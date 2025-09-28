@@ -36,7 +36,16 @@ typedef struct {
   int analysis_count;
   int* next_job_index;
   pthread_mutex_t* job_mutex;
-  pthread_mutext_t*
+  pthread_mutex_t* prob_file_mutex;
+  pthread_mutex_t* beta_file_mutex;
+  FILE* prob_file;
+  FILE* beta_file;
 } ThreadData;
+
+bool parse_args(int argc, char* argv[], CommandLineArgs* args);
+bool read_csv(const char* path, DataTable* table);
+void run_analysis(CommandLineArgs* args, DataTable* table);
+void free_data_table(DataTable* table);
+void free_command_line_args(CommandLineArgs* args);
 
 #endif // BELT_BK_H

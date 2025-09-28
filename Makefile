@@ -1,8 +1,8 @@
 # Compiler settings
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c17 -O2 -g
-LDFLAGS = 
-LIBS = 
+CFLAGS = -Wall -Wextra -std=c23 -O2 -g
+LDFLAGS =
+LIBS =
 
 # Directories
 SRCDIR = src

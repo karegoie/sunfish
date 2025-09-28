@@ -22,7 +22,8 @@
         "ms-vscode.hexeditor",
         "vadimcn.vscode-lldb",
         "formulahendry.code-runner",
-        "github.copilot"
+        "github.copilot",
+        "ms-vscode.makefile-tools"
       ],
       "settings": {
         "C_Cpp.default.cppStandard": "c++23",
