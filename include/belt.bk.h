@@ -1,15 +1,14 @@
-#ifndef BELT_H
-#define BELT_H
+#ifndef BELT_BK_H
+#define BELK_BK_H
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
 #include <stdbool.h>
 #include <pthread.h>
 #include <unistd.h>
 
-#define MAX_LINE_LEN 65536
+#define MAX_LINE_LEN 1000000
 #define INITIAL_CAPACITY 1000
 
 typedef struct
@@ -18,7 +17,7 @@ typedef struct
     bool all_genes;
     char **goi_list;
     int goi_count;
-    double threshold;
+    double threadhols;
     char *output_prefix;
 } CommandLineArgs;
 
@@ -40,16 +39,7 @@ typedef struct
     int analysis_count;
     int *next_job_index;
     pthread_mutex_t *job_mutex;
-    pthread_mutex_t *prob_file_mutex;
-    pthread_mutex_t *beta_file_mutex;
-    FILE *prob_file;
-    FILE *beta_file;
+    pthread_mutext_t *
 } ThreadData;
 
-bool parse_args(int argc, char *argv[], CommandLineArgs *args);
-bool read_csv(const char *path, DataTable *table);
-void run_analysis(CommandLineArgs *args, DataTable *table);
-void free_data_table(DataTable *table);
-void free_command_line_args(CommandLineArgs *args);
-
-#endif // BELT_H
+#endif // BELT_BK_H

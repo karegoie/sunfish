@@ -1,7 +1,6 @@
 {
   "name": "C Development Environment",
   "image": "mcr.microsoft.com/devcontainers/cpp:0-ubuntu-22.04",
-  
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
       "installZsh": true,
@@ -13,7 +12,6 @@
       "userGid": "automatic"
     }
   },
-  
   "customizations": {
     "vscode": {
       "extensions": [
@@ -27,8 +25,9 @@
         "github.copilot"
       ],
       "settings": {
-        "C_Cpp.default.cppStandard": "c17",
-        "C_Cpp.default.cStandard": "c17",
+        "C_Cpp.default.cppStandard": "c++23",
+        "C_Cpp.default.cStandard": "c23",
+        "C_Cpp.clang_format_fallbackStyle": "{ PointerAlignment: Left}",
         "C_Cpp.default.compilerPath": "/usr/bin/gcc",
         "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
         "editor.formatOnSave": true,
@@ -37,17 +36,12 @@
       }
     }
   },
-  
   "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential gdb valgrind cppcheck clang-format git make cmake pkg-config",
-  
   "remoteUser": "vscode",
-  
   "mounts": [
     "source=${localWorkspaceFolder}/.devcontainer,target=/workspace/.devcontainer,type=bind,consistency=cached"
   ],
-  
   "forwardPorts": [],
-  
   "runArgs": [
     "--cap-add=SYS_PTRACE",
     "--security-opt",
