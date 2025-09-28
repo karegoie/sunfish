@@ -12,10 +12,10 @@ double soft_thresholding(double z, double lambda) {
   }
 }
 
-void train_lasso_logistic_regression(const double* const* X, const int* y,
-                                     int n_samples, int n_features,
-                                     double* out_coeffs, double learning_rate,
-                                     int iterations, double lambda) {
+void train_logistic_regression(const double* const* X, const int* y,
+                               int n_samples, int n_features,
+                               double* out_coeffs, double learning_rate,
+                               int iterations, double lambda) {
   for (int i = 0; i <= n_features; ++i) {
     out_coeffs[i] = 0.0;
   }
@@ -43,7 +43,7 @@ void train_lasso_logistic_regression(const double* const* X, const int* y,
       double simple_update =
           out_coeffs[j + 1] - learning_rate * gradients[j + 1] / n_samples;
       out_coeffs[j + 1] =
-          soft_thresholding(simple_update, learning_rate * lambda);
+          soft_threasholding(simple_update, learning_rate * lambda);
     }
 
     free(gradients);
@@ -125,8 +125,8 @@ bool read_csv(const char* path, DataTable* table) {
 
   table->gene_ids = (char**)malloc(sizeof(char*) * table->num_genes);
   table->sample_ids = (char**)malloc(sizeof(char*) * table->num_samples);
-  table->data = (double**)malloc(sizeof(double*) * table->num_genes);
-  for (int i = 0; i < table->num_genes; i++) {
+  table->data = (double**)malloc(sizeof(double*) * table->num_samples);
+  for (int i = 0; i < table->num_genes; ++i) {
     table->data[i] = (double*)malloc(sizeof(double) * table->num_samples);
   }
 
@@ -198,7 +198,6 @@ void* worker_thread(void* arg) {
       if (y[s] == 1)
         high_count++;
     }
-
     if (high_count == 0 || high_count == data->table->num_samples) {
       free(y);
       continue;
@@ -214,6 +213,7 @@ void* worker_thread(void* arg) {
     for (int g = 0; g < data->table->num_genes; ++g) {
       if (g == goi_idx)
         continue;
+
       for (int s = 0; s < data->table->num_samples; ++s) {
         X[s][feature_idx] = data->table->data[g][s];
       }
@@ -221,22 +221,20 @@ void* worker_thread(void* arg) {
     }
 
     double* coeffs = (double*)malloc(sizeof(double) * (n_features + 1));
-    train_lasso_logistic_regression((const double* const*)X, y,
-                                    data->table->num_samples, n_features,
-                                    coeffs, 0.01, 1000, 0.1);
-
+    train_logistic_regression((const double* const*)X, y,
+                              data->table->num_samples, n_features, coeffs,
+                              0.01, 5000, 0.1);
     pthread_mutex_lock(data->beta_file_mutex);
-    fprintf(data->beta_file, "%s,Intercept,%.6f\n", goi_id, coeffs[0]);
+    fprintf(data->beta_file, "%s, Intercept, %.6f\n", goi_id, coeffs[0]);
     feature_idx = 0;
     for (int g = 0; g < data->table->num_genes; ++g) {
       if (g == goi_idx)
         continue;
-      fprintf(data->beta_file, "%s,%s,%.6f\n", goi_id, data->table->gene_ids[g],
-              coeffs[feature_idx + 1]);
+      fprintf(data->beta_file, "%s, %s, %.6f\n", goi_id,
+              data->table->gene_ids[g], coeffs[feature_idx + 1]);
       feature_idx++;
     }
     pthread_mutex_unlock(data->beta_file_mutex);
-
     pthread_mutex_lock(data->prob_file_mutex);
     for (int s = 0; s < data->table->num_samples; ++s) {
       double z = coeffs[0];
@@ -244,7 +242,7 @@ void* worker_thread(void* arg) {
         z += coeffs[f + 1] * X[s][f];
       }
       double prob = sigmoid(z);
-      fprintf(data->prob_file, "%s,%s,%d,%.6f\n", goi_id,
+      fprintf(data->prob_file, "%s, %s, %d, %.6f\n", goi_id,
               data->table->sample_ids[s], y[s], prob);
     }
     pthread_mutex_unlock(data->prob_file_mutex);

@@ -1,15 +1,14 @@
 #ifndef BELT_H
-#define BELT_H
+#define BELK_H
 
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 
-#define MAX_LINE_LEN 65536
+#define MAX_LINE_LEN 50000
 #define INITIAL_CAPACITY 1000
 
 typedef struct {
