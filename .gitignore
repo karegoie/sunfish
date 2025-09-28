@@ -1,0 +1,29 @@
+# Build directories
+obj/
+bin/
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Core dumps
+core
+core.*
+
+# Valgrind output
+vgcore.*
+*.valgrind
