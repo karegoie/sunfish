@@ -234,7 +234,7 @@ void* worker_thread(void* arg) {
     double* coeffs = (double*)malloc(sizeof(double) * (n_features + 1));
     train_logistic_regression((const double* const*)X, y,
                               data->table->num_samples, n_features, coeffs,
-                              0.01, 1000, 0.1);
+                              0.01, 5000, 0.1);
     pthread_mutex_lock(data->beta_file_mutex);
     fprintf(data->beta_file, "%s, Intercept, %.6f\n", goi_id, coeffs[0]);
     feature_idx = 0;
