@@ -1,5 +1,16 @@
 #include "belt.h"
 
+char* belt_strdup(const char* s) {
+  if (!s)
+    return NULL;
+  size_t len = strlen(s) + 1;
+  char* copy = malloc(len);
+  if (copy) {
+    memcpy(copy, s, len);
+  }
+  return copy;
+}
+
 double sigmoid(double z) { return 1.0 / (1.0 + exp(-z)); }
 
 double soft_thresholding(double z, double lambda) {
@@ -43,7 +54,7 @@ void train_logistic_regression(const double* const* X, const int* y,
       double simple_update =
           out_coeffs[j + 1] - learning_rate * gradients[j + 1] / n_samples;
       out_coeffs[j + 1] =
-          soft_threasholding(simple_update, learning_rate * lambda);
+          soft_thresholding(simple_update, learning_rate * lambda);
     }
 
     free(gradients);
@@ -60,23 +71,23 @@ bool parse_args(int argc, char* argv[], CommandLineArgs* args) {
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
-      args->csv_path = strdup(argv[++i]);
+      args->csv_path = belt_strdup(argv[++i]);
     } else if (strcmp(argv[i], "--all") == 0) {
       args->all_genes = true;
     } else if (strcmp(argv[i], "--goi") == 0 && i + 1 < argc) {
-      char* goi_str = strdup(argv[++i]);
+      char* goi_str = belt_strdup(argv[++i]);
       char* token = strtok(goi_str, ",");
       while (token) {
         args->goi_list = (char**)realloc(args->goi_list,
                                          sizeof(char*) * (args->goi_count + 1));
-        args->goi_list[args->goi_count++] = strdup(token);
+        args->goi_list[args->goi_count++] = belt_strdup(token);
         token = strtok(NULL, ",");
       }
       free(goi_str);
     } else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
       args->threshold = atof(argv[++i]);
     } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
-      args->output_prefix = strdup(argv[++i]);
+      args->output_prefix = belt_strdup(argv[++i]);
     }
   }
 
@@ -125,7 +136,7 @@ bool read_csv(const char* path, DataTable* table) {
 
   table->gene_ids = (char**)malloc(sizeof(char*) * table->num_genes);
   table->sample_ids = (char**)malloc(sizeof(char*) * table->num_samples);
-  table->data = (double**)malloc(sizeof(double*) * table->num_samples);
+  table->data = (double**)malloc(sizeof(double*) * table->num_genes);
   for (int i = 0; i < table->num_genes; ++i) {
     table->data[i] = (double*)malloc(sizeof(double) * table->num_samples);
   }
@@ -135,12 +146,12 @@ bool read_csv(const char* path, DataTable* table) {
   int gene_idx = 0;
   if (fgets(line, sizeof(line), file)) {
     line[strcspn(line, "\r\n")] = 0;
-    char* line_copy = strdup(line);
+    char* line_copy = belt_strdup(line);
     char* token = strtok(line_copy, ",");
     token = strtok(NULL, ",");
     int sample_idx = 0;
     while (token) {
-      table->sample_ids[sample_idx++] = strdup(token);
+      table->sample_ids[sample_idx++] = belt_strdup(token);
       token = strtok(NULL, ",");
     }
     free(line_copy);
@@ -148,9 +159,9 @@ bool read_csv(const char* path, DataTable* table) {
 
   while (fgets(line, sizeof(line), file) && gene_idx < table->num_genes) {
     line[strcspn(line, "\r\n")] = 0;
-    char* line_copy = strdup(line);
+    char* line_copy = belt_strdup(line);
     char* token = strtok(line_copy, ",");
-    table->gene_ids[gene_idx] = strdup(token);
+    table->gene_ids[gene_idx] = belt_strdup(token);
 
     int sample_idx = 0;
     while ((token = strtok(NULL, ",")) != NULL &&

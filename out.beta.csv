@@ -1,0 +1,7 @@
+Analyzed_GOI_ID,Predictor_Gene_ID,Beta_Coefficient
+GOI1, Intercept, 0.246201
+GOI1, GOI2, 1.515669
+GOI1, GOI3, -0.669535
+GOI3, Intercept, 2.844065
+GOI3, GOI1, -0.025907
+GOI3, GOI2, -1.357417

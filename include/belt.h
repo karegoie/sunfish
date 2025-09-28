@@ -1,11 +1,12 @@
 #ifndef BELT_H
-#define BELK_H
+#define BELT_H
 
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define MAX_LINE_LEN 50000
@@ -42,6 +43,7 @@ typedef struct {
   FILE* beta_file;
 } ThreadData;
 
+char* belt_strdup(const char* s);
 bool parse_args(int argc, char* argv[], CommandLineArgs* args);
 bool read_csv(const char* path, DataTable* table);
 void run_analysis(CommandLineArgs* args, DataTable* table);

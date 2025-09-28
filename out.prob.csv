@@ -1,0 +1,7 @@
+Analyzed_GOI_ID,Sample_ID,Actual_Expression_Class,Predicted_Probability_High
+GOI1, sample1, 0, 0.268044
+GOI1, sample2, 1, 0.765062
+GOI1, sample3, 1, 0.966620
+GOI3, sample1, 1, 0.894679
+GOI3, sample2, 1, 0.680512
+GOI3, sample3, 0, 0.348146
