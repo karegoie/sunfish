@@ -1,5 +1,10 @@
 #include "belt.h"
 
+// 전역 하이퍼파라미터 기본값
+static double g_learning_rate = 0.01;
+static int g_iterations = 5000;
+static double g_lambda = 0.1;
+
 char* belt_strdup(const char* s) {
   if (!s)
     return NULL;
@@ -88,15 +93,41 @@ bool parse_args(int argc, char* argv[], CommandLineArgs* args) {
       args->threshold = atof(argv[++i]);
     } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
       args->output_prefix = belt_strdup(argv[++i]);
+    } else if (strcmp(argv[i], "--learning-rate") == 0 && i + 1 < argc) {
+      double v = atof(argv[++i]);
+      if (v > 0) {
+        g_learning_rate = v;
+      } else {
+        fprintf(stderr, "Warning: --learning-rate must be > 0. Using %g.\n",
+                g_learning_rate);
+      }
+    } else if (strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
+      int v = atoi(argv[++i]);
+      if (v > 0) {
+        g_iterations = v;
+      } else {
+        fprintf(stderr, "Warning: --iterations must be > 0. Using %d.\n",
+                g_iterations);
+      }
+    } else if (strcmp(argv[i], "--lambda") == 0 && i + 1 < argc) {
+      double v = atof(argv[++i]);
+      if (v >= 0) {
+        g_lambda = v;
+      } else {
+        fprintf(stderr, "Warning: --lambda must be >= 0. Using %g.\n",
+                g_lambda);
+      }
     }
   }
 
   if (!args->csv_path || !args->output_prefix ||
       (!args->all_genes && args->goi_count == 0)) {
-    fprintf(stderr,
-            "Usage: %s --csv <path> --output <prefix> [--all | --goi "
-            "<g1,g2,...>] [--threshold <float>]\n",
-            argv[0]);
+    fprintf(
+        stderr,
+        "Usage: %s --csv <path> --output <prefix> [--all | --goi <g1,g2,...>] "
+        "[--threshold <float>] [--learning-rate <float>] [--iterations <int>] "
+        "[--lambda <float>]\n",
+        argv[0]);
     return false;
   }
   if (args->all_genes && args->goi_count > 0) {
@@ -234,7 +265,7 @@ void* worker_thread(void* arg) {
     double* coeffs = (double*)malloc(sizeof(double) * (n_features + 1));
     train_logistic_regression((const double* const*)X, y,
                               data->table->num_samples, n_features, coeffs,
-                              0.01, 5000, 0.1);
+                              g_learning_rate, g_iterations, g_lambda);
     pthread_mutex_lock(data->beta_file_mutex);
     fprintf(data->beta_file, "%s, Intercept, %.6f\n", goi_id, coeffs[0]);
     feature_idx = 0;
