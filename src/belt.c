@@ -17,6 +17,8 @@ char* belt_strdup(const char* s) {
 
 double sigmoid(double z) { return 1.0 / (1.0 + exp(-z)); }
 
+static inline double log10p1(double x) { return log10(1.0 + x); }
+
 double soft_thresholding(double z, double lambda) {
   if (z > 0 && lambda < fabs(z)) {
     return z - lambda;
@@ -196,7 +198,9 @@ bool read_csv(const char* path, DataTable* table) {
     int sample_idx = 0;
     while ((token = strtok(NULL, ",")) != NULL &&
            sample_idx < table->num_samples) {
-      table->data[gene_idx][sample_idx++] = atof(token);
+      double v = atof(token);
+      table->data[gene_idx][sample_idx++] =
+          log10p1(v); // log10(1+v)로 변환 저장
     }
     gene_idx++;
     free(line_copy);
@@ -232,10 +236,12 @@ void* worker_thread(void* arg) {
     if (goi_idx == -1)
       continue;
 
+    double thr_log = log10p1(data->args->threshold);
+
     int* y = (int*)malloc(sizeof(int) * data->table->num_samples);
     int high_count = 0;
     for (int s = 0; s < data->table->num_samples; ++s) {
-      y[s] = data->table->data[goi_idx][s] > data->args->threshold ? 1 : 0;
+      y[s] = data->table->data[goi_idx][s] > thr_log ? 1 : 0;
       if (y[s] == 1)
         high_count++;
     }
