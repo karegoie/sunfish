@@ -1,9 +1,8 @@
 #include "belt.h"
 
-// 전역 하이퍼파라미터 기본값
 static double g_learning_rate = 0.01;
-static int g_iterations = 5000;
-static double g_lambda = 0.1;
+static int g_iterations = 1000;
+static double g_lambda = 0.5;
 
 char* belt_strdup(const char* s) {
   if (!s)
