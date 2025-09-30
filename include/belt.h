@@ -50,4 +50,12 @@ void run_analysis(CommandLineArgs* args, DataTable* table);
 void free_data_table(DataTable* table);
 void free_command_line_args(CommandLineArgs* args);
 
+// Create a pivot table CSV from the generated <prefix>.prob.csv file.
+// Input:  prob_csv at path like "<prefix>.prob.csv"
+// Output: pivot_csv at path like "<prefix>.pivot.csv"
+// The output format matches: header "Gene,<sample1>,<sample2>,..."
+// and rows per gene containing Predicted_Probability_High for each sample,
+// defaulting to 0 when missing.
+void write_pivot_from_prob(const char* prob_csv, const char* pivot_csv);
+
 #endif // BELT_H

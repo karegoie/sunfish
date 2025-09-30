@@ -355,6 +355,11 @@ void run_analysis(CommandLineArgs* args, DataTable* table) {
   free(thread_data);
   fclose(prob_file);
   fclose(beta_file);
+
+  // After writing prob/beta files, also emit the pivot CSV like awk script
+  char pivot_path[256];
+  snprintf(pivot_path, sizeof(pivot_path), "%s.pivot.csv", args->output_prefix);
+  write_pivot_from_prob(prob_path, pivot_path);
 }
 
 void free_command_line_args(CommandLineArgs* args) {
@@ -410,4 +415,204 @@ int main(int argc, char* argv[]) {
   free_data_table(&table);
 
   return 0;
+}
+
+// Helper for dynamic string array
+typedef struct {
+  char** items;
+  int size;
+  int capacity;
+} StrVec;
+
+static void strvec_init(StrVec* v) {
+  v->items = NULL;
+  v->size = 0;
+  v->capacity = 0;
+}
+
+static void strvec_free(StrVec* v) {
+  for (int i = 0; i < v->size; ++i)
+    free(v->items[i]);
+  free(v->items);
+  v->items = NULL;
+  v->size = v->capacity = 0;
+}
+
+static bool strvec_push_unique(StrVec* v, const char* s) {
+  for (int i = 0; i < v->size; ++i) {
+    if (strcmp(v->items[i], s) == 0)
+      return false;
+  }
+  if (v->size == v->capacity) {
+    int nc = v->capacity ? v->capacity * 2 : 64;
+    char** ni = (char**)realloc(v->items, sizeof(char*) * nc);
+    if (!ni)
+      return false;
+    v->items = ni;
+    v->capacity = nc;
+  }
+  v->items[v->size++] = belt_strdup(s);
+  return true;
+}
+
+// Simple key composed of two strings (gene,sample) -> value
+typedef struct PairValue {
+  char* gene;
+  char* sample;
+  double value;
+} PairValue;
+
+typedef struct {
+  PairValue* items;
+  int size;
+  int capacity;
+} PairVec;
+
+static void pairvec_init(PairVec* v) {
+  v->items = NULL;
+  v->size = 0;
+  v->capacity = 0;
+}
+
+static void pairvec_free(PairVec* v) {
+  for (int i = 0; i < v->size; ++i) {
+    free(v->items[i].gene);
+    free(v->items[i].sample);
+  }
+  free(v->items);
+  v->items = NULL;
+  v->size = v->capacity = 0;
+}
+
+static bool pairvec_push(PairVec* v, const char* gene, const char* sample,
+                         double value) {
+  if (v->size == v->capacity) {
+    int nc = v->capacity ? v->capacity * 2 : 1024;
+    PairValue* ni = (PairValue*)realloc(v->items, sizeof(PairValue) * nc);
+    if (!ni)
+      return false;
+    v->items = ni;
+    v->capacity = nc;
+  }
+  v->items[v->size].gene = belt_strdup(gene);
+  v->items[v->size].sample = belt_strdup(sample);
+  v->items[v->size].value = value;
+  v->size += 1;
+  return true;
+}
+
+// Lookup helper: O(n). Good enough for moderate sizes; input files typically
+// not huge.
+static bool pairvec_get(const PairVec* v, const char* gene, const char* sample,
+                        double* out) {
+  for (int i = 0; i < v->size; ++i) {
+    if (strcmp(v->items[i].gene, gene) == 0 &&
+        strcmp(v->items[i].sample, sample) == 0) {
+      *out = v->items[i].value;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Trim CR and trailing newline
+static void chomp_crlf(char* line) {
+  size_t n = strlen(line);
+  while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+    line[--n] = '\0';
+  }
+}
+
+void write_pivot_from_prob(const char* prob_csv, const char* pivot_csv) {
+  FILE* f = fopen(prob_csv, "r");
+  if (!f) {
+    perror("open prob csv");
+    return;
+  }
+
+  // Columns:
+  // Analyzed_GOI_ID,Sample_ID,Actual_Expression_Class,Predicted_Probability_High
+  // We collect unique samples, unique genes, and map (gene,sample) -> value
+  StrVec samples;
+  strvec_init(&samples);
+  StrVec genes;
+  strvec_init(&genes);
+  PairVec data;
+  pairvec_init(&data);
+
+  char line[MAX_LINE_LEN];
+  // skip header
+  if (!fgets(line, sizeof(line), f)) {
+    fclose(f);
+    return;
+  }
+
+  while (fgets(line, sizeof(line), f)) {
+    chomp_crlf(line);
+    // split
+    // Use strtok on a copy to avoid modifying original if needed later
+    char* copy = belt_strdup(line);
+    char* tok = strtok(copy, ",");
+    if (!tok) {
+      free(copy);
+      continue;
+    }
+    char* gene = tok;
+    tok = strtok(NULL, ",");
+    if (!tok) {
+      free(copy);
+      continue;
+    }
+    char* sample = tok;
+    tok = strtok(NULL, ","); // actual
+    tok = strtok(NULL, ","); // predicted prob
+    if (!tok) {
+      free(copy);
+      continue;
+    }
+    double val = atof(tok);
+
+    strvec_push_unique(&genes, gene);
+    strvec_push_unique(&samples, sample);
+    pairvec_push(&data, gene, sample, val);
+    free(copy);
+  }
+  fclose(f);
+
+  // write pivot
+  FILE* out = fopen(pivot_csv, "w");
+  if (!out) {
+    perror("open pivot csv");
+    strvec_free(&samples);
+    strvec_free(&genes);
+    pairvec_free(&data);
+    return;
+  }
+
+  // Header
+  fprintf(out, "Gene");
+  for (int i = 0; i < samples.size; ++i) {
+    fprintf(out, ",%s", samples.items[i]);
+  }
+  fprintf(out, "\n");
+
+  // Rows
+  for (int j = 0; j < genes.size; ++j) {
+    const char* gene = genes.items[j];
+    fprintf(out, "%s", gene);
+    for (int i = 0; i < samples.size; ++i) {
+      const char* sample = samples.items[i];
+      double v = 0.0;
+      if (pairvec_get(&data, gene, sample, &v)) {
+        // v set
+      }
+      fprintf(out, ",%.6f", v);
+    }
+    fprintf(out, "\n");
+  }
+
+  fclose(out);
+  strvec_free(&samples);
+  strvec_free(&genes);
+  pairvec_free(&data);
 }
