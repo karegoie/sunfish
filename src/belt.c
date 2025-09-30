@@ -2,7 +2,7 @@
 
 static double g_learning_rate = 0.01;
 static int g_iterations = 1000;
-static double g_lambda = 0.5;
+static double g_lambda = 0.05;
 
 char* belt_strdup(const char* s) {
   if (!s)
@@ -72,7 +72,7 @@ bool parse_args(int argc, char* argv[], CommandLineArgs* args) {
   args->all_genes = false;
   args->goi_list = NULL;
   args->goi_count = 0;
-  args->threshold = 1.0;
+  args->threshold = 10.0;
   args->output_prefix = NULL;
 
   for (int i = 1; i < argc; ++i) {
