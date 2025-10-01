@@ -31,7 +31,3 @@ vgcore.*
 # Sunfish model file (generated during training)
 sunfish.model
 
-# Belt output files
-*.prob.csv
-*.beta.csv
-*.pivot.csv

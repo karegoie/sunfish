@@ -8,11 +8,15 @@ Sunfish is a novel gene annotation program that operates in two modes: `train` a
 
 ## Features
 
-- **Training Mode**: Learn amino acid composition patterns from annotated genomes
-- **Prediction Mode**: Discover potential coding sequences in unannotated genomes
-- **Statistical Validation**: Uses P_stat ≥ P_theory criterion for all 20 standard amino acids
-- **Comprehensive Bioinformatics Pipeline**: Includes FASTA/GFF3 parsing, genetic code translation, and ORF detection
-- **Queue-Based ORF Discovery**: Efficient iterative approach for finding all potential coding sequences
+- Training from annotated proteomes (GFF3 CDS)
+- Prediction on unannotated genomes (FASTA)
+- Statistical validation: P_stat ≥ P_theory for all 20 amino acids
+- FASTA/GFF3 parsing and translation with standard genetic code
+- Exhaustive candidate generation:
+   - All contiguous DNA subsequences are considered as candidate CDS (not only ATG→stop)
+   - Canonical splicing support with GT..AG (+) and CT..AC (−) signals
+   - Multi-exon enumeration for 2, 3, and 4 exons
+   - Both strands are scanned; reverse-complement coordinates are mapped back to original
 
 ## Installation
 
@@ -36,7 +40,7 @@ This will create the `bin/sunfish` executable.
 Train 20 logistic regression models (one per amino acid) from an annotated genome:
 
 ```bash
-./bin/sunfish train <train.fasta> <train.gff>
+./bin/sunfish train <train.fasta> <train.gff> [--min-occ N|-m N] [--lr R] [--iters I] [--l1 L]
 ```
 
 **Input:**
@@ -46,9 +50,13 @@ Train 20 logistic regression models (one per amino acid) from an annotated genom
 **Output:**
 - `sunfish.model`: Binary model file containing coefficients for all 20 amino acid models
 
+**Options:**
+- `--min-occ N` or `-m N`: Minimum occurrence k used to label positives during training (default 1)
+- `--lr R`, `--iters I`, `--l1 L`: Optimization hyperparameters for logistic regression
+
 **Example:**
 ```bash
-./bin/sunfish train reference_genome.fasta reference_annotations.gff3
+./bin/sunfish train reference_genome.fasta reference_annotations.gff3 --min-pep 5 --min-occ 2
 ```
 
 ### Prediction Mode
@@ -56,7 +64,7 @@ Train 20 logistic regression models (one per amino acid) from an annotated genom
 Predict genes in a target genome using the trained model:
 
 ```bash
-./bin/sunfish predict <target.fasta>
+./bin/sunfish predict <target.fasta> [--min-occ N|-m N]
 ```
 
 **Input:**
@@ -67,39 +75,38 @@ Predict genes in a target genome using the trained model:
 - GFF3 format gene annotations written to stdout
 - Progress messages written to stderr
 
+**Options:**
+- `--min-occ N` or `-m N`: Minimum occurrence k used in the validation criterion (default 1)
+
 **Example:**
 ```bash
-./bin/sunfish predict target_genome.fasta > predicted_genes.gff3
+./bin/sunfish predict target_genome.fasta --min-occ 3 > predicted_genes.gff3
 ```
 
 ## Algorithm Details
 
 ### Training Phase
 
-1. **Parse Inputs**: Load genome FASTA and GFF3 annotations
-2. **Extract Peptides**: For each CDS group:
-   - Concatenate exon sequences in order
-   - Reverse complement if on minus strand
-   - Translate DNA to amino acid sequence
-3. **Train Models**: For each of 20 amino acids (aa_j):
-   - **Target (y)**: Binary indicator if peptide contains aa_j
-   - **Features (X)**: Amino acid counts from entire proteome excluding current peptide
-   - Uses gradient descent with L1 regularization
-4. **Save Model**: Write all 20 sets of coefficients to file
+1. Parse inputs: load genome FASTA and GFF3 annotations
+2. Extract peptides from CDS groups: concatenate exons, reverse-complement on minus strand, translate
+3. Train 20 logistic regression models (one per amino acid):
+   - Target (y): indicator if peptide contains the amino acid at least k times
+   - Features (X): amino acid counts from the whole proteome excluding the current peptide
+   - Optimization: gradient descent with L1 regularization
+4. Save all coefficient vectors to `sunfish.model`
 
 ### Prediction Phase
 
-1. **Load Model**: Read coefficients for all 20 amino acid models
-2. **Generate Candidates**: For each chromosome (both strands):
-   - Find all ATG start codons
-   - Use queue-based search to explore all possible ORF paths
-   - Support for splice sites (GT-AG) while maintaining reading frame
-   - Stop at stop codons (TAA, TAG, TGA)
-3. **Validate Candidates**: For each peptide:
-   - Calculate P_stat for each amino acid using its logistic regression model
-   - Calculate P_theory: 1 - (1 - q)^L where q is amino acid frequency, L is length
-   - Accept only if P_stat ≥ P_theory for ALL 20 amino acids
-4. **Output**: Write valid genes in GFF3 format with gene/mRNA/CDS hierarchy
+1. Load model coefficients
+2. Generate candidate CDS for each sequence and strand:
+   - Contiguous ORFs: consider every DNA subsequence; translate until first stop
+   - Spliced ORFs: identify canonical splice signals (GT..AG on +, CT..AC on −) and enumerate 2–4 exon combinations; concatenate exon segments, then translate
+   - Map coordinates back to original reference for the minus strand
+3. Validate each translated peptide by requiring, for all 20 amino acids:
+   - P_stat = sigmoid(w_0 + w·counts) from the learned model
+   - P_theory = P[X ≥ k] where X ~ Binomial(L, q) with q = count_j / L
+   - Accept if P_stat ≥ P_theory for every amino acid
+4. Output accepted candidates in GFF3 (gene/mRNA/CDS). Multi-exon candidates produce multiple CDS lines.
 
 ## Standard 20 Amino Acids
 
@@ -126,26 +133,14 @@ chr1    source  CDS    100    200    .    +    0    ID=cds1;Parent=mRNA1
 chr1    source  CDS    300    400    .    +    0    ID=cds2;Parent=mRNA1
 ```
 
-## Belt - SLACS Analysis Tool
-
-The repository also includes the original `belt` tool for logistic regression analysis on gene expression data. See the original documentation for belt usage.
-
-### Building Belt
-
-```bash
-make belt
-```
-
 ## Development
 
 ### Project Structure
 ```
 sunfish/
 ├── src/
-│   ├── sunfish.c    # Main sunfish implementation
-│   └── belt.c       # Original belt tool
+│   └── sunfish.c    # Main sunfish implementation
 ├── include/
-│   └── belt.h       # Belt headers
 ├── Makefile
 └── README.md
 ```
@@ -154,6 +149,10 @@ sunfish/
 ```bash
 make clean
 ```
+
+## Notes on Performance
+
+The exhaustive all-subsequence and multi-exon enumeration can be computationally expensive on large genomes. Consider subsetting to regions of interest or adding problem-specific constraints if runtime is prohibitive.
 
 ## License
 
