@@ -7,10 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_LINE_LEN 50000
-#define MAX_PEPTIDE_LEN 100000
-#define MAX_DNA_LEN 1000000
-#define NUM_AMINO_ACIDS 20
+#include "../include/defaults.h"
 
 // Data Structures
 
@@ -380,20 +377,72 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
 
 // Prediction helpers
 
+// Load model and metadata. Returns true on success. If header contains
+// a min_occ, means or stds lines they are filled into the provided buffers.
 bool load_model(const char* path,
-                double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1]) {
+                double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
+                double means[NUM_AMINO_ACIDS], double stds[NUM_AMINO_ACIDS],
+                int* out_min_occ) {
   FILE* fp = fopen(path, "r");
   if (!fp) {
     fprintf(stderr, "Error: Cannot open model file: %s\n", path);
     return false;
   }
-  for (int j = 0; j < NUM_AMINO_ACIDS; j++)
-    for (int k = 0; k <= NUM_AMINO_ACIDS; k++)
+  // initialize defaults
+  for (int i = 0; i < NUM_AMINO_ACIDS; i++) {
+    means[i] = 0.0;
+    stds[i] = 1.0;
+  }
+  if (out_min_occ)
+    *out_min_occ = -1;
+
+  char line[MAX_LINE_LEN];
+  // read header lines starting with '#'
+  long pos = ftell(fp);
+  while (fgets(line, sizeof(line), fp)) {
+    if (line[0] != '#') {
+      // rewind to start of coefficients section
+      fseek(fp, pos, SEEK_SET);
+      break;
+    }
+    // parse header tokens
+    if (strncmp(line, "#min_occ", 8) == 0) {
+      int v = atoi(line + 8);
+      if (out_min_occ)
+        *out_min_occ = v;
+    } else if (strncmp(line, "#means", 6) == 0) {
+      char* p = line + 6;
+      for (int i = 0; i < NUM_AMINO_ACIDS; i++) {
+        while (*p && isspace((unsigned char)*p))
+          p++;
+        if (!*p)
+          break;
+        means[i] = strtod(p, &p);
+      }
+    } else if (strncmp(line, "#stds", 5) == 0) {
+      char* p = line + 5;
+      for (int i = 0; i < NUM_AMINO_ACIDS; i++) {
+        while (*p && isspace((unsigned char)*p))
+          p++;
+        if (!*p)
+          break;
+        stds[i] = strtod(p, &p);
+        if (stds[i] == 0.0)
+          stds[i] = 1.0;
+      }
+    }
+    pos = ftell(fp);
+  }
+
+  for (int j = 0; j < NUM_AMINO_ACIDS; j++) {
+    for (int k = 0; k <= NUM_AMINO_ACIDS; k++) {
       if (fscanf(fp, "%lf", &models[j][k]) != 1) {
         fprintf(stderr, "Error: Invalid model file format\n");
         fclose(fp);
         return false;
       }
+    }
+  }
   fclose(fp);
   return true;
 }
@@ -427,7 +476,8 @@ static double prob_at_least_k_successes(int n, double q, int k) {
 
 bool validate_peptide(const char* peptide,
                       double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
-                      int min_occ) {
+                      const double means[NUM_AMINO_ACIDS],
+                      const double stds[NUM_AMINO_ACIDS], int min_occ) {
   int counts[NUM_AMINO_ACIDS];
   count_amino_acids(peptide, counts);
   int L = (int)strlen(peptide);
@@ -435,8 +485,12 @@ bool validate_peptide(const char* peptide,
     return false;
   for (int j = 0; j < NUM_AMINO_ACIDS; j++) {
     double z = models[j][0];
-    for (int k = 0; k < NUM_AMINO_ACIDS; k++)
-      z += models[j][k + 1] * counts[k];
+    for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
+      double feat = (double)counts[k] / (double)L;
+      // standardize
+      double xv = (feat - means[k]) / (stds[k] != 0.0 ? stds[k] : 1.0);
+      z += models[j][k + 1] * xv;
+    }
     double P_stat = sigmoid(z);
     double q = (double)counts[j] / L;
     double P_theory = (min_occ <= 1) ? (1.0 - pow(1.0 - q, L))
@@ -447,47 +501,49 @@ bool validate_peptide(const char* peptide,
   return true;
 }
 
-// Compute the maximum difference P_stat - P_theory across amino acids for a
-// peptide. Also return via out_pass whether the peptide satisfies the same
-// validation rule (P_stat >= P_theory for all amino acids).
-static double peptide_max_stat_minus_theory(
+// Calculate an aggregate peptide score based only on model predictions
+// (P_stat). This function computes P_stat for each amino acid (using the
+// same logistic model computation as before), returns the average P_stat
+// across the NUM_AMINO_ACIDS amino acids, and sets out_pass to true only if
+// every P_stat is at least the DEFAULT_P_STAT_THRESHOLD (0.5 by default).
+static double calculate_peptide_score(
     const char* peptide, double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
+    const double means[NUM_AMINO_ACIDS], const double stds[NUM_AMINO_ACIDS],
     int min_occ, bool* out_pass) {
+  (void)min_occ; // min_occ is unused under the new scoring rule
   int counts[NUM_AMINO_ACIDS];
   count_amino_acids(peptide, counts);
   int L = (int)strlen(peptide);
   if (L == 0) {
     if (out_pass)
       *out_pass = false;
-    return -INFINITY;
+    return 0.0;
   }
-  double maxdiff = -INFINITY;
+
+  double sum_pstat = 0.0;
   bool pass = true;
   for (int j = 0; j < NUM_AMINO_ACIDS; j++) {
     double z = models[j][0];
-    for (int k = 0; k < NUM_AMINO_ACIDS; k++)
-      z += models[j][k + 1] * counts[k];
+    for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
+      double feat = (double)counts[k] / (double)L;
+      double xv = (feat - means[k]) / (stds[k] != 0.0 ? stds[k] : 1.0);
+      z += models[j][k + 1] * xv;
+    }
     double P_stat = sigmoid(z);
-    double q = (double)counts[j] / L;
-    double P_theory = (min_occ <= 1) ? (1.0 - pow(1.0 - q, L))
-                                     : prob_at_least_k_successes(L, q, min_occ);
-    if (P_stat < P_theory)
+    sum_pstat += P_stat;
+    if (P_stat < DEFAULT_P_STAT_THRESHOLD)
       pass = false;
-    double diff = P_stat - P_theory;
-    if (diff > maxdiff)
-      maxdiff = diff;
   }
+  double avg = sum_pstat / (double)NUM_AMINO_ACIDS;
   if (out_pass)
     *out_pass = pass;
-  return maxdiff;
+  return avg;
 }
 
 // ORF search (all subsequences) with strand-aware coordinate mapping
 
 static void print_gff_single(const char* chr, int seq_len, char strand, int s,
                              int e, int* gene_counter) {
-  // s,e are 0-based indices on current sequence (either + or RC). Map to
-  // original coords.
   int g_start, g_end;
   if (strand == '+') {
     g_start = s + 1;
@@ -507,7 +563,8 @@ static void print_gff_single(const char* chr, int seq_len, char strand, int s,
 
 static void print_gff_multi_spliced(const char* chr, int seq_len, char strand,
                                     const int* starts, const int* ends,
-                                    int exon_count, int* gene_counter) {
+                                    const int* phases, int exon_count,
+                                    int* gene_counter) {
   int g_start, g_end;
   if (strand == '+') {
     g_start = starts[0] + 1;
@@ -530,19 +587,13 @@ static void print_gff_multi_spliced(const char* chr, int seq_len, char strand,
       a_start = seq_len - ends[i];
       a_end = seq_len - starts[i];
     }
-    printf("%s\tsunfish\tCDS\t%d\t%d\t.\t%c\t0\tID=cds%d_%d;Parent=mRNA%d\n",
-           chr, a_start, a_end, strand, *gene_counter, i + 1, *gene_counter);
+    printf("%s\tsunfish\tCDS\t%d\t%d\t.\t%c\t%d\tID=cds%d_%d;Parent=mRNA%d\n",
+           chr, a_start, a_end, strand, phases[i] >= 0 ? phases[i] : 0,
+           *gene_counter, i + 1, *gene_counter);
   }
 }
 
-// DFS-based splicing enumeration without exon-count upper bound
-// Candidate struct used to store spliced ORF candidates during enumeration
-typedef struct SplicedCandidate {
-  int exon_count;
-  int* starts;
-  int* ends;
-  double diff; // peptide_max_stat_minus_theory value
-} SplicedCandidate;
+// Context for splicing recursion
 
 typedef struct SpliceDfsCtx {
   const char* sequence;
@@ -555,328 +606,239 @@ typedef struct SpliceDfsCtx {
   int na;
   int min_exon;
   int max_exon;
+  int max_pairs;
+  int min_orf_nt;
+  double pstat_threshold;
   double (*models)[NUM_AMINO_ACIDS + 1];
   int min_occ;
   int* gene_counter;
-  int* sel_d;
-  int* sel_a;
-  SplicedCandidate* candidates;
-  int cand_count;
-  int cand_cap;
+  const double* means;
+  const double* stds;
 } SpliceDfsCtx;
 
-static void try_emit_spliced_candidate(SpliceDfsCtx* ctx, const int* donors,
-                                       const int* accepts, int pair_count) {
-  const char* sequence = ctx->sequence;
-  int seq_len = ctx->seq_len;
-  int min_exon = ctx->min_exon;
-  int max_exon = ctx->max_exon;
-  double (*models)[NUM_AMINO_ACIDS + 1] = ctx->models;
-  int min_occ = ctx->min_occ;
-
-  int exon_count = pair_count + 1;
-  int* starts = (int*)malloc((size_t)exon_count * sizeof(int));
-  int* ends = (int*)malloc((size_t)exon_count * sizeof(int));
-  if (!starts || !ends) {
-    free(starts);
-    free(ends);
+static void find_splice_path_recursive(int current_pos, int accumulated_len,
+                                       int exon_idx, int* exon_starts,
+                                       int* exon_ends, int* exon_phases,
+                                       SpliceDfsCtx* ctx) {
+  if (exon_idx >= ctx->max_pairs) {
     return;
   }
-  starts[0] = 0;
-  ends[0] = donors[0];
-  for (int i = 1; i < pair_count; i++) {
-    starts[i] = accepts[i - 1];
-    ends[i] = donors[i];
+  if (ctx->nd > 1000 || ctx->na > 1000) {
+    fprintf(stderr,
+            "[WARN] Too many donor/acceptor sites (nd=%d, na=%d), aborting "
+            "this path.\n",
+            ctx->nd, ctx->na);
+    return;
   }
-  starts[pair_count] = accepts[pair_count - 1];
-  ends[pair_count] = seq_len - 1;
-
-  long total_len = 0;
-  for (int i = 0; i < exon_count; i++) {
-    int l = ends[i] - starts[i] + 1;
-    if (l < min_exon || l > max_exon) {
-      free(starts);
-      free(ends);
+  for (int p = current_pos; p + 2 < ctx->seq_len; p += 3) {
+    if (is_stop_triplet(ctx->sequence, p)) {
+      exon_ends[exon_idx] = p + 2;
+      int current_exon_len = exon_ends[exon_idx] - exon_starts[exon_idx] + 1;
+      if (accumulated_len + current_exon_len >= ctx->min_orf_nt) {
+        int final_exon_count = exon_idx + 1;
+        char* temp_cds = (char*)malloc(MAX_DNA_LEN);
+        if (temp_cds) {
+          long current_offset = 0;
+          for (int i = 0; i < final_exon_count; ++i) {
+            int len = exon_ends[i] - exon_starts[i] + 1;
+            memcpy(temp_cds + current_offset, ctx->sequence + exon_starts[i],
+                   (size_t)len);
+            current_offset += len;
+          }
+          temp_cds[current_offset] = '\0';
+          char* pep = translate_cds(temp_cds);
+          if (pep) {
+            bool pass = false;
+            double score = calculate_peptide_score(
+                pep, ctx->models, ctx->means, ctx->stds, ctx->min_occ, &pass);
+            if (pass && score >= ctx->pstat_threshold) {
+              print_gff_multi_spliced(ctx->chr_name, ctx->seq_len, ctx->strand,
+                                      exon_starts, exon_ends, exon_phases,
+                                      final_exon_count, ctx->gene_counter);
+            }
+            free(pep);
+          }
+          free(temp_cds);
+        }
+      }
       return;
     }
-    total_len += l;
-    if (total_len > (long)MAX_DNA_LEN - 1) {
-      free(starts);
-      free(ends);
+    bool donor_found = false;
+    for (int d_idx = 0; d_idx < ctx->nd; d_idx++) {
+      if (ctx->donor[d_idx] >= p && ctx->donor[d_idx] < p + 3) {
+        donor_found = true;
+        exon_ends[exon_idx] = ctx->donor[d_idx] - 1;
+        int current_exon_len = exon_ends[exon_idx] - exon_starts[exon_idx] + 1;
+        if (current_exon_len < ctx->min_exon)
+          continue;
+        for (int a_idx = 0; a_idx < ctx->na; a_idx++) {
+          if (ctx->accept[a_idx] > ctx->donor[d_idx]) {
+            int next_idx = exon_idx + 1;
+            if (next_idx >= ctx->max_pairs * 2) {
+              continue; // avoid out-of-bounds when reaching max exons
+            }
+            exon_starts[next_idx] = ctx->accept[a_idx];
+            int new_accumulated_len = accumulated_len + current_exon_len;
+            exon_phases[next_idx] = (3 - (new_accumulated_len % 3)) % 3;
+            find_splice_path_recursive(ctx->accept[a_idx], new_accumulated_len,
+                                       next_idx, exon_starts, exon_ends,
+                                       exon_phases, ctx);
+          }
+        }
+        return;
+      }
+    }
+    if (!donor_found) {
       return;
     }
   }
-
-  char* sp = (char*)malloc((size_t)total_len + 1);
-  if (!sp) {
-    free(starts);
-    free(ends);
-    return;
-  }
-  long off = 0;
-  for (int i = 0; i < exon_count; i++) {
-    int l = ends[i] - starts[i] + 1;
-    memcpy(sp + off, sequence + starts[i], (size_t)l);
-    off += l;
-  }
-  sp[off] = '\0';
-  // require start codon at beginning and in-frame stop at end
-  if (off < 6) { // at least two codons (start + stop) required
-    free(sp);
-    free(starts);
-    free(ends);
-    return;
-  }
-  if (!is_atg_triplet(sp, 0)) {
-    free(sp);
-    free(starts);
-    free(ends);
-    return;
-  }
-  if (off % 3 != 0) {
-    free(sp);
-    free(starts);
-    free(ends);
-    return;
-  }
-  int last_codon_pos = (int)off - 3;
-  if (!is_stop_triplet(sp, last_codon_pos)) {
-    free(sp);
-    free(starts);
-    free(ends);
-    return;
-  }
-  char* pep = translate_cds(sp);
-  if (pep) {
-    bool pass = false;
-    double diff = peptide_max_stat_minus_theory(pep, models, min_occ, &pass);
-    if (pass) {
-      // store candidate in ctx
-      if (ctx->cand_count >= ctx->cand_cap) {
-        int newcap = ctx->cand_cap ? ctx->cand_cap * 2 : 64;
-        SplicedCandidate* nc = (SplicedCandidate*)realloc(
-            ctx->candidates, newcap * sizeof(SplicedCandidate));
-        if (!nc) {
-          free(pep);
-          free(sp);
-          free(starts);
-          free(ends);
-          return;
-        }
-        ctx->candidates = nc;
-        ctx->cand_cap = newcap;
-      }
-      SplicedCandidate* c = &ctx->candidates[ctx->cand_count++];
-      c->exon_count = exon_count;
-      c->starts = (int*)malloc((size_t)exon_count * sizeof(int));
-      c->ends = (int*)malloc((size_t)exon_count * sizeof(int));
-      if (!c->starts || !c->ends) {
-        free(c->starts);
-        free(c->ends);
-        ctx->cand_count--;
-      } else {
-        for (int i = 0; i < exon_count; i++) {
-          c->starts[i] = starts[i];
-          c->ends[i] = ends[i];
-        }
-        c->diff = diff;
-      }
-    }
-    free(pep);
-  }
-  free(sp);
-  free(starts);
-  free(ends);
 }
 
-static void dfs_recur(SpliceDfsCtx* c, int d_from, int a_from, int pair_count,
-                      bool expect_donor) {
-  // If we just chose an accept (i.e., expect_donor==true now), we can emit
-  if (expect_donor && pair_count > 0) {
-    int last_acc_pos = c->accept[c->sel_a[pair_count - 1]];
-    if (c->seq_len - last_acc_pos >= c->min_exon) {
-      int* donors_buf = (int*)malloc((size_t)pair_count * sizeof(int));
-      int* accepts_buf = (int*)malloc((size_t)pair_count * sizeof(int));
-      if (donors_buf && accepts_buf) {
-        for (int i = 0; i < pair_count; i++) {
-          donors_buf[i] = c->donor[c->sel_d[i]];
-          accepts_buf[i] = c->accept[c->sel_a[i]];
-        }
-        try_emit_spliced_candidate(c, donors_buf, accepts_buf, pair_count);
-      }
-      free(donors_buf);
-      free(accepts_buf);
-    }
-  }
-
-  if (expect_donor) {
-    for (int di = d_from; di < c->nd; di++) {
-      int dpos = c->donor[di];
-      int l = (pair_count == 0)
-                  ? (dpos - 0 + 1)
-                  : (dpos - c->accept[c->sel_a[pair_count - 1]] + 1);
-      if (l < c->min_exon || l > c->max_exon)
-        continue;
-      int ai_start = a_from;
-      while (ai_start < c->na && c->accept[ai_start] < dpos + c->min_exon)
-        ai_start++;
-      if (ai_start >= c->na)
-        break;
-      c->sel_d[pair_count] = di;
-      dfs_recur(c, di + 1, ai_start, pair_count, false);
-    }
-  } else {
-    int last_d_pos = c->donor[c->sel_d[pair_count]];
-    for (int ai = a_from; ai < c->na; ai++) {
-      int apos = c->accept[ai];
-      if (apos < last_d_pos + c->min_exon)
-        continue;
-      if (c->seq_len - apos < c->min_exon)
-        break;
-      c->sel_a[pair_count] = ai;
-      dfs_recur(c, c->sel_d[pair_count] + 1, ai + 1, pair_count + 1, true);
-    }
-  }
-}
-
-static void
-dfs_splice_enumerate(const char* sequence, const char* chr_name, char strand,
-                     int seq_len, const int* donor, int nd, const int* accept,
-                     int na, int min_exon, int max_exon,
-                     double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
-                     int min_occ, int* gene_counter) {
-  int max_pairs = nd < na ? nd : na;
-  int* sel_d = (int*)malloc((size_t)max_pairs * sizeof(int));
-  int* sel_a = (int*)malloc((size_t)max_pairs * sizeof(int));
-  if (!sel_d || !sel_a) {
-    free(sel_d);
-    free(sel_a);
-    return;
-  }
-  SpliceDfsCtx ctx = {
-      sequence,     chr_name, strand,   seq_len,  donor,  nd,
-      accept,       na,       min_exon, max_exon, models, min_occ,
-      gene_counter, sel_d,    sel_a,    NULL,     0,      0};
-  dfs_recur(&ctx, 0, 0, 0, true);
-  // Post-process collected candidates: choose best per start coordinate
-  if (ctx.cand_count > 0) {
-    // We'll map start position -> best candidate index. Because start positions
-    // are bounded by seq_len, use an array of indices initialized to -1.
-    int* best_idx = (int*)malloc((size_t)ctx.seq_len * sizeof(int));
-    if (best_idx) {
-      for (int i = 0; i < ctx.seq_len; i++)
-        best_idx[i] = -1;
-      for (int ci = 0; ci < ctx.cand_count; ci++) {
-        SplicedCandidate* c = &ctx.candidates[ci];
-        if (c->exon_count <= 0 || !c->starts)
-          continue;
-        int start_pos = c->starts[0];
-        int prev = best_idx[start_pos];
-        if (prev == -1 || c->diff > ctx.candidates[prev].diff)
-          best_idx[start_pos] = ci;
-      }
-      for (int pos = 0; pos < ctx.seq_len; pos++) {
-        int bi = best_idx[pos];
-        if (bi == -1)
-          continue;
-        SplicedCandidate* c = &ctx.candidates[bi];
-        print_gff_multi_spliced(ctx.chr_name, ctx.seq_len, ctx.strand,
-                                c->starts, c->ends, c->exon_count,
-                                ctx.gene_counter);
-      }
-      free(best_idx);
-    }
-    // free candidate storage
-    for (int ci = 0; ci < ctx.cand_count; ci++) {
-      free(ctx.candidates[ci].starts);
-      free(ctx.candidates[ci].ends);
-    }
-    free(ctx.candidates);
-  }
-  free(sel_d);
-  free(sel_a);
-}
-
+// Unspliced ORF search
 void find_candidate_cds_iterative(
     const char* sequence, const char* chr_name, char strand, int ref_len,
-    double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1], int min_occ,
+    double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1], const double* means,
+    const double* stds, int min_occ, int min_orf_nt, double pstat_threshold,
     int* gene_counter) {
   int seq_len = (int)strlen(sequence);
-  (void)ref_len; // not needed, mapping uses seq_len which equals ref_len for +
-                 // and rc_len for -
-  for (int start = 0; start < seq_len - 2; start++) {
-    // require ATG at start position
-    if (!is_atg_triplet(sequence, start))
+  (void)ref_len;
+  for (int start = 0; start < seq_len - 5; start++) {
+    if (!is_atg_triplet(sequence, start)) {
       continue;
-    double best_diff = -INFINITY;
-    int best_end = -1;
-    for (int end = start + 2; end < seq_len; end++) {
-      int len = end - start + 1;
-      if (len > MAX_DNA_LEN - 1)
-        continue;
-      // require in-frame stop codon at end of ORF
-      int frame_len = len;
-      if (frame_len % 3 != 0)
-        continue;
-      int stop_pos = end - 2; // start position of last codon
-      if (!is_stop_triplet(sequence, stop_pos))
-        continue;
-      char* orf_seq = (char*)malloc(len + 1);
-      if (!orf_seq)
-        continue;
-      memcpy(orf_seq, sequence + start, len);
-      orf_seq[len] = '\0';
-      char* pep = translate_cds(orf_seq);
-      if (pep) {
-        bool pass = false;
-        double diff =
-            peptide_max_stat_minus_theory(pep, models, min_occ, &pass);
-        if (pass && diff > best_diff) {
-          best_diff = diff;
-          best_end = end;
-        }
-        free(pep);
+    }
+    int end_of_orf = -1;
+    for (int pos = start + 3; pos < seq_len - 2; pos += 3) {
+      if (is_stop_triplet(sequence, pos)) {
+        end_of_orf = pos + 2;
+        break;
       }
-      free(orf_seq);
     }
-    if (best_end != -1) {
-      print_gff_single(chr_name, seq_len, strand, start, best_end,
-                       gene_counter);
+    if (end_of_orf == -1) {
+      continue;
     }
+    int len = end_of_orf - start + 1;
+    if (len < min_orf_nt)
+      continue;
+    if (len > MAX_DNA_LEN - 1)
+      continue;
+    char* orf_seq = (char*)malloc((size_t)len + 1);
+    if (!orf_seq)
+      continue;
+    memcpy(orf_seq, sequence + start, (size_t)len);
+    orf_seq[len] = '\0';
+    char* pep = translate_cds(orf_seq);
+    if (pep) {
+      bool pass = false;
+      double score =
+          calculate_peptide_score(pep, models, means, stds, min_occ, &pass);
+      if (pass && score >= pstat_threshold) {
+        print_gff_single(chr_name, seq_len, strand, start, end_of_orf,
+                         gene_counter);
+      }
+      free(pep);
+    }
+    free(orf_seq);
   }
 }
 
+// 새로운 메인 스플라이싱 탐색 함수
 void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
                        int ref_len,
                        double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
-                       int min_occ, int* gene_counter) {
+                       const double* means, const double* stds, int min_occ,
+                       int min_exon, int min_orf_nt, double pstat_threshold,
+                       int* gene_counter) {
   int seq_len = (int)strlen(sequence);
-  (void)ref_len; // unused
-  int* donor = (int*)malloc((size_t)seq_len * sizeof(int));
-  int* accept = (int*)malloc((size_t)seq_len * sizeof(int));
-  int nd = 0, na = 0;
-  for (int i = 0; i < seq_len - 1; i++) {
-    char c1 = toupper(sequence[i]);
-    char c2 = toupper(sequence[i + 1]);
-    if (strand == '+') {
-      if (c1 == 'G' && c2 == 'T')
-        donor[nd++] = i;
-      if (c1 == 'A' && c2 == 'G')
-        accept[na++] = i + 1;
-    } else {
-      if (c1 == 'C' && c2 == 'T')
-        donor[nd++] = i; // CT on RC == GT on original
-      if (c1 == 'A' && c2 == 'C')
-        accept[na++] = i + 1; // AC on RC == AG on original
+  (void)ref_len;
+  // 윈도우 크기 및 슬라이드 간격을 defaults.h에서 조절
+  const int window_size = DEFAULT_SPLICE_WINDOW_SIZE;
+  const int window_slide = DEFAULT_SPLICE_WINDOW_SLIDE;
+  for (int win_start = 0; win_start < seq_len; win_start += window_slide) {
+    int win_end = win_start + window_size;
+    if (win_end > seq_len)
+      win_end = seq_len;
+    int win_len = win_end - win_start;
+    if (win_len < min_orf_nt)
+      continue;
+    // 윈도우 내 donor/acceptor 추출
+    int* donor = (int*)malloc((size_t)win_len * sizeof(int));
+    int* accept = (int*)malloc((size_t)win_len * sizeof(int));
+    if (!donor || !accept) {
+      free(donor);
+      free(accept);
+      continue;
     }
+    int nd = 0, na = 0;
+    for (int i = 0; i < win_len - 1; i++) {
+      char c1 = toupper(sequence[win_start + i]);
+      char c2 = toupper(sequence[win_start + i + 1]);
+      if (c1 == 'G' && c2 == 'T')
+        donor[nd++] = win_start + i;
+      if (c1 == 'A' && c2 == 'G')
+        accept[na++] = win_start + i;
+    }
+    if (nd == 0 || na == 0) {
+      free(donor);
+      free(accept);
+      continue;
+    }
+    if (nd > 1000 || na > 1000) {
+      fprintf(stderr,
+              "[WARN] Too many donor/acceptor sites in window (nd=%d, na=%d), "
+              "skipping window.\n",
+              nd, na);
+      free(donor);
+      free(accept);
+      continue;
+    }
+    SpliceDfsCtx ctx = {.sequence = sequence,
+                        .chr_name = chr_name,
+                        .strand = strand,
+                        .seq_len = seq_len,
+                        .donor = donor,
+                        .nd = nd,
+                        .accept = accept,
+                        .na = na,
+                        .min_exon = min_exon,
+                        .max_exon = 10000,
+                        .max_pairs = DEFAULT_MAX_SPLICE_PAIRS,
+                        .min_orf_nt = min_orf_nt,
+                        .pstat_threshold = pstat_threshold,
+                        .models = models,
+                        .min_occ = min_occ,
+                        .gene_counter = gene_counter,
+                        .means = means,
+                        .stds = stds};
+    int max_exons = ctx.max_pairs * 2;
+    int cap_exons = max_exons + 2;
+    int* exon_starts = (int*)malloc((size_t)cap_exons * sizeof(int));
+    int* exon_ends = (int*)malloc((size_t)cap_exons * sizeof(int));
+    int* exon_phases = (int*)malloc((size_t)cap_exons * sizeof(int));
+    if (!exon_starts || !exon_ends || !exon_phases) {
+      free(exon_starts);
+      free(exon_ends);
+      free(exon_phases);
+      free(donor);
+      free(accept);
+      continue;
+    }
+    for (int start_pos = win_start; start_pos < win_end - 5; start_pos++) {
+      if (is_atg_triplet(sequence, start_pos)) {
+        memset(exon_starts, 0, (size_t)cap_exons * sizeof(int));
+        memset(exon_ends, 0, (size_t)cap_exons * sizeof(int));
+        memset(exon_phases, 0, (size_t)cap_exons * sizeof(int));
+        exon_starts[0] = start_pos;
+        exon_phases[0] = 0;
+        find_splice_path_recursive(start_pos, 0, 0, exon_starts, exon_ends,
+                                   exon_phases, &ctx);
+      }
+    }
+    free(exon_starts);
+    free(exon_ends);
+    free(exon_phases);
+    free(donor);
+    free(accept);
   }
-  const int MIN_EXON = 10, MAX_EXON = 10000;
-  if (nd > 0 && na > 0) {
-    dfs_splice_enumerate(sequence, chr_name, strand, seq_len, donor, nd, accept,
-                         na, MIN_EXON, MAX_EXON, models, min_occ, gene_counter);
-  }
-  free(donor);
-  free(accept);
 }
 
 // Training Mode
@@ -891,10 +853,10 @@ void handle_train(int argc, char* argv[]) {
   }
   const char* fasta_path = argv[2];
   const char* gff_path = argv[3];
-  int min_occ = 1;
-  double lr = 0.01;
-  int iters = 1000;
-  double l1 = 0.05;
+  int min_occ = DEFAULT_MIN_OCC;
+  double lr = DEFAULT_LR;
+  int iters = DEFAULT_ITERS;
+  double l1 = DEFAULT_L1;
   for (int i = 4; i < argc; i++) {
     if ((strcmp(argv[i], "--min-occ") == 0 || strcmp(argv[i], "-m") == 0) &&
         i + 1 < argc) {
@@ -937,7 +899,7 @@ void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Loaded %d CDS groups\n", group_count);
 
   PeptideInfo* peptides =
-      (PeptideInfo*)malloc(group_count * sizeof(PeptideInfo));
+      (PeptideInfo*)malloc((size_t)group_count * sizeof(PeptideInfo));
   int peptide_count = 0;
   for (int g = 0; g < group_count; g++) {
     CdsGroup* grp = &groups[g];
@@ -952,7 +914,6 @@ void handle_train(int argc, char* argv[]) {
     }
     if (!chr_seq)
       continue;
-    // sort exons by start
     for (int i = 0; i < grp->exon_count - 1; i++)
       for (int j = 0; j < grp->exon_count - 1 - i; j++)
         if (grp->exons[j].start > grp->exons[j + 1].start) {
@@ -973,7 +934,7 @@ void handle_train(int argc, char* argv[]) {
           if (l <= 0)
             break;
         }
-        memcpy(cds_seq + cds_len, chr_seq + s, l);
+        memcpy(cds_seq + cds_len, chr_seq + s, (size_t)l);
         cds_len += (size_t)l;
       }
     }
@@ -1000,20 +961,52 @@ void handle_train(int argc, char* argv[]) {
     exit(1);
   }
 
-  int total_counts[NUM_AMINO_ACIDS] = {0};
-  for (int i = 0; i < peptide_count; i++)
-    for (int j = 0; j < NUM_AMINO_ACIDS; j++)
-      total_counts[j] += peptides[i].counts[j];
+  double* feature_means = (double*)malloc(NUM_AMINO_ACIDS * sizeof(double));
+  double* feature_stds = (double*)malloc(NUM_AMINO_ACIDS * sizeof(double));
+  for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
+    feature_means[k] = 0.0;
+    feature_stds[k] = 0.0;
+  }
+
+  double** Xraw = (double**)malloc((size_t)peptide_count * sizeof(double*));
+  int* y_allocation = (int*)malloc((size_t)peptide_count * sizeof(int));
+  for (int i = 0; i < peptide_count; i++) {
+    int L = (int)strlen(peptides[i].sequence);
+    if (L <= 0)
+      L = 1;
+    Xraw[i] = (double*)malloc(NUM_AMINO_ACIDS * sizeof(double));
+    for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
+      double freq = (double)peptides[i].counts[k] / (double)L;
+      Xraw[i][k] = freq;
+      feature_means[k] += freq;
+    }
+  }
+  for (int k = 0; k < NUM_AMINO_ACIDS; k++)
+    feature_means[k] /= (double)peptide_count;
+  for (int i = 0; i < peptide_count; i++) {
+    for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
+      double d = Xraw[i][k] - feature_means[k];
+      feature_stds[k] += d * d;
+    }
+  }
+  for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
+    feature_stds[k] = sqrt(feature_stds[k] / (double)peptide_count);
+    if (feature_stds[k] == 0.0)
+      feature_stds[k] = 1.0;
+  }
 
   double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1];
   for (int aa = 0; aa < NUM_AMINO_ACIDS; aa++) {
-    int* y = (int*)malloc(peptide_count * sizeof(int));
-    double** X = (double**)malloc(peptide_count * sizeof(double*));
+    int* y = (int*)malloc((size_t)peptide_count * sizeof(int));
+    double** X = (double**)malloc((size_t)peptide_count * sizeof(double*));
     for (int i = 0; i < peptide_count; i++) {
       y[i] = (peptides[i].counts[aa] >= min_occ) ? 1 : 0;
       X[i] = (double*)malloc(NUM_AMINO_ACIDS * sizeof(double));
-      for (int k = 0; k < NUM_AMINO_ACIDS; k++)
-        X[i][k] = (double)(total_counts[k] - peptides[i].counts[k]);
+      for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
+        double feat = Xraw[i][k];
+        double xv = (feat - feature_means[k]) / feature_stds[k];
+        X[i][k] = xv;
+      }
     }
     train_logistic_regression((const double* const*)X, y, peptide_count,
                               NUM_AMINO_ACIDS, models[aa], lr, iters, l1);
@@ -1022,11 +1015,25 @@ void handle_train(int argc, char* argv[]) {
     free(X);
     free(y);
   }
+  for (int i = 0; i < peptide_count; i++)
+    free(Xraw[i]);
+  free(Xraw);
+  free(y_allocation);
+
   FILE* mf = fopen("sunfish.model", "w");
   if (!mf) {
     fprintf(stderr, "Error: Cannot create model file\n");
     exit(1);
   }
+  fprintf(mf, "#min_occ %d\n", min_occ);
+  fprintf(mf, "#means");
+  for (int k = 0; k < NUM_AMINO_ACIDS; k++)
+    fprintf(mf, " %.10f", feature_means[k]);
+  fprintf(mf, "\n");
+  fprintf(mf, "#stds");
+  for (int k = 0; k < NUM_AMINO_ACIDS; k++)
+    fprintf(mf, " %.10f", feature_stds[k]);
+  fprintf(mf, "\n");
   for (int aa = 0; aa < NUM_AMINO_ACIDS; aa++) {
     for (int k = 0; k <= NUM_AMINO_ACIDS; k++) {
       fprintf(mf, "%.10f", models[aa][k]);
@@ -1037,6 +1044,8 @@ void handle_train(int argc, char* argv[]) {
   }
   fclose(mf);
   fprintf(stderr, "Training complete. Model saved to sunfish.model\n");
+  free(feature_means);
+  free(feature_stds);
   for (int i = 0; i < peptide_count; i++)
     free(peptides[i].sequence);
   free(peptides);
@@ -1046,6 +1055,13 @@ void handle_train(int argc, char* argv[]) {
 
 // Prediction Mode
 
+void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
+                       int ref_len,
+                       double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
+                       const double* means, const double* stds, int min_occ,
+                       int min_exon, int min_orf_nt, double pstat_threshold,
+                       int* gene_counter);
+
 void handle_predict(int argc, char* argv[]) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s predict <target.fasta> [--min-occ N|-m N]\n",
@@ -1053,22 +1069,49 @@ void handle_predict(int argc, char* argv[]) {
     exit(1);
   }
   const char* fasta_path = argv[2];
-  int min_occ = 3;
+  int min_occ = DEFAULT_MIN_OCC;
+  int min_exon = DEFAULT_MIN_EXON;
+  int min_orf_nt = DEFAULT_MIN_ORF_NT;
+  double pstat_threshold = DEFAULT_P_STAT_THRESHOLD;
   for (int i = 3; i < argc; i++) {
     if ((strcmp(argv[i], "--min-occ") == 0 || strcmp(argv[i], "-m") == 0) &&
         i + 1 < argc) {
       min_occ = atoi(argv[++i]);
       if (min_occ < 1)
         min_occ = 1;
+    } else if (strcmp(argv[i], "--min-exon") == 0 && i + 1 < argc) {
+      min_exon = atoi(argv[++i]);
+      if (min_exon < 1)
+        min_exon = 1;
+    } else if (strcmp(argv[i], "--min-orf") == 0 && i + 1 < argc) {
+      min_orf_nt = atoi(argv[++i]);
+      if (min_orf_nt < 3)
+        min_orf_nt = 3;
+    } else if (strcmp(argv[i], "--pstat-threshold") == 0 && i + 1 < argc) {
+      pstat_threshold = strtod(argv[++i], NULL);
     } else {
       fprintf(stderr, "Warning: Unknown or incomplete option '%s' ignored\n",
               argv[i]);
     }
   }
   double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1];
-  if (!load_model("sunfish.model", models)) {
+  double means[NUM_AMINO_ACIDS];
+  double stds[NUM_AMINO_ACIDS];
+  int model_min_occ = -1;
+  if (!load_model("sunfish.model", models, means, stds, &model_min_occ)) {
     fprintf(stderr, "Failed to load model. Run 'train' first.\n");
     exit(1);
+  }
+  if (model_min_occ > 0) {
+    bool user_specified = false;
+    for (int i = 3; i < argc; i++) {
+      if ((strcmp(argv[i], "--min-occ") == 0 || strcmp(argv[i], "-m") == 0)) {
+        user_specified = true;
+        break;
+      }
+    }
+    if (!user_specified)
+      min_occ = model_min_occ;
   }
   FastaData* genome = parse_fasta(fasta_path);
   if (!genome) {
@@ -1082,18 +1125,23 @@ void handle_predict(int argc, char* argv[]) {
     const char* seq = genome->records[i].sequence;
     int L = (int)strlen(seq);
     fprintf(stderr, "Processing %s (+ strand)...\n", id);
-    find_candidate_cds_iterative(seq, id, '+', L, models, min_occ,
-                                 &gene_counter);
-    find_spliced_orfs(seq, id, '+', L, models, min_occ, &gene_counter);
+    fflush(stderr);
+    find_candidate_cds_iterative(seq, id, '+', L, models, means, stds, min_occ,
+                                 min_orf_nt, pstat_threshold, &gene_counter);
     fprintf(stderr, "Processing %s (- strand)...\n", id);
+    fflush(stderr);
     char* rc = reverse_complement(seq);
     if (rc) {
       int rcL = (int)strlen(rc);
-      find_candidate_cds_iterative(rc, id, '-', rcL, models, min_occ,
+      find_candidate_cds_iterative(rc, id, '-', rcL, models, means, stds,
+                                   min_occ, min_orf_nt, pstat_threshold,
                                    &gene_counter);
-      find_spliced_orfs(rc, id, '-', rcL, models, min_occ, &gene_counter);
+      find_spliced_orfs(rc, id, '-', rcL, models, means, stds, min_occ,
+                        min_exon, min_orf_nt, pstat_threshold, &gene_counter);
       free(rc);
     }
+    find_spliced_orfs(seq, id, '+', L, models, means, stds, min_occ, min_exon,
+                      min_orf_nt, pstat_threshold, &gene_counter);
   }
   fprintf(stderr, "Prediction complete. Found %d genes.\n", gene_counter);
   free_fasta_data(genome);
