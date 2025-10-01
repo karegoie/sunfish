@@ -74,6 +74,7 @@ Predict genes in a target genome using the trained model:
 **Output:**
 - GFF3 format gene annotations written to stdout
 - Progress messages written to stderr
+ - Real-time output: records are flushed line-by-line to stdout; progress logs are unbuffered on stderr
 
 **Options:**
 - `--min-occ N` or `-m N`: Minimum occurrence k used in the validation criterion (default 1)
@@ -81,6 +82,12 @@ Predict genes in a target genome using the trained model:
 **Example:**
 ```bash
 ./bin/sunfish predict target_genome.fasta --min-occ 3 > predicted_genes.gff3
+```
+
+While piping/redirecting, GFF3 lines are flushed immediately so you can tail the file in real-time:
+```bash
+./bin/sunfish predict target_genome.fasta > predicted.gff3 &
+tail -f predicted.gff3
 ```
 
 ## Algorithm Details

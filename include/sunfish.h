@@ -23,6 +23,7 @@
 #define DEFAULT_MIN_EXON 300
 #define DEFAULT_MIN_ORF_NT 900
 #define DEFAULT_P_STAT_THRESHOLD 0.5
+#define DEFAULT_P_STAT_SPLICED_THRESHOLD 0.0
 #define DEFAULT_MAX_SPLICE_PAIRS 5
 #define DEFAULT_SPLICE_WINDOW_SIZE 10000
 #define DEFAULT_SPLICE_WINDOW_SLIDE 10000
@@ -33,6 +34,9 @@
 // Defaults for splicing search limits
 #define DEFAULT_MAX_SITES_PER_WINDOW 200
 #define DEFAULT_MAX_RECURSIONS_PER_WINDOW 2000
+
+// Branch point usage default (0=disabled, 1=enabled)
+#define DEFAULT_USE_BRANCHPOINT 0
 
 // Data Structures
 typedef struct {
