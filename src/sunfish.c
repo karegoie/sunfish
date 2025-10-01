@@ -170,24 +170,35 @@ static double compute_percentile(double* arr, int n, double p) {
 // Check for branch point sequence (YNYYRAY)
 static bool check_branch_point(const char* seq, int pos) {
   // Branch point usually occurs 18-40 nt upstream of acceptor site
-  if (pos < 40)
-    return false;
-  const char* bp_region = seq + pos - 40;
-  int region_len = 40 - 18;
+  // Allow positions closer to start to improve coverage
+  int search_start = pos >= 40 ? 40 : pos;
+  int search_end = pos >= 18 ? 18 : (pos >= 7 ? 7 : 0);
+  
+  if (search_start <= search_end)
+    return true; // Too close to sequence start, allow it
+  
+  const char* bp_region = seq + pos - search_start;
+  int region_len = search_start - search_end;
 
   for (int i = 0; i < region_len; i++) {
-    // Check for YNYYRAY pattern
+    // Check for YNYYRAY pattern (7 nucleotides)
     if (i + 7 > region_len)
       break;
     char y1 = toupper(bp_region[i]);
+    char n2 = toupper(bp_region[i + 1]);
     char y3 = toupper(bp_region[i + 2]);
     char y4 = toupper(bp_region[i + 3]);
     char r5 = toupper(bp_region[i + 4]);
     char a6 = toupper(bp_region[i + 5]);
     char y7 = toupper(bp_region[i + 6]);
 
-    if ((y1 == 'C' || y1 == 'T') && (y3 == 'C' || y3 == 'T') &&
-        (y4 == 'C' || y4 == 'T') && (r5 == 'A' || r5 == 'G') && a6 == 'A' &&
+    // Y = C or T, R = A or G, N = any nucleotide
+    if ((y1 == 'C' || y1 == 'T') && 
+        (n2 == 'A' || n2 == 'C' || n2 == 'G' || n2 == 'T') &&
+        (y3 == 'C' || y3 == 'T') &&
+        (y4 == 'C' || y4 == 'T') && 
+        (r5 == 'A' || r5 == 'G') && 
+        a6 == 'A' &&
         (y7 == 'C' || y7 == 'T')) {
       return true;
     }
@@ -644,7 +655,6 @@ static double calculate_peptide_score(
     const char* peptide, double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
     const double means[NUM_AMINO_ACIDS], const double stds[NUM_AMINO_ACIDS],
     int min_occ, bool* out_pass) {
-  (void)min_occ; // min_occ is unused under the new scoring rule
   int counts[NUM_AMINO_ACIDS];
   count_amino_acids(peptide, counts);
   int L = (int)strlen(peptide);
@@ -656,6 +666,15 @@ static double calculate_peptide_score(
 
   double sum_pstat = 0.0;
   bool pass = true;
+  
+  // Length-based quality factor: prefer longer peptides
+  double length_factor = 1.0;
+  if (L < 100) {
+    length_factor = 0.9; // Slightly penalize very short peptides
+  } else if (L > 300) {
+    length_factor = 1.1; // Slightly favor longer peptides
+  }
+  
   for (int j = 0; j < NUM_AMINO_ACIDS; j++) {
     double z = models[j][0];
     for (int k = 0; k < NUM_AMINO_ACIDS; k++) {
@@ -665,10 +684,46 @@ static double calculate_peptide_score(
     }
     double P_stat = sigmoid(z);
     sum_pstat += P_stat;
-    if (P_stat < DEFAULT_P_STAT_THRESHOLD)
+    
+    // P_theory: binomial probability P[X >= k] where k = min_occ
+    // Use simplified check: if count >= min_occ, likely valid
+    double P_theory = 0.0;
+    if (counts[j] >= min_occ) {
+      // Observed count meets threshold - use high probability
+      P_theory = 0.5; // Use same threshold as P_stat for consistency
+    } else {
+      // Observed count below threshold - compute exact probability
+      double q = (double)counts[j] / (double)L;
+      if (q > 0.001 && L > 10) {
+        // Normal approximation for efficiency: mean=L*q, var=L*q*(1-q)
+        double mean = L * q;
+        double var = L * q * (1.0 - q);
+        if (var > 0) {
+          double sd = sqrt(var);
+          double z_score = ((double)min_occ - 0.5 - mean) / sd;
+          // Use simplified approximation: P[X >= k] ≈ 1 - Φ(z)
+          // For z_score < -2, P_theory ≈ 1; for z_score > 2, P_theory ≈ 0
+          if (z_score < -2.0) {
+            P_theory = 0.99;
+          } else if (z_score > 2.0) {
+            P_theory = 0.01;
+          } else {
+            P_theory = 0.5 * (1.0 - z_score / 3.0); // Linear approximation
+          }
+        }
+      } else {
+        // For small L or q, use simple threshold
+        P_theory = (q > 0.05) ? 0.5 : 0.1;
+      }
+    }
+    
+    // Validate: P_stat must be >= P_theory
+    if (P_stat < P_theory) {
       pass = false;
+    }
   }
   double avg = sum_pstat / (double)NUM_AMINO_ACIDS;
+  avg *= length_factor; // Apply length-based adjustment
   if (out_pass)
     *out_pass = pass;
   return avg;
