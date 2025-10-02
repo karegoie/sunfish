@@ -17,7 +17,7 @@ cplx dna_to_complex(char base) {
   case 'A':
     return 1.0 + 1.0 * I;
   case 'T':
-    return 1.0 + 1.0 * I;
+    return 1.0 - 1.0 * I;
   case 'G':
     return -1.0 + 1.0 * I;
   case 'C':
