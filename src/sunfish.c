@@ -2169,8 +2169,26 @@ static void handle_train(int argc, char* argv[]) {
   if (splice_pwm) {
     fprintf(stderr, "Splice PWM training complete (min donor=%.3f, min acceptor=%.3f)\n",
             splice_pwm->min_donor_score, splice_pwm->min_acceptor_score);
-    // TODO: Store PWM in model file for use during prediction
+    
+    // Store PWM in model for use during prediction
+    model.pwm.has_donor = 1;
+    model.pwm.has_acceptor = 1;
+    model.pwm.pwm_weight = 1.0;
+    model.pwm.min_donor_score = splice_pwm->min_donor_score;
+    model.pwm.min_acceptor_score = splice_pwm->min_acceptor_score;
+    
+    // Copy PWM matrices
+    for (int i = 0; i < NUM_NUCLEOTIDES; i++) {
+      for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+        model.pwm.donor_pwm[i][j] = splice_pwm->donor_pwm[i][j];
+      }
+      for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+        model.pwm.acceptor_pwm[i][j] = splice_pwm->acceptor_pwm[i][j];
+      }
+    }
+    
     free(splice_pwm);
+    fprintf(stderr, "PWM integrated into model.\n");
   } else {
     fprintf(stderr, "Warning: Failed to train splice PWM model\n");
   }

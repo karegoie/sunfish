@@ -34,9 +34,60 @@ static inline bool is_strict_dna_base(char base) {
   }
 }
 
+static inline int base_to_index(char base) {
+  switch (base) {
+  case 'A':
+    return 0;
+  case 'C':
+    return 1;
+  case 'G':
+    return 2;
+  case 'T':
+    return 3;
+  default:
+    return -1;
+  }
+}
+
+static double pwm_score_at(const double pwm[][DONOR_MOTIF_SIZE], int pwm_len,
+                          const char* sequence, int seq_len, int start_pos) {
+  if (!sequence || start_pos < 0 || start_pos + pwm_len > seq_len) {
+    return 0.0;
+  }
+  
+  double score = 0.0;
+  for (int i = 0; i < pwm_len; i++) {
+    char base = normalize_base(sequence[start_pos + i]);
+    int idx = base_to_index(base);
+    if (idx < 0) {
+      return 0.0; // Invalid base, no contribution
+    }
+    score += pwm[idx][i];
+  }
+  return score;
+}
+
+static double pwm_score_acceptor(const double pwm[][ACCEPTOR_MOTIF_SIZE],
+                                 const char* sequence, int seq_len, int start_pos) {
+  if (!sequence || start_pos < 0 || start_pos + ACCEPTOR_MOTIF_SIZE > seq_len) {
+    return 0.0;
+  }
+  
+  double score = 0.0;
+  for (int i = 0; i < ACCEPTOR_MOTIF_SIZE; i++) {
+    char base = normalize_base(sequence[start_pos + i]);
+    int idx = base_to_index(base);
+    if (idx < 0) {
+      return 0.0; // Invalid base, no contribution
+    }
+    score += pwm[idx][i];
+  }
+  return score;
+}
+
 static double splice_signal_adjustment(const char* sequence, int seq_len,
                                        int prev_state, int curr_state,
-                                       int position) {
+                                       int position, const PWMModel* pwm) {
   if (!sequence || seq_len <= 0) {
     return 0.0;
   }
@@ -45,36 +96,53 @@ static double splice_signal_adjustment(const char* sequence, int seq_len,
   static const double kMatchBonus = 1e-3;
   static const double kMismatchPenalty = -1e-3;
 
+  double adjustment = 0.0;
+
+  // Exon -> Intron transition (donor site)
   if (hmm_is_exon_state(prev_state) && curr_state == STATE_INTRON) {
     if (position + 1 >= seq_len) {
       return 0.0;
     }
 
+    // Simple GT check
     char first = normalize_base(sequence[position]);
     char second = normalize_base(sequence[position + 1]);
-    if (!is_strict_dna_base(first) || !is_strict_dna_base(second)) {
-      return 0.0;
+    if (is_strict_dna_base(first) && is_strict_dna_base(second)) {
+      adjustment += (first == 'G' && second == 'T') ? kMatchBonus : kMismatchPenalty;
     }
 
-    return (first == 'G' && second == 'T') ? kMatchBonus : kMismatchPenalty;
+    // Add PWM score if available
+    if (pwm && pwm->has_donor) {
+      int donor_start = position;
+      double pwm_score = pwm_score_at((const double (*)[DONOR_MOTIF_SIZE])pwm->donor_pwm,
+                                     DONOR_MOTIF_SIZE, sequence, seq_len, donor_start);
+      adjustment += pwm_score * pwm->pwm_weight;
+    }
   }
 
+  // Intron -> Exon transition (acceptor site)
   if (prev_state == STATE_INTRON && hmm_is_exon_state(curr_state)) {
     if (position - 2 < 0 || position - 1 < 0) {
       return 0.0;
     }
 
+    // Simple AG check
     char penultimate = normalize_base(sequence[position - 2]);
     char ultimate = normalize_base(sequence[position - 1]);
-    if (!is_strict_dna_base(penultimate) || !is_strict_dna_base(ultimate)) {
-      return 0.0;
+    if (is_strict_dna_base(penultimate) && is_strict_dna_base(ultimate)) {
+      adjustment += (penultimate == 'A' && ultimate == 'G') ? kMatchBonus : kMismatchPenalty;
     }
 
-    return (penultimate == 'A' && ultimate == 'G') ? kMatchBonus
-                                                   : kMismatchPenalty;
+    // Add PWM score if available
+    if (pwm && pwm->has_acceptor) {
+      int acceptor_start = position - ACCEPTOR_MOTIF_SIZE;
+      double pwm_score = pwm_score_acceptor((const double (*)[ACCEPTOR_MOTIF_SIZE])pwm->acceptor_pwm,
+                                           sequence, seq_len, acceptor_start);
+      adjustment += pwm_score * pwm->pwm_weight;
+    }
   }
 
-  return 0.0;
+  return adjustment;
 }
 
 void hmm_init(HMMModel* model, int num_features) {
@@ -119,6 +187,21 @@ void hmm_init(HMMModel* model, int num_features) {
   for (int f = 0; f < num_features; f++) {
     model->global_feature_mean[f] = 0.0;
     model->global_feature_stddev[f] = 1.0;
+  }
+
+  // Initialize PWM model
+  model->pwm.has_donor = 0;
+  model->pwm.has_acceptor = 0;
+  model->pwm.pwm_weight = 1.0;
+  model->pwm.min_donor_score = 0.0;
+  model->pwm.min_acceptor_score = 0.0;
+  for (int i = 0; i < NUM_NUCLEOTIDES; i++) {
+    for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+      model->pwm.donor_pwm[i][j] = 0.0;
+    }
+    for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+      model->pwm.acceptor_pwm[i][j] = 0.0;
+    }
   }
 }
 
@@ -437,7 +520,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
 
       for (int i = 0; i < NUM_STATES; i++) {
         double transition_log = log(model->transition[i][j]);
-        transition_log += splice_signal_adjustment(sequence, seq_len, i, j, t);
+        transition_log += splice_signal_adjustment(sequence, seq_len, i, j, t, &model->pwm);
         double val = delta[t - 1][i] + transition_log;
         if (val > max_val) {
           max_val = val;
@@ -537,6 +620,62 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     fprintf(fp, "%.10f ", model->global_feature_stddev[i]);
   }
   fprintf(fp, "\n");
+
+  // Save PWM if present
+  if (model->pwm.has_donor || model->pwm.has_acceptor) {
+    fprintf(fp, "PWM\n");
+    fprintf(fp, "WEIGHT %.10f\n", model->pwm.pwm_weight);
+    
+    if (model->pwm.has_donor) {
+      fprintf(fp, "DONOR %d\n", DONOR_MOTIF_SIZE);
+      fprintf(fp, "A:");
+      for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.donor_pwm[0][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "C:");
+      for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.donor_pwm[1][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "G:");
+      for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.donor_pwm[2][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "T:");
+      for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.donor_pwm[3][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "MIN_SCORE %.10f\n", model->pwm.min_donor_score);
+    }
+    
+    if (model->pwm.has_acceptor) {
+      fprintf(fp, "ACCEPTOR %d\n", ACCEPTOR_MOTIF_SIZE);
+      fprintf(fp, "A:");
+      for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.acceptor_pwm[0][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "C:");
+      for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.acceptor_pwm[1][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "G:");
+      for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.acceptor_pwm[2][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "T:");
+      for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+        fprintf(fp, " %.10f", model->pwm.acceptor_pwm[3][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "MIN_SCORE %.10f\n", model->pwm.min_acceptor_score);
+    }
+  }
 
   fclose(fp);
   return true;
@@ -752,6 +891,122 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
     for (int i = 0; i < model->num_features; i++) {
       model->global_feature_mean[i] = 0.0;
       model->global_feature_stddev[i] = 1.0;
+    }
+  }
+
+  // Initialize PWM with defaults
+  model->pwm.has_donor = 0;
+  model->pwm.has_acceptor = 0;
+  model->pwm.pwm_weight = 1.0;
+  model->pwm.min_donor_score = 0.0;
+  model->pwm.min_acceptor_score = 0.0;
+
+  // Read PWM block if present (optional for backward compatibility)
+  if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "PWM", 3) == 0) {
+    // Read WEIGHT line
+    if (fgets(line, sizeof(line), fp) != NULL) {
+      if (sscanf(line, "WEIGHT %lf", &model->pwm.pwm_weight) != 1) {
+        model->pwm.pwm_weight = 1.0;
+      }
+    }
+
+    // Read DONOR or ACCEPTOR blocks
+    while (fgets(line, sizeof(line), fp) != NULL) {
+      if (strncmp(line, "DONOR", 5) == 0) {
+        int donor_size = 0;
+        if (sscanf(line, "DONOR %d", &donor_size) == 1 && 
+            donor_size == DONOR_MOTIF_SIZE) {
+          model->pwm.has_donor = 1;
+          
+          // Read A: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "A:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[0][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read C: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "C:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[1][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read G: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "G:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[2][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read T: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "T:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[3][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read MIN_SCORE line
+          if (fgets(line, sizeof(line), fp) != NULL) {
+            sscanf(line, "MIN_SCORE %lf", &model->pwm.min_donor_score);
+          }
+        }
+      } else if (strncmp(line, "ACCEPTOR", 8) == 0) {
+        int acceptor_size = 0;
+        if (sscanf(line, "ACCEPTOR %d", &acceptor_size) == 1 && 
+            acceptor_size == ACCEPTOR_MOTIF_SIZE) {
+          model->pwm.has_acceptor = 1;
+          
+          // Read A: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "A:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[0][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read C: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "C:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[1][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read G: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "G:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[2][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read T: line
+          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "T:", 2) == 0) {
+            char* ptr = line + 2;
+            for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[3][j]) != 1) break;
+              ptr = strchr(ptr, ' ');
+              if (ptr) ptr++; else break;
+            }
+          }
+          // Read MIN_SCORE line
+          if (fgets(line, sizeof(line), fp) != NULL) {
+            sscanf(line, "MIN_SCORE %lf", &model->pwm.min_acceptor_score);
+          }
+        }
+      }
     }
   }
 
