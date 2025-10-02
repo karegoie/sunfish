@@ -52,7 +52,7 @@ void generate_morlet_wavelet(double scale, int length, cplx* output) {
 
 bool convolve_with_wavelet(const cplx* signal, int signal_len,
                            const cplx* wavelet, int wavelet_len,
-                           double* output) {
+                           cplx* output) {
   // Find common padded length (power of 2)
   int max_len = signal_len + wavelet_len - 1;
   int padded_len = next_power_of_2(max_len);
@@ -83,10 +83,12 @@ bool convolve_with_wavelet(const cplx* signal, int signal_len,
   // Inverse FFT
   ifft(signal_padded, padded_len);
 
-  // Extract magnitude (raw, un-normalized)
-  // The valid convolution result is in the first signal_len elements
+  // Calculate offset to correct for convolution delay
+  int offset = wavelet_len / 2;
+
+  // Extract complex values with offset correction
   for (int i = 0; i < signal_len; i++) {
-    output[i] = cabs(signal_padded[i]);
+    output[i] = signal_padded[i + offset];
   }
 
   free(signal_padded);
@@ -122,13 +124,31 @@ bool compute_cwt_features(const char* sequence, int seq_len,
 
     generate_morlet_wavelet(scales[s], wavelet_len, wavelet);
 
-    if (!convolve_with_wavelet(signal, seq_len, wavelet, wavelet_len,
-                               features[s])) {
+    // Allocate temporary buffer for complex results
+    cplx* cwt_result = (cplx*)malloc(seq_len * sizeof(cplx));
+    if (cwt_result == NULL) {
       free(wavelet);
       free(signal);
       return false;
     }
 
+    if (!convolve_with_wavelet(signal, seq_len, wavelet, wavelet_len,
+                               cwt_result)) {
+      free(cwt_result);
+      free(wavelet);
+      free(signal);
+      return false;
+    }
+
+    // Split complex result into real and imaginary parts
+    // features[s * 2] = real part
+    // features[s * 2 + 1] = imaginary part
+    for (int i = 0; i < seq_len; i++) {
+      features[s * 2][i] = creal(cwt_result[i]);
+      features[s * 2 + 1][i] = cimag(cwt_result[i]);
+    }
+
+    free(cwt_result);
     free(wavelet);
   }
 
