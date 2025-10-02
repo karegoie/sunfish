@@ -63,5 +63,6 @@ void free_fasta_data(FastaData* data);
 FastaData* parse_fasta(const char* path);
 void free_cds_groups(CdsGroup* groups, int count);
 CdsGroup* parse_gff_for_cds(const char* path, int* group_count);
+char* reverse_complement(const char* sequence);
 
 #endif // SUNFISH_H

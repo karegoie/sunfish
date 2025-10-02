@@ -1,4 +1,0 @@
-##gff-version 3
-test_seq1testCDS1090.+0Parent=gene1
-test_seq1testCDS110190.+0Parent=gene1
-test_seq2testCDS2080.+0Parent=gene2

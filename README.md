@@ -31,6 +31,11 @@ This is an advanced version of the Sunfish gene annotation tool that uses a Cont
    - Thread-safe output queue
    - Configurable number of threads
 
+6. **Bidirectional Strand Support**
+   - Reverse complement augmentation during training
+   - Viterbi prediction on both + and - strands
+   - Strand-aware coordinate conversion in GFF3 output
+
 ## Installation
 
 Build the HMM-based tool:
@@ -66,6 +71,8 @@ Train the HMM using annotated sequences:
 ```
 
 This creates `sunfish.hmm.model` containing the trained HMM parameters.
+Both the forward sequence and its reverse complement are used so the model
+learns features on the positive and negative strands simultaneously.
 
 ### Prediction
 
@@ -84,6 +91,9 @@ Predict genes in unannotated sequences:
 ```bash
 ./bin/sunfish_hmm predict genome.fasta --wavelet-scales 10.0,20.0,30.0,40.0,50.0 --threads 8 > predictions.gff3
 ```
+
+Prediction automatically evaluates both strands and reports strand-specific
+coordinates in the resulting GFF3 records.
 
 ## Algorithm Details
 

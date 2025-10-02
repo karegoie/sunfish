@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -38,6 +39,90 @@ static output_queue_t g_output_queue;
 static pthread_mutex_t g_gene_counter_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_gene_counter = 0;
 
+static const char* get_field_ptr(const char* line, int field_index) {
+  if (!line || field_index <= 0)
+    return NULL;
+
+  const char* ptr = line;
+  int current = 1;
+
+  while (current < field_index && ptr) {
+    const char* next_tab = strchr(ptr, '\t');
+    if (!next_tab)
+      return NULL;
+    ptr = next_tab + 1;
+    current++;
+  }
+
+  return ptr;
+}
+
+static long extract_start_coordinate(const char* line) {
+  const char* start_ptr = get_field_ptr(line, 4);
+  if (!start_ptr)
+    return LONG_MAX;
+
+  return strtol(start_ptr, NULL, 10);
+}
+
+static int feature_rank(const char* feature) {
+  if (!feature)
+    return 100;
+
+  if (strncmp(feature, "gene", 4) == 0)
+    return 0;
+  if (strncmp(feature, "mRNA", 4) == 0)
+    return 1;
+  if (strncmp(feature, "CDS", 3) == 0)
+    return 2;
+
+  return 10;
+}
+
+static int compare_gff_lines(const void* a, const void* b) {
+  const char* line_a = *(const char* const*)a;
+  const char* line_b = *(const char* const*)b;
+
+  const char* seq_a = line_a;
+  const char* seq_b = line_b;
+
+  size_t len_a = 0;
+  while (seq_a[len_a] != '\t' && seq_a[len_a] != '\0')
+    len_a++;
+
+  size_t len_b = 0;
+  while (seq_b[len_b] != '\t' && seq_b[len_b] != '\0')
+    len_b++;
+
+  size_t min_len = (len_a < len_b) ? len_a : len_b;
+  int cmp = strncmp(seq_a, seq_b, min_len);
+  if (cmp == 0) {
+    if (len_a != len_b)
+      cmp = (len_a < len_b) ? -1 : 1;
+  }
+
+  if (cmp != 0)
+    return cmp;
+
+  long start_a = extract_start_coordinate(line_a);
+  long start_b = extract_start_coordinate(line_b);
+
+  if (start_a < start_b)
+    return -1;
+  if (start_a > start_b)
+    return 1;
+
+  const char* feature_a = get_field_ptr(line_a, 3);
+  const char* feature_b = get_field_ptr(line_b, 3);
+
+  int rank_a = feature_rank(feature_a);
+  int rank_b = feature_rank(feature_b);
+  if (rank_a != rank_b)
+    return (rank_a < rank_b) ? -1 : 1;
+
+  return strcmp(line_a, line_b);
+}
+
 // Initialize output queue
 static void output_queue_init(output_queue_t* queue) {
   queue->head = NULL;
@@ -69,16 +154,40 @@ static void output_queue_add(output_queue_t* queue, const char* gff_line) {
 static void output_queue_flush(output_queue_t* queue) {
   pthread_mutex_lock(&queue->mutex);
   output_node_t* node = queue->head;
+  int count = 0;
+  while (node != NULL) {
+    count++;
+    node = node->next;
+  }
+
+  char** lines = NULL;
+  if (count > 0) {
+    lines = (char**)malloc(count * sizeof(char*));
+  }
+
+  int idx = 0;
+  node = queue->head;
   queue->head = NULL;
   queue->tail = NULL;
   pthread_mutex_unlock(&queue->mutex);
 
   while (node != NULL) {
-    printf("%s", node->gff_line);
+    if (lines)
+      lines[idx++] = node->gff_line;
     output_node_t* next = node->next;
-    free(node->gff_line);
     free(node);
     node = next;
+  }
+
+  if (lines) {
+    qsort(lines, count, sizeof(char*), compare_gff_lines);
+
+    for (int i = 0; i < count; i++) {
+      printf("%s", lines[i]);
+      free(lines[i]);
+    }
+
+    free(lines);
   }
 }
 
@@ -104,12 +213,89 @@ static int parse_wavelet_scales(const char* arg, double* scales,
   return count;
 }
 
+static void free_observation_sequence(double** observations, int seq_len) {
+  if (!observations)
+    return;
+
+  for (int t = 0; t < seq_len; t++) {
+    free(observations[t]);
+  }
+  free(observations);
+}
+
+static bool build_observation_matrix(const char* sequence, int seq_len,
+                                     double*** out_observations) {
+  if (seq_len <= 0)
+    return false;
+
+  double** features = (double**)malloc(g_num_wavelet_scales * sizeof(double*));
+  if (!features)
+    return false;
+
+  for (int s = 0; s < g_num_wavelet_scales; s++) {
+    features[s] = (double*)malloc(seq_len * sizeof(double));
+    if (!features[s]) {
+      for (int j = 0; j < s; j++) {
+        free(features[j]);
+      }
+      free(features);
+      return false;
+    }
+  }
+
+  if (!compute_cwt_features(sequence, seq_len, g_wavelet_scales,
+                            g_num_wavelet_scales, features)) {
+    for (int s = 0; s < g_num_wavelet_scales; s++) {
+      free(features[s]);
+    }
+    free(features);
+    return false;
+  }
+
+  double** observations = (double**)malloc(seq_len * sizeof(double*));
+  if (!observations) {
+    for (int s = 0; s < g_num_wavelet_scales; s++) {
+      free(features[s]);
+    }
+    free(features);
+    return false;
+  }
+
+  for (int t = 0; t < seq_len; t++) {
+    observations[t] = (double*)malloc(g_num_wavelet_scales * sizeof(double));
+    if (!observations[t]) {
+      for (int u = 0; u < t; u++) {
+        free(observations[u]);
+      }
+      free(observations);
+      for (int s = 0; s < g_num_wavelet_scales; s++) {
+        free(features[s]);
+      }
+      free(features);
+      return false;
+    }
+
+    for (int f = 0; f < g_num_wavelet_scales; f++) {
+      observations[t][f] = features[f][t];
+    }
+  }
+
+  for (int s = 0; s < g_num_wavelet_scales; s++) {
+    free(features[s]);
+  }
+  free(features);
+
+  *out_observations = observations;
+  return true;
+}
+
 // Task structure for parallel processing
 typedef struct {
   char* sequence;
   char* seq_id;
   char strand;
   HMMModel* model;
+  int original_length;
 } prediction_task_t;
 
 // Worker function for parallel prediction
@@ -118,38 +304,28 @@ static void predict_sequence_worker(void* arg) {
 
   int seq_len = strlen(task->sequence);
 
-  // Compute CWT features
-  double** features = (double**)malloc(g_num_wavelet_scales * sizeof(double*));
-  for (int i = 0; i < g_num_wavelet_scales; i++) {
-    features[i] = (double*)malloc(seq_len * sizeof(double));
+  double** observations = NULL;
+  int* states = NULL;
+
+  if (!build_observation_matrix(task->sequence, seq_len, &observations)) {
+    fprintf(stderr,
+            "Warning: Failed to compute CWT features for %s (%c strand)\n",
+            task->seq_id, task->strand);
+    goto cleanup;
   }
 
-  if (!compute_cwt_features(task->sequence, seq_len, g_wavelet_scales,
-                            g_num_wavelet_scales, features)) {
-    fprintf(stderr, "Warning: Failed to compute CWT features for %s\n",
-            task->seq_id);
-    for (int i = 0; i < g_num_wavelet_scales; i++) {
-      free(features[i]);
-    }
-    free(features);
-    free(task->sequence);
-    free(task->seq_id);
-    free(task);
-    return;
+  states = (int*)malloc(seq_len * sizeof(int));
+  if (!states) {
+    fprintf(stderr,
+            "Warning: Failed to allocate state buffer for %s (%c strand)\n",
+            task->seq_id, task->strand);
+    goto cleanup;
   }
 
-  // Prepare observations for Viterbi (transpose features)
-  double** observations = (double**)malloc(seq_len * sizeof(double*));
-  for (int t = 0; t < seq_len; t++) {
-    observations[t] = (double*)malloc(g_num_wavelet_scales * sizeof(double));
-    for (int f = 0; f < g_num_wavelet_scales; f++) {
-      observations[t][f] = features[f][t];
-    }
-  }
-
-  // Run Viterbi algorithm
-  int* states = (int*)malloc(seq_len * sizeof(int));
   double log_prob = hmm_viterbi(task->model, observations, seq_len, states);
+  double normalized_score = (seq_len > 0) ? (log_prob / seq_len) : log_prob;
+  const int original_length =
+      (task->original_length > 0) ? task->original_length : seq_len;
 
   // Process state sequence to identify genes
   // Find contiguous exon regions and output as GFF3
@@ -175,17 +351,24 @@ static void predict_sequence_worker(void* arg) {
       pthread_mutex_unlock(&g_gene_counter_mutex);
 
       // Format GFF3 output
+      int output_start = gene_start + 1;
+      int output_end = gene_end + 1;
+      if (task->strand == '-') {
+        output_start = original_length - gene_end;
+        output_end = original_length - gene_start;
+      }
+
       char gff_line[1024];
       snprintf(gff_line, sizeof(gff_line),
                "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-               task->seq_id, gene_start + 1, gene_end + 1, log_prob / seq_len,
+               task->seq_id, output_start, output_end, normalized_score,
                task->strand, gene_id);
 
       output_queue_add(&g_output_queue, gff_line);
 
       snprintf(gff_line, sizeof(gff_line),
                "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
-               task->seq_id, gene_start + 1, gene_end + 1, log_prob / seq_len,
+               task->seq_id, output_start, output_end, normalized_score,
                task->strand, gene_id);
 
       output_queue_add(&g_output_queue, gff_line);
@@ -200,32 +383,33 @@ static void predict_sequence_worker(void* arg) {
     gene_id = ++g_gene_counter;
     pthread_mutex_unlock(&g_gene_counter_mutex);
 
+    int gene_end = seq_len - 1;
+    int output_start = gene_start + 1;
+    int output_end = gene_end + 1;
+    if (task->strand == '-') {
+      output_start = original_length - gene_end;
+      output_end = original_length - gene_start;
+    }
+
     char gff_line[1024];
     snprintf(gff_line, sizeof(gff_line),
              "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-             task->seq_id, gene_start + 1, seq_len, log_prob / seq_len,
+             task->seq_id, output_start, output_end, normalized_score,
              task->strand, gene_id);
     output_queue_add(&g_output_queue, gff_line);
 
     snprintf(gff_line, sizeof(gff_line),
              "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
-             task->seq_id, gene_start + 1, seq_len, log_prob / seq_len,
+             task->seq_id, output_start, output_end, normalized_score,
              task->strand, gene_id);
     output_queue_add(&g_output_queue, gff_line);
   }
 
-  // Cleanup
-  for (int i = 0; i < g_num_wavelet_scales; i++) {
-    free(features[i]);
-  }
-  free(features);
-
-  for (int t = 0; t < seq_len; t++) {
-    free(observations[t]);
-  }
-  free(observations);
-
-  free(states);
+cleanup:
+  if (states)
+    free(states);
+  if (observations)
+    free_observation_sequence(observations, seq_len);
   free(task->sequence);
   free(task->seq_id);
   free(task);
@@ -276,45 +460,55 @@ static void handle_train(int argc, char* argv[]) {
   // For simplicity, we'll just compute CWT features for all sequences
   fprintf(stderr, "Computing CWT features for training sequences...\n");
 
-  double*** observations = (double***)malloc(genome->count * sizeof(double**));
-  int* seq_lengths = (int*)malloc(genome->count * sizeof(int));
+  int total_sequences = genome->count * 2;
+  double*** observations =
+      (double***)malloc(total_sequences * sizeof(double**));
+  int* seq_lengths = (int*)malloc(total_sequences * sizeof(int));
+
+  if (!observations || !seq_lengths) {
+    fprintf(stderr, "Failed to allocate buffers for training observations\n");
+    free(observations);
+    free(seq_lengths);
+    free_cds_groups(groups, group_count);
+    free_fasta_data(genome);
+    exit(1);
+  }
+
+  fprintf(stderr,
+          "Augmenting training data with reverse complements (%d total "
+          "sequences)\n",
+          total_sequences);
 
   for (int i = 0; i < genome->count; i++) {
     const char* seq = genome->records[i].sequence;
     int seq_len = strlen(seq);
-    seq_lengths[i] = seq_len;
+    int forward_idx = i * 2;
+    int reverse_idx = forward_idx + 1;
 
-    // Allocate feature matrix
-    double** features =
-        (double**)malloc(g_num_wavelet_scales * sizeof(double*));
-    for (int s = 0; s < g_num_wavelet_scales; s++) {
-      features[s] = (double*)malloc(seq_len * sizeof(double));
+    if (!build_observation_matrix(seq, seq_len, &observations[forward_idx])) {
+      fprintf(stderr,
+              "Failed to compute CWT features for sequence %d (+ strand)\n", i);
+      exit(1);
     }
+    seq_lengths[forward_idx] = seq_len;
 
-    // Compute CWT features
-    if (!compute_cwt_features(seq, seq_len, g_wavelet_scales,
-                              g_num_wavelet_scales, features)) {
-      fprintf(stderr, "Failed to compute CWT features for sequence %d\n", i);
+    char* rc = reverse_complement(seq);
+    if (!rc) {
+      fprintf(stderr, "Failed to allocate reverse complement for sequence %d\n",
+              i);
       exit(1);
     }
 
-    // Transpose to [seq_len][num_features] format
-    observations[i] = (double**)malloc(seq_len * sizeof(double*));
-    for (int t = 0; t < seq_len; t++) {
-      observations[i][t] =
-          (double*)malloc(g_num_wavelet_scales * sizeof(double));
-      for (int f = 0; f < g_num_wavelet_scales; f++) {
-        observations[i][t][f] = features[f][t];
-      }
+    if (!build_observation_matrix(rc, seq_len, &observations[reverse_idx])) {
+      fprintf(stderr,
+              "Failed to compute CWT features for sequence %d (- strand)\n", i);
+      free(rc);
+      exit(1);
     }
+    seq_lengths[reverse_idx] = seq_len;
+    free(rc);
 
-    // Free temporary feature matrix
-    for (int s = 0; s < g_num_wavelet_scales; s++) {
-      free(features[s]);
-    }
-    free(features);
-
-    fprintf(stderr, "Processed sequence %d/%d\r", i + 1, genome->count);
+    fprintf(stderr, "Processed sequence %d/%d (+/-)\r", i + 1, genome->count);
   }
   fprintf(stderr, "\n");
 
@@ -323,8 +517,8 @@ static void handle_train(int argc, char* argv[]) {
   hmm_init(&model, g_num_wavelet_scales);
 
   fprintf(stderr, "Training HMM using Baum-Welch algorithm...\n");
-  if (!hmm_train_baum_welch(&model, observations, seq_lengths, genome->count,
-                            50, 0.01)) {
+  if (!hmm_train_baum_welch(&model, observations, seq_lengths, total_sequences,
+                            100, 0.01)) {
     fprintf(stderr, "Training failed\n");
     exit(1);
   }
@@ -337,11 +531,10 @@ static void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Model saved to sunfish.model\n");
 
   // Cleanup
-  for (int i = 0; i < genome->count; i++) {
-    for (int t = 0; t < seq_lengths[i]; t++) {
-      free(observations[i][t]);
+  for (int i = 0; i < total_sequences; i++) {
+    if (observations[i]) {
+      free_observation_sequence(observations[i], seq_lengths[i]);
     }
-    free(observations[i]);
   }
   free(observations);
   free(seq_lengths);
@@ -388,6 +581,7 @@ static void handle_predict(int argc, char* argv[]) {
 
   // Initialize output queue
   output_queue_init(&g_output_queue);
+  g_gene_counter = 0;
 
   // If threads not set explicitly, use number of online processors
   if (g_num_threads <= 0) {
@@ -422,18 +616,64 @@ static void handle_predict(int argc, char* argv[]) {
     {
       prediction_task_t* task =
           (prediction_task_t*)malloc(sizeof(prediction_task_t));
-      task->sequence = strdup(genome->records[i].sequence);
-      task->seq_id = strdup(genome->records[i].id);
-      task->strand = '+';
-      task->model = &model;
+      if (!task) {
+        fprintf(stderr, "Warning: Failed to allocate task for %s (+ strand)\n",
+                genome->records[i].id);
+      } else {
+        task->sequence = strdup(genome->records[i].sequence);
+        task->seq_id = strdup(genome->records[i].id);
+        task->strand = '+';
+        task->model = &model;
+        task->original_length = strlen(genome->records[i].sequence);
 
-      thread_pool_add_task(pool, predict_sequence_worker, task);
-      fprintf(stderr, "Processing %s (+ strand)...\n", task->seq_id);
+        if (!task->sequence || !task->seq_id) {
+          fprintf(stderr,
+                  "Warning: Failed to duplicate inputs for %s (+ strand)\n",
+                  genome->records[i].id);
+          free(task->sequence);
+          free(task->seq_id);
+          free(task);
+        } else {
+          thread_pool_add_task(pool, predict_sequence_worker, task);
+          fprintf(stderr, "Processing %s (+ strand)...\n", task->seq_id);
+        }
+      }
     }
 
     // Process reverse strand
-    // Note: We would need to implement reverse_complement function
-    // For now, we'll skip reverse strand to keep the example simple
+    char* rc_sequence = reverse_complement(genome->records[i].sequence);
+    if (!rc_sequence) {
+      fprintf(stderr, "Warning: Failed to generate reverse complement for %s\n",
+              genome->records[i].id);
+      continue;
+    }
+
+    prediction_task_t* task =
+        (prediction_task_t*)malloc(sizeof(prediction_task_t));
+    if (!task) {
+      fprintf(stderr, "Warning: Failed to allocate task for %s (- strand)\n",
+              genome->records[i].id);
+      free(rc_sequence);
+      continue;
+    }
+
+    task->sequence = rc_sequence;
+    task->seq_id = strdup(genome->records[i].id);
+    task->strand = '-';
+    task->model = &model;
+    task->original_length = strlen(genome->records[i].sequence);
+
+    if (!task->seq_id) {
+      fprintf(stderr,
+              "Warning: Failed to duplicate sequence ID for %s (- strand)\n",
+              genome->records[i].id);
+      free(task->sequence);
+      free(task);
+      continue;
+    }
+
+    thread_pool_add_task(pool, predict_sequence_worker, task);
+    fprintf(stderr, "Processing %s (- strand)...\n", task->seq_id);
   }
 
   // Wait for all tasks to complete
