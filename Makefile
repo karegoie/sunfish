@@ -59,8 +59,6 @@ directories:
 $(SUNFISH_EXE): $(SUNFISH_OBJS)
 	$(CC) $(SUNFISH_OBJS) $(LDFLAGS) $(LIBS) -o $@
 
-$(SUNFISH_EXE): $(SUNFISH_OBJS)
-	$(CC) $(SUNFISH_OBJS) $(LDFLAGS) $(LIBS) -o $@
 
 $(OBJDIR)/fft.o: $(SRCDIR)/fft.c $(INCDIR)/fft.h
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -10,12 +10,7 @@ enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
 enum { NUM_AMINO_ACIDS = 20, NUM_NUCLEOTIDES = 4 };
 
 // Splice site parameters
-enum {
-  DONOR_MOTIF_SIZE = 9,    // -3 to +6 relative to GT
-  ACCEPTOR_MOTIF_SIZE = 15 // -12 to +3 relative to AG
-};
-
-static const double PWM_PSEUDOCOUNT = 0.1;
+enum { DONOR_MOTIF_SIZE = 9, ACCEPTOR_MOTIF_SIZE = 15 };
 
 // Data Structures
 typedef struct {

@@ -1,196 +1,180 @@
-# Sunfish - Gene Annotation Tool
+# Sunfish HMM - Advanced Gene Prediction with Continuous Wavelet Transform
 
-A bioinformatics tool for gene annotation based on logistic regression and statistical probability analysis of amino acid composition.
+This is an advanced version of the Sunfish gene annotation tool that uses a Continuous Density Hidden Markov Model (HMM) with Continuous Wavelet Transform (CWT) features for gene prediction.
 
-## Overview
+## New Features
 
-Sunfish is a novel gene annotation program that operates in two modes: `train` and `predict`. It uses a unique hypothesis for validating peptide sequences: a peptide is considered valid if the statistical probability of its amino acid composition (predicted by logistic regression models) is consistently greater than or equal to a theoretical probability derived from its own internal amino acid frequencies.
+### Core Components
 
-## Features
+1. **Fast Fourier Transform (FFT)**: Custom implementation of the Cooley-Tukey FFT algorithm
+   - No external dependencies (no FFTW required)
+   - Supports forward and inverse FFT
+   - Bit-reversal permutation for in-place computation
 
-- Training from annotated proteomes (GFF3 CDS)
-- Prediction on unannotated genomes (FASTA)
-- Statistical validation: P_stat ≥ P_theory for all 20 amino acids
-- FASTA/GFF3 parsing and translation with standard genetic code
-- Exhaustive candidate generation:
-   - All contiguous DNA subsequences are considered as candidate CDS (not only ATG→stop)
-   - Canonical splicing support with GT..AG (+) and CT..AC (−) signals
-   - Multi-exon enumeration for 2, 3, and 4 exons
-   - Both strands are scanned; reverse-complement coordinates are mapped back to original
-   - Alternative isoforms are ranked by peptide P_stat and the top-scoring transcripts per start codon are emitted
-      - Branchpoint heuristics are disabled; acceptor strength relies solely on PWM scoring
-   - Adaptive splice-site penalties down-weight weak introns, reducing spurious multi-exon calls on compact genomes (e.g., budding yeast)
+2. **Continuous Wavelet Transform (CWT)**: Extracts sophisticated features from DNA sequences
+   - Converts DNA bases to complex plane: A→(1+0i), C→(-1+0i), G→(0+1i), T→(0-1i)
+   - Morlet wavelet generation for multiple scales
+   - Frequency-domain convolution using FFT
+
+3. **Continuous Emission HMM**: Models gene structures with continuous feature vectors
+   - States: Exon_F0, Exon_F1, Exon_F2, Intron, Intergenic
+   - Multivariate Gaussian emissions with diagonal covariance
+   - Designed for future extension to Gaussian Mixture Models
+
+4. **Baum-Welch Training**: EM algorithm for parameter learning
+   - Forward-backward algorithm for state probabilities
+   - Iterative parameter re-estimation
+   - Convergence monitoring
+
+5. **Parallel Prediction**: Multi-threaded Viterbi decoding
+   - Pthread-based worker pool
+   - Thread-safe output queue
+   - Configurable number of threads
 
 ## Installation
 
-### Prerequisites
-
-- GCC compiler
-- Standard C library with math support
-
-### Building
+Build the HMM-based tool:
 
 ```bash
-make sunfish
+make sunfish_hmm
 ```
 
-This will create the `bin/sunfish` executable.
+Build both versions (original + HMM):
+
+```bash
+make all
+```
 
 ## Usage
 
-### Training Mode
+### Training
 
-Train 20 logistic regression models (one per amino acid) from an annotated genome:
+Train the HMM using annotated sequences:
 
 ```bash
-./bin/sunfish train <train.fasta> <train.gff> [--min-occ N|-m N] [--lr R] [--iters I] [--l1 L]
+./bin/sunfish_hmm train <train.fasta> <train.gff> [--wavelet-scales S1,S2,...]
 ```
 
-**Input:**
-- `train.fasta`: Reference genome in FASTA format
-- `train.gff`: Gene annotations in GFF3 format (must contain CDS features with Parent attributes)
-
-**Output:**
-- `sunfish.model`: Binary model file containing coefficients for all 20 amino acid models
-
-**Options:**
-- `--min-occ N` or `-m N`: Minimum occurrence k used to label positives during training (default 1)
-- `--lr R`, `--iters I`, `--l1 L`: Optimization hyperparameters for logistic regression
+**Arguments:**
+- `train.fasta`: Training genome sequences in FASTA format
+- `train.gff`: Gene annotations in GFF3 format
+- `--wavelet-scales`: Comma-separated list of wavelet scales (default: 10.0,20.0,30.0,40.0,50.0)
 
 **Example:**
 ```bash
-./bin/sunfish train reference_genome.fasta reference_annotations.gff3 --min-pep 5 --min-occ 2
+./bin/sunfish_hmm train reference.fasta reference.gff --wavelet-scales 10.0,20.0,30.0,40.0,50.0
 ```
 
-### Prediction Mode
+This creates `sunfish.hmm.model` containing the trained HMM parameters.
 
-Predict genes in a target genome using the trained model:
+### Prediction
+
+Predict genes in unannotated sequences:
 
 ```bash
-./bin/sunfish predict <target.fasta> [--min-occ N|-m N]
+./bin/sunfish_hmm predict <target.fasta> [--wavelet-scales S1,S2,...] [--threads N]
 ```
 
-**Input:**
-- `target.fasta`: Target genome in FASTA format
-- `sunfish.model`: Model file (must be created by running train mode first)
-
-**Output:**
-- GFF3 format gene annotations written to stdout
-- Progress messages written to stderr
- - Real-time output: records are flushed line-by-line to stdout; progress logs are unbuffered on stderr
-
-**Options:**
-- `--min-occ N` or `-m N`: Minimum occurrence k used in the validation criterion (default 1)
+**Arguments:**
+- `target.fasta`: Target genome sequences in FASTA format
+- `--wavelet-scales`: Wavelet scales (must match training)
+- `--threads`: Number of parallel threads (default: 4)
 
 **Example:**
 ```bash
-./bin/sunfish predict target_genome.fasta --min-occ 3 > predicted_genes.gff3
-```
-
-While piping/redirecting, GFF3 lines are flushed immediately so you can tail the file in real-time:
-```bash
-./bin/sunfish predict target_genome.fasta > predicted.gff3 &
-tail -f predicted.gff3
+./bin/sunfish_hmm predict genome.fasta --wavelet-scales 10.0,20.0,30.0,40.0,50.0 --threads 8 > predictions.gff3
 ```
 
 ## Algorithm Details
 
-### Training Phase
+### Feature Extraction (CWT)
 
-1. Parse inputs: load genome FASTA and GFF3 annotations
-2. Extract peptides from CDS groups: concatenate exons, reverse-complement on minus strand, translate
-3. Train 20 logistic regression models (one per amino acid):
-   - Target (y): indicator if peptide contains the amino acid at least k times
-   - Features (X): amino acid counts from the whole proteome excluding the current peptide
-   - Optimization: gradient descent with L1 regularization
-4. Save all coefficient vectors to `sunfish.model`
+For each base position in the DNA sequence:
 
-### Prediction Phase
+1. Convert DNA sequence to complex signal
+2. Generate Morlet wavelet at each scale: ψ(t) = (1/√(s·π^(1/4))) · exp(-1/2·(t/s)²) · exp(-j·2π·t/s)
+3. Convolve signal with wavelets using FFT
+4. Extract magnitude as feature value
+5. Normalize features
 
-1. Load model coefficients
-2. Generate candidate CDS for each sequence and strand:
-   - Contiguous ORFs: consider every DNA subsequence; translate until first stop
-   - Spliced ORFs: identify canonical splice signals (GT..AG on +, CT..AC on −) and enumerate 2–4 exon combinations; concatenate exon segments, then translate
-   - Each intron contributes a penalty driven by PWM support and intron length; weak sites or excessive splicing are filtered before reporting
-   - Map coordinates back to original reference for the minus strand
-3. Validate each translated peptide by requiring, for all 20 amino acids:
-   - P_stat = sigmoid(w_0 + w·counts) from the learned model
-   - P_theory = P[X ≥ k] where X ~ Binomial(L, q) with q = count_j / L
-   - Accept if P_stat ≥ P_theory for every amino acid
-4. Rank spliced candidates originating from the same start codon by their peptide P_stat and emit up to the built-in alternative isoform cap (`DEFAULT_MAX_ALTERNATIVE_ISOFORMS`, default 3) of non-duplicate isoforms with the highest scores.
-5. Output accepted candidates in GFF3 (gene/mRNA/CDS). Multi-exon candidates produce multiple CDS lines.
+This produces a feature vector of dimension equal to the number of wavelet scales for each position.
 
-## Standard 20 Amino Acids
+### HMM Training (Baum-Welch)
 
-The tool uses the following amino acids in alphabetical order:
-A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y
+1. Initialize HMM parameters (transitions, initial probabilities, Gaussian means/variances)
+2. E-step: Run forward-backward algorithm to compute posterior state probabilities
+3. M-step: Re-estimate parameters using weighted averages
+4. Repeat until convergence (log-likelihood change < threshold)
 
-## File Formats
+### Gene Prediction (Viterbi)
 
-### FASTA Format
-Standard FASTA format with multi-line sequences supported:
-```
->chromosome1
-ATGGCTAGCAAATTTGGTCATGAA...
-CCCTATGGCGCAATCGATTACAAA...
->chromosome2
-ATGGGTAAACCCTTTGAATTCGCA...
-```
+1. Load trained HMM model
+2. For each sequence (in parallel):
+   - Extract CWT features
+   - Run Viterbi algorithm with Gaussian PDF for emission probabilities
+   - Trace back optimal state path
+   - Output contiguous exon regions as genes
 
-### GFF3 Format
-Standard GFF3 with CDS features:
-```
-##gff-version 3
-chr1    source  CDS    100    200    .    +    0    ID=cds1;Parent=mRNA1
-chr1    source  CDS    300    400    .    +    0    ID=cds2;Parent=mRNA1
-```
+## Testing
 
-## Development
-
-### Project Structure
-```
-sunfish/
-├── src/
-│   └── sunfish.c    # Main sunfish implementation
-├── include/
-├── Makefile
-└── README.md
-```
-
-### Cleaning Build Files
-```bash
-make clean
-```
-
-## Notes on Performance
-
-The exhaustive all-subsequence and multi-exon enumeration can be computationally expensive on large genomes. Consider subsetting to regions of interest or adding problem-specific constraints if runtime is prohibitive.
-
-## Evaluation Snapshot
-
-The updated splice heuristics were profiled on the budding-yeast chromosome `NC_079272.1` using the bundled model and `gffcompare`:
+A test suite is provided to verify the core components:
 
 ```bash
-bin/sunfish predict data/NC_079272.1.fasta > NC_079272.1.predict.gff
-./gffcompare -r data/NC_079272.1.gff NC_079272.1.predict.gff
+gcc -std=c17 -O2 -Iinclude -o test/test_cwt test/test_cwt.c src/fft.c src/cwt.c -lm
+./test/test_cwt
 ```
 
-Key takeaways from `gffcmp.stats`:
+This tests:
+- FFT forward and inverse transforms
+- DNA to complex signal conversion
+- Morlet wavelet generation
+- CWT feature computation
 
-- 484 query transcripts across 61 loci with **0 multi-exon predictions**, aligning with yeast’s predominantly single-exon architecture.
-- Intron-level precision is now near-zero noise; weak splice combinations that previously produced dozens of false positives are filtered out.
-- Four annotated multi-exon genes remain uncalled; relaxing the penalties for well-supported introns can be done by adjusting the `DEFAULT_INTRON_*` constants in `include/sunfish.h`.
+## Implementation Notes
 
-This run acts as a smoke-test to confirm the new penalties suppress unsupported introns without inflating novel multi-exon calls.
+### Performance Optimizations
+
+- **FFT**: Iterative implementation avoids recursion overhead
+- **HMM**: Log-space computations prevent numerical underflow
+- **Threading**: Worker pool avoids thread creation overhead
+- **Memory**: Diagonal covariance reduces storage and computation
+
+### Numerical Stability
+
+- Log-sum-exp trick in forward-backward algorithm
+- Minimum variance threshold (1e-6) in Gaussian PDF
+- Normalized CWT features
+
+### Thread Safety
+
+- Mutex-protected output queue
+- Atomic gene counter updates
+- Independent task processing
+
+## Differences from Original Sunfish
+
+The original `sunfish` tool uses:
+- Logistic regression for amino acid composition
+- Discrete codon/k-mer features
+- Single-threaded processing
+- Statistical validation (P_stat ≥ P_theory)
+
+The new `sunfish_hmm` tool uses:
+- Hidden Markov Model with continuous emissions
+- CWT-based features from raw DNA
+- Multi-threaded parallel processing
+- Viterbi decoding for optimal state paths
+
+Both tools can coexist and are built separately.
+
+## References
+
+- Cooley-Tukey FFT algorithm
+- Morlet wavelet transform
+- Baum-Welch algorithm (Expectation-Maximization)
+- Viterbi algorithm for HMM decoding
+- POSIX threads (pthreads) for parallelization
 
 ## License
 
-See repository license file for details.
-
-## Contributing
-
-Contributions are welcome! Please ensure code follows the existing style and passes compilation without errors.
-
-## Authors
-
-Created as part of bioinformatics research on gene annotation using statistical methods.
+Same as the main Sunfish project.

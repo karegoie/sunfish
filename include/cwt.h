@@ -8,7 +8,7 @@
 
 /**
  * Convert DNA base to complex number on the complex plane.
- * A -> (1+0i), C -> (-1+0i), G -> (0+1i), T -> (0-1i)
+ * A -> (1+1i), T -> (1-1i), G -> (-1+1i), C -> (-1-1i)
  * @param base DNA base character
  * @return Complex number representation
  */
@@ -54,7 +54,7 @@ bool convolve_with_wavelet(const cplx* signal, int signal_len,
  * @return true on success, false on error
  */
 bool compute_cwt_features(const char* sequence, int seq_len,
-                         const double* scales, int num_scales,
-                         double** features);
+                          const double* scales, int num_scales,
+                          double** features);
 
 #endif // CWT_H
