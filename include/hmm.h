@@ -27,6 +27,21 @@ typedef struct {
   int num_features;
 } GaussianEmission;
 
+// PWM structures for splice site scoring
+#define DONOR_MOTIF_SIZE 9
+#define ACCEPTOR_MOTIF_SIZE 15
+#define NUM_NUCLEOTIDES 4
+
+typedef struct {
+  double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
+  double acceptor_pwm[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
+  double min_donor_score;
+  double min_acceptor_score;
+  int has_donor;
+  int has_acceptor;
+  double pwm_weight;
+} PWMModel;
+
 // HMM model structure
 typedef struct {
   // Transition probabilities: transition[i][j] = P(state_j | state_i)
@@ -47,6 +62,9 @@ typedef struct {
   // Global feature statistics for Z-score normalization
   double global_feature_mean[MAX_NUM_FEATURES];
   double global_feature_stddev[MAX_NUM_FEATURES];
+
+  // PWM model for splice site scoring
+  PWMModel pwm;
 } HMMModel;
 
 /**

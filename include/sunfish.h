@@ -5,15 +5,13 @@
 
 #include "fasta_parser.h"
 #include "gff_parser.h"
+#include "hmm.h"
 
 // Line and buffer sizes
 enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
 
 // Amino acids
-enum { NUM_AMINO_ACIDS = 20, NUM_NUCLEOTIDES = 4 };
-
-// Splice site parameters
-enum { DONOR_MOTIF_SIZE = 9, ACCEPTOR_MOTIF_SIZE = 15 };
+enum { NUM_AMINO_ACIDS = 20 };
 
 typedef struct {
   char* sequence;
