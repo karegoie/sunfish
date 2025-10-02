@@ -3,6 +3,9 @@
 
 #include <stdbool.h>
 
+#include "fasta_parser.h"
+#include "gff_parser.h"
+
 // Line and buffer sizes
 enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
 
@@ -11,31 +14,6 @@ enum { NUM_AMINO_ACIDS = 20, NUM_NUCLEOTIDES = 4 };
 
 // Splice site parameters
 enum { DONOR_MOTIF_SIZE = 9, ACCEPTOR_MOTIF_SIZE = 15 };
-
-// Data Structures
-typedef struct {
-  char* id;
-  char* sequence;
-} FastaRecord;
-
-typedef struct {
-  FastaRecord* records;
-  int count;
-} FastaData;
-
-typedef struct {
-  char* seqid;
-  int start;
-  int end;
-  char strand;
-  int phase;
-} Exon;
-
-typedef struct {
-  char* parent_id;
-  Exon* exons;
-  int exon_count;
-} CdsGroup;
 
 typedef struct {
   char* sequence;
@@ -59,10 +37,6 @@ typedef struct {
   int total_acceptor_sites;
 } SpliceCounts;
 
-void free_fasta_data(FastaData* data);
-FastaData* parse_fasta(const char* path);
-void free_cds_groups(CdsGroup* groups, int count);
-CdsGroup* parse_gff_for_cds(const char* path, int* group_count);
 char* reverse_complement(const char* sequence);
 
 #endif // SUNFISH_H
