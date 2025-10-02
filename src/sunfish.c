@@ -404,19 +404,140 @@ typedef struct {
   int original_length;
 } prediction_task_t;
 
+typedef struct {
+  int start;
+  int end;
+  int phase;
+} PredictedExon;
+
+static bool is_exon_state(int state) {
+  return state == STATE_EXON_F0 || state == STATE_EXON_F1 ||
+         state == STATE_EXON_F2;
+}
+
+static int exon_state_to_phase(int state) {
+  switch (state) {
+  case STATE_EXON_F0:
+    return 0;
+  case STATE_EXON_F1:
+    return 1;
+  case STATE_EXON_F2:
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+static void output_predicted_gene(const prediction_task_t* task,
+                                  const PredictedExon* exons, size_t exon_count,
+                                  int gene_seq_start, int gene_seq_end,
+                                  double normalized_score,
+                                  int original_length) {
+  if (!task || !exons || exon_count == 0)
+    return;
+
+  if (original_length <= 0)
+    return;
+
+  if (gene_seq_start < 0 || gene_seq_end < gene_seq_start)
+    return;
+
+  const char* seq_id = task->seq_id ? task->seq_id : "(unknown)";
+
+  int gene_id = 0;
+  pthread_mutex_lock(&g_gene_counter_mutex);
+  gene_id = ++g_gene_counter;
+  pthread_mutex_unlock(&g_gene_counter_mutex);
+
+  int output_start = 0;
+  int output_end = 0;
+
+  if (task->strand == '+') {
+    output_start = gene_seq_start + 1;
+    output_end = gene_seq_end + 1;
+  } else {
+    output_start = original_length - gene_seq_end;
+    output_end = original_length - gene_seq_start;
+  }
+
+  if (output_start < 1)
+    output_start = 1;
+  if (output_end < output_start) {
+    int tmp = output_start;
+    output_start = output_end;
+    output_end = tmp;
+  }
+  if (output_end > original_length)
+    output_end = original_length;
+
+  char gff_line[1024];
+  snprintf(gff_line, sizeof(gff_line),
+           "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n", seq_id,
+           output_start, output_end, normalized_score, task->strand, gene_id);
+  output_queue_add(&g_output_queue, gff_line);
+
+  if (task->strand == '+') {
+    for (size_t idx = 0; idx < exon_count; idx++) {
+      const PredictedExon* exon = &exons[idx];
+      int cds_start = exon->start + 1;
+      int cds_end = exon->end + 1;
+      if (cds_start < 1)
+        cds_start = 1;
+      if (cds_end > original_length)
+        cds_end = original_length;
+
+      snprintf(gff_line, sizeof(gff_line),
+               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
+               "gene%d\n",
+               seq_id, cds_start, cds_end, normalized_score, task->strand,
+               exon->phase, gene_id, idx + 1, gene_id);
+      output_queue_add(&g_output_queue, gff_line);
+    }
+  } else {
+    for (size_t reverse_idx = exon_count; reverse_idx-- > 0;) {
+      const PredictedExon* exon = &exons[reverse_idx];
+      int cds_start = original_length - exon->end;
+      int cds_end = original_length - exon->start;
+      if (cds_start < 1)
+        cds_start = 1;
+      if (cds_end > original_length)
+        cds_end = original_length;
+
+      snprintf(gff_line, sizeof(gff_line),
+               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
+               "gene%d\n",
+               seq_id, cds_start, cds_end, normalized_score, task->strand,
+               exon->phase, gene_id, exon_count - reverse_idx, gene_id);
+      output_queue_add(&g_output_queue, gff_line);
+    }
+  }
+}
+
 // Worker function for parallel prediction
 static void predict_sequence_worker(void* arg) {
   prediction_task_t* task = (prediction_task_t*)arg;
-
-  int seq_len = strlen(task->sequence);
+  if (!task)
+    return;
 
   double** observations = NULL;
   int* states = NULL;
+  PredictedExon* exon_buffer = NULL;
+  size_t exon_capacity = 0;
+  size_t exon_count = 0;
+  int seq_len = 0;
+  const char* seq_id = task->seq_id ? task->seq_id : "(unknown)";
+
+  if (!task->sequence)
+    goto cleanup;
+
+  seq_len = strlen(task->sequence);
+  if (seq_len <= 0)
+    goto cleanup;
 
   if (!build_observation_matrix(task->sequence, seq_len, &observations)) {
     fprintf(stderr,
             "Warning: Failed to compute CWT features for %s (%c strand)\n",
-            task->seq_id, task->strand);
+            seq_id, task->strand);
     goto cleanup;
   }
 
@@ -434,7 +555,7 @@ static void predict_sequence_worker(void* arg) {
   if (!states) {
     fprintf(stderr,
             "Warning: Failed to allocate state buffer for %s (%c strand)\n",
-            task->seq_id, task->strand);
+            seq_id, task->strand);
     goto cleanup;
   }
 
@@ -443,85 +564,121 @@ static void predict_sequence_worker(void* arg) {
   const int original_length =
       (task->original_length > 0) ? task->original_length : seq_len;
 
-  // Process state sequence to identify genes
-  // Find contiguous exon regions and output as GFF3
-  int in_gene = 0;
-  int gene_start = -1;
-  int gene_id;
+  exon_capacity = 8;
+  exon_buffer = (PredictedExon*)malloc(exon_capacity * sizeof(PredictedExon));
+  if (!exon_buffer) {
+    fprintf(stderr,
+            "Warning: Failed to allocate exon buffer for %s (%c strand)\n",
+            seq_id, task->strand);
+    goto cleanup;
+  }
+
+  bool gene_active = false;
+  int current_exon_start = -1;
+  int gene_seq_start = -1;
+  int gene_seq_end = -1;
 
   for (int i = 0; i < seq_len; i++) {
-    int is_exon = (states[i] == STATE_EXON_F0 || states[i] == STATE_EXON_F1 ||
-                   states[i] == STATE_EXON_F2);
+    int state = states[i];
+    bool exon_state = is_exon_state(state);
+    bool intron_state = (state == STATE_INTRON);
 
-    if (is_exon && !in_gene) {
-      // Start of a new gene
-      in_gene = 1;
-      gene_start = i;
-    } else if (!is_exon && in_gene) {
-      // End of gene
-      int gene_end = i - 1;
+    if (!gene_active) {
+      if (exon_state) {
+        gene_active = true;
+        gene_seq_start = i;
+        gene_seq_end = i;
+        exon_count = 0;
+        current_exon_start = i;
+      }
+      continue;
+    }
 
-      // Get thread-safe gene counter
-      pthread_mutex_lock(&g_gene_counter_mutex);
-      gene_id = ++g_gene_counter;
-      pthread_mutex_unlock(&g_gene_counter_mutex);
+    if (exon_state) {
+      if (current_exon_start == -1)
+        current_exon_start = i;
+      gene_seq_end = i;
+      continue;
+    }
 
-      // Format GFF3 output
-      int output_start = gene_start + 1;
-      int output_end = gene_end + 1;
-      if (task->strand == '-') {
-        output_start = original_length - gene_end;
-        output_end = original_length - gene_start;
+    if (current_exon_start != -1) {
+      int exon_end = i - 1;
+      if (exon_end < current_exon_start)
+        exon_end = current_exon_start;
+
+      if (exon_count >= exon_capacity) {
+        size_t new_capacity = exon_capacity * 2;
+        PredictedExon* tmp = (PredictedExon*)realloc(
+            exon_buffer, new_capacity * sizeof(PredictedExon));
+        if (!tmp) {
+          fprintf(stderr,
+                  "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                  seq_id, task->strand);
+          goto cleanup;
+        }
+        exon_buffer = tmp;
+        exon_capacity = new_capacity;
       }
 
-      char gff_line[1024];
-      snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-               task->seq_id, output_start, output_end, normalized_score,
-               task->strand, gene_id);
+      exon_buffer[exon_count].start = current_exon_start;
+      exon_buffer[exon_count].end = exon_end;
+      exon_buffer[exon_count].phase =
+          exon_state_to_phase(states[current_exon_start]);
+      exon_count++;
 
-      output_queue_add(&g_output_queue, gff_line);
+      current_exon_start = -1;
+      gene_seq_end = exon_end;
+    }
 
-      snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
-               task->seq_id, output_start, output_end, normalized_score,
-               task->strand, gene_id);
+    if (!intron_state) {
+      if (exon_count > 0 && gene_seq_start >= 0 &&
+          gene_seq_end >= gene_seq_start) {
+        output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                              gene_seq_end, normalized_score, original_length);
+      }
 
-      output_queue_add(&g_output_queue, gff_line);
-
-      in_gene = 0;
+      gene_active = false;
+      gene_seq_start = -1;
+      gene_seq_end = -1;
+      exon_count = 0;
+      current_exon_start = -1;
     }
   }
 
-  // Handle gene extending to end of sequence
-  if (in_gene) {
-    pthread_mutex_lock(&g_gene_counter_mutex);
-    gene_id = ++g_gene_counter;
-    pthread_mutex_unlock(&g_gene_counter_mutex);
-
-    int gene_end = seq_len - 1;
-    int output_start = gene_start + 1;
-    int output_end = gene_end + 1;
-    if (task->strand == '-') {
-      output_start = original_length - gene_end;
-      output_end = original_length - gene_start;
+  if (current_exon_start != -1) {
+    int exon_end = seq_len - 1;
+    if (exon_count >= exon_capacity) {
+      size_t new_capacity = exon_capacity * 2;
+      PredictedExon* tmp = (PredictedExon*)realloc(
+          exon_buffer, new_capacity * sizeof(PredictedExon));
+      if (!tmp) {
+        fprintf(stderr,
+                "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                seq_id, task->strand);
+        goto cleanup;
+      }
+      exon_buffer = tmp;
+      exon_capacity = new_capacity;
     }
 
-    char gff_line[1024];
-    snprintf(gff_line, sizeof(gff_line),
-             "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-             task->seq_id, output_start, output_end, normalized_score,
-             task->strand, gene_id);
-    output_queue_add(&g_output_queue, gff_line);
+    exon_buffer[exon_count].start = current_exon_start;
+    exon_buffer[exon_count].end = exon_end;
+    exon_buffer[exon_count].phase =
+        exon_state_to_phase(states[current_exon_start]);
+    exon_count++;
+    gene_seq_end = exon_end;
+    current_exon_start = -1;
+  }
 
-    snprintf(gff_line, sizeof(gff_line),
-             "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
-             task->seq_id, output_start, output_end, normalized_score,
-             task->strand, gene_id);
-    output_queue_add(&g_output_queue, gff_line);
+  if (gene_active && exon_count > 0 && gene_seq_start >= 0 &&
+      gene_seq_end >= gene_seq_start) {
+    output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                          gene_seq_end, normalized_score, original_length);
   }
 
 cleanup:
+  if (exon_buffer)
+    free(exon_buffer);
   if (states)
     free(states);
   if (observations)
@@ -769,7 +926,7 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
       for (int pos = rc->start; pos <= rc->end && pos < seq_len; pos++) {
         if (pos < 0)
           continue;
-        int offset = pos - rc->start;
+        int offset = rc->end - pos;
         HMMState state = frame_to_state(rc->phase + offset);
         state_labels[pos] = state;
       }
