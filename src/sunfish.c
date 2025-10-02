@@ -105,7 +105,7 @@ static int compute_kmer_feature_count(int k) {
 }
 
 static bool update_feature_counts(void) {
-  int wavelet_features = g_num_wavelet_scales * 2;
+  int wavelet_features = g_num_wavelet_scales * 4;
   int kmer_features = 0;
 
   if (g_kmer_size > 0) {
@@ -695,6 +695,57 @@ static void output_predicted_gene(const prediction_task_t* task,
   }
 }
 
+// Validate ORF: check start codon, stop codon, in-frame stops, and length
+static bool is_valid_orf(const char* cds_sequence) {
+  if (!cds_sequence) {
+    return false;
+  }
+
+  size_t len = strlen(cds_sequence);
+
+  // Check length is multiple of 3
+  if (len < 3 || len % 3 != 0) {
+    return false;
+  }
+
+  // Check starts with ATG
+  if (toupper((unsigned char)cds_sequence[0]) != 'A' ||
+      toupper((unsigned char)cds_sequence[1]) != 'T' ||
+      toupper((unsigned char)cds_sequence[2]) != 'G') {
+    return false;
+  }
+
+  // Check internal codons for in-frame stop codons
+  for (size_t i = 3; i < len - 3; i += 3) {
+    char codon[4];
+    codon[0] = toupper((unsigned char)cds_sequence[i]);
+    codon[1] = toupper((unsigned char)cds_sequence[i + 1]);
+    codon[2] = toupper((unsigned char)cds_sequence[i + 2]);
+    codon[3] = '\0';
+
+    // Check for stop codons: TAA, TAG, TGA
+    if ((strcmp(codon, "TAA") == 0) || (strcmp(codon, "TAG") == 0) ||
+        (strcmp(codon, "TGA") == 0)) {
+      return false; // Internal stop codon
+    }
+  }
+
+  // Check ends with stop codon
+  size_t last_codon_start = len - 3;
+  char last_codon[4];
+  last_codon[0] = toupper((unsigned char)cds_sequence[last_codon_start]);
+  last_codon[1] = toupper((unsigned char)cds_sequence[last_codon_start + 1]);
+  last_codon[2] = toupper((unsigned char)cds_sequence[last_codon_start + 2]);
+  last_codon[3] = '\0';
+
+  if (strcmp(last_codon, "TAA") != 0 && strcmp(last_codon, "TAG") != 0 &&
+      strcmp(last_codon, "TGA") != 0) {
+    return false; // No stop codon at end
+  }
+
+  return true;
+}
+
 // Worker function for parallel prediction
 static void predict_sequence_worker(void* arg) {
   prediction_task_t* task = (prediction_task_t*)arg;
@@ -832,8 +883,35 @@ static void predict_sequence_worker(void* arg) {
     if (!intron_state) {
       if (exon_count > 0 && gene_seq_start >= 0 &&
           gene_seq_end >= gene_seq_start) {
-        output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
-                              gene_seq_end, prediction_score, original_length);
+        // Assemble CDS sequence from exons for validation
+        size_t cds_len = 0;
+        for (size_t e = 0; e < exon_count; e++) {
+          cds_len += (exon_buffer[e].end - exon_buffer[e].start + 1);
+        }
+
+        char* cds_seq = (char*)malloc(cds_len + 1);
+        if (cds_seq) {
+          size_t pos = 0;
+          for (size_t e = 0; e < exon_count; e++) {
+            int exon_len = exon_buffer[e].end - exon_buffer[e].start + 1;
+            memcpy(cds_seq + pos, task->sequence + exon_buffer[e].start,
+                   exon_len);
+            pos += exon_len;
+          }
+          cds_seq[cds_len] = '\0';
+
+          // Validate ORF before outputting
+          if (is_valid_orf(cds_seq)) {
+            output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                                  gene_seq_end, prediction_score,
+                                  original_length);
+          }
+          free(cds_seq);
+        } else {
+          // Memory allocation failed, output without validation
+          output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                                gene_seq_end, prediction_score, original_length);
+        }
       }
 
       gene_active = false;
@@ -871,8 +949,33 @@ static void predict_sequence_worker(void* arg) {
 
   if (gene_active && exon_count > 0 && gene_seq_start >= 0 &&
       gene_seq_end >= gene_seq_start) {
-    output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
-                          gene_seq_end, prediction_score, original_length);
+    // Assemble CDS sequence from exons for validation
+    size_t cds_len = 0;
+    for (size_t e = 0; e < exon_count; e++) {
+      cds_len += (exon_buffer[e].end - exon_buffer[e].start + 1);
+    }
+
+    char* cds_seq = (char*)malloc(cds_len + 1);
+    if (cds_seq) {
+      size_t pos = 0;
+      for (size_t e = 0; e < exon_count; e++) {
+        int exon_len = exon_buffer[e].end - exon_buffer[e].start + 1;
+        memcpy(cds_seq + pos, task->sequence + exon_buffer[e].start, exon_len);
+        pos += exon_len;
+      }
+      cds_seq[cds_len] = '\0';
+
+      // Validate ORF before outputting
+      if (is_valid_orf(cds_seq)) {
+        output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                              gene_seq_end, prediction_score, original_length);
+      }
+      free(cds_seq);
+    } else {
+      // Memory allocation failed, output without validation
+      output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                            gene_seq_end, prediction_score, original_length);
+    }
   }
 
 cleanup:
@@ -1303,6 +1406,263 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
   }
 }
 
+// Helper function to convert base character to index (A=0, C=1, G=2, T=3)
+static int base_to_index(char base) {
+  switch (toupper((unsigned char)base)) {
+  case 'A':
+    return 0;
+  case 'C':
+    return 1;
+  case 'G':
+    return 2;
+  case 'T':
+    return 3;
+  default:
+    return -1; // Invalid base
+  }
+}
+
+// Train splice site PWM model from annotated data
+static SplicePWM* train_splice_model(const FastaData* genome,
+                                     const CdsGroup* groups, int group_count) {
+  if (!genome || !groups || group_count <= 0) {
+    return NULL;
+  }
+
+  // Allocate and initialize counts structure
+  SpliceCounts* counts = (SpliceCounts*)calloc(1, sizeof(SpliceCounts));
+  if (!counts) {
+    return NULL;
+  }
+
+  // Iterate through all CDS groups to find donor and acceptor sites
+  for (int g = 0; g < group_count; g++) {
+    const CdsGroup* group = &groups[g];
+    if (group->exon_count < 1) {
+      continue;
+    }
+
+    // Find the sequence this group belongs to
+    const char* seqid = group->exons[0].seqid;
+    const FastaRecord* record = NULL;
+    for (int i = 0; i < genome->count; i++) {
+      if (strcmp(genome->records[i].id, seqid) == 0) {
+        record = &genome->records[i];
+        break;
+      }
+    }
+    if (!record || !record->sequence) {
+      continue;
+    }
+
+    const char* seq = record->sequence;
+    int seq_len = strlen(seq);
+    char strand = group->exons[0].strand;
+
+    // Process each adjacent exon pair to find splice sites
+    for (int e = 0; e < group->exon_count - 1; e++) {
+      const Exon* exon1 = &group->exons[e];
+      const Exon* exon2 = &group->exons[e + 1];
+
+      if (strand == '+') {
+        // Donor site: at the end of exon1 (exon-intron boundary)
+        // Extract sequence centered around the boundary
+        int donor_center = exon1->end; // GFF is 1-based, end is inclusive
+        int donor_start = donor_center - DONOR_MOTIF_SIZE / 2;
+
+        if (donor_start >= 0 && donor_start + DONOR_MOTIF_SIZE <= seq_len) {
+          bool valid = true;
+          for (int pos = 0; pos < DONOR_MOTIF_SIZE; pos++) {
+            int idx = base_to_index(seq[donor_start + pos]);
+            if (idx < 0) {
+              valid = false;
+              break;
+            }
+            counts->donor_counts[idx][pos]++;
+          }
+          if (valid) {
+            counts->total_donor_sites++;
+          }
+        }
+
+        // Acceptor site: at the start of exon2 (intron-exon boundary)
+        int acceptor_center = exon2->start - 1; // Convert to 0-based
+        int acceptor_start = acceptor_center - ACCEPTOR_MOTIF_SIZE / 2;
+
+        if (acceptor_start >= 0 &&
+            acceptor_start + ACCEPTOR_MOTIF_SIZE <= seq_len) {
+          bool valid = true;
+          for (int pos = 0; pos < ACCEPTOR_MOTIF_SIZE; pos++) {
+            int idx = base_to_index(seq[acceptor_start + pos]);
+            if (idx < 0) {
+              valid = false;
+              break;
+            }
+            counts->acceptor_counts[idx][pos]++;
+          }
+          if (valid) {
+            counts->total_acceptor_sites++;
+          }
+        }
+      } else if (strand == '-') {
+        // For reverse strand, donor/acceptor are reversed
+        // Donor site: at the start of exon1 (actually acceptor in genomic
+        // coords)
+        int donor_center = exon1->start - 1; // Convert to 0-based
+        int donor_start = donor_center - DONOR_MOTIF_SIZE / 2;
+
+        if (donor_start >= 0 && donor_start + DONOR_MOTIF_SIZE <= seq_len) {
+          bool valid = true;
+          // Extract and reverse complement
+          char motif[DONOR_MOTIF_SIZE + 1];
+          for (int pos = 0; pos < DONOR_MOTIF_SIZE; pos++) {
+            motif[pos] = seq[donor_start + DONOR_MOTIF_SIZE - 1 - pos];
+          }
+          motif[DONOR_MOTIF_SIZE] = '\0';
+
+          // Apply reverse complement
+          for (int pos = 0; pos < DONOR_MOTIF_SIZE; pos++) {
+            char base = motif[pos];
+            char rc_base;
+            switch (toupper((unsigned char)base)) {
+            case 'A':
+              rc_base = 'T';
+              break;
+            case 'T':
+              rc_base = 'A';
+              break;
+            case 'G':
+              rc_base = 'C';
+              break;
+            case 'C':
+              rc_base = 'G';
+              break;
+            default:
+              rc_base = 'N';
+              break;
+            }
+
+            int idx = base_to_index(rc_base);
+            if (idx < 0) {
+              valid = false;
+              break;
+            }
+            counts->donor_counts[idx][pos]++;
+          }
+          if (valid) {
+            counts->total_donor_sites++;
+          }
+        }
+
+        // Acceptor site: at the end of exon2
+        int acceptor_center = exon2->end;
+        int acceptor_start = acceptor_center - ACCEPTOR_MOTIF_SIZE / 2;
+
+        if (acceptor_start >= 0 &&
+            acceptor_start + ACCEPTOR_MOTIF_SIZE <= seq_len) {
+          bool valid = true;
+          // Extract and reverse complement
+          char motif[ACCEPTOR_MOTIF_SIZE + 1];
+          for (int pos = 0; pos < ACCEPTOR_MOTIF_SIZE; pos++) {
+            motif[pos] = seq[acceptor_start + ACCEPTOR_MOTIF_SIZE - 1 - pos];
+          }
+          motif[ACCEPTOR_MOTIF_SIZE] = '\0';
+
+          // Apply reverse complement
+          for (int pos = 0; pos < ACCEPTOR_MOTIF_SIZE; pos++) {
+            char base = motif[pos];
+            char rc_base;
+            switch (toupper((unsigned char)base)) {
+            case 'A':
+              rc_base = 'T';
+              break;
+            case 'T':
+              rc_base = 'A';
+              break;
+            case 'G':
+              rc_base = 'C';
+              break;
+            case 'C':
+              rc_base = 'G';
+              break;
+            default:
+              rc_base = 'N';
+              break;
+            }
+
+            int idx = base_to_index(rc_base);
+            if (idx < 0) {
+              valid = false;
+              break;
+            }
+            counts->acceptor_counts[idx][pos]++;
+          }
+          if (valid) {
+            counts->total_acceptor_sites++;
+          }
+        }
+      }
+    }
+  }
+
+  // Convert counts to log-odds PWM
+  SplicePWM* pwm = (SplicePWM*)calloc(1, sizeof(SplicePWM));
+  if (!pwm) {
+    free(counts);
+    return NULL;
+  }
+
+  // Background frequencies (assume uniform)
+  double bg_freq = 0.25;
+  double pseudocount = 1.0;
+
+  // Calculate donor PWM
+  pwm->min_donor_score = 0.0;
+  for (int pos = 0; pos < DONOR_MOTIF_SIZE; pos++) {
+    double position_sum = 0.0;
+    for (int base = 0; base < NUM_NUCLEOTIDES; base++) {
+      position_sum += counts->donor_counts[base][pos] + pseudocount;
+    }
+
+    double min_log_odds = 0.0;
+    for (int base = 0; base < NUM_NUCLEOTIDES; base++) {
+      double freq = (counts->donor_counts[base][pos] + pseudocount) / position_sum;
+      double log_odds = log(freq / bg_freq);
+      pwm->donor_pwm[base][pos] = log_odds;
+      if (log_odds < min_log_odds) {
+        min_log_odds = log_odds;
+      }
+    }
+    pwm->min_donor_score += min_log_odds;
+  }
+
+  // Calculate acceptor PWM
+  pwm->min_acceptor_score = 0.0;
+  for (int pos = 0; pos < ACCEPTOR_MOTIF_SIZE; pos++) {
+    double position_sum = 0.0;
+    for (int base = 0; base < NUM_NUCLEOTIDES; base++) {
+      position_sum += counts->acceptor_counts[base][pos] + pseudocount;
+    }
+
+    double min_log_odds = 0.0;
+    for (int base = 0; base < NUM_NUCLEOTIDES; base++) {
+      double freq = (counts->acceptor_counts[base][pos] + pseudocount) / position_sum;
+      double log_odds = log(freq / bg_freq);
+      pwm->acceptor_pwm[base][pos] = log_odds;
+      if (log_odds < min_log_odds) {
+        min_log_odds = log_odds;
+      }
+    }
+    pwm->min_acceptor_score += min_log_odds;
+  }
+
+  fprintf(stderr, "Trained splice PWM from %d donor sites and %d acceptor sites\n",
+          counts->total_donor_sites, counts->total_acceptor_sites);
+
+  free(counts);
+  return pwm;
+}
+
 static void handle_train(int argc, char* argv[]) {
   if (argc < 4) {
     fprintf(stderr,
@@ -1416,7 +1776,7 @@ static void handle_train(int argc, char* argv[]) {
 
   fprintf(stderr,
           "Feature configuration: %d wavelet dims + %d k-mer dims = %d total\n",
-          g_num_wavelet_scales * 2, g_kmer_feature_count,
+          g_num_wavelet_scales * 4, g_kmer_feature_count,
           g_total_feature_count);
 
   ensure_thread_count("training", threads_specified);
@@ -1619,7 +1979,7 @@ static void handle_train(int argc, char* argv[]) {
   // Initialize HMM model
   HMMModel model;
   hmm_init(&model, g_total_feature_count);
-  model.wavelet_feature_count = g_num_wavelet_scales * 2;
+  model.wavelet_feature_count = g_num_wavelet_scales * 4;
   model.kmer_feature_count = g_kmer_feature_count;
   model.kmer_size = g_kmer_size;
 
@@ -1802,6 +2162,18 @@ static void handle_train(int argc, char* argv[]) {
   enforce_exon_cycle_constraints(&model);
 
   fprintf(stderr, "Supervised training complete.\n");
+
+  // Train splice site PWM model
+  fprintf(stderr, "Training splice site PWM model...\n");
+  SplicePWM* splice_pwm = train_splice_model(genome, groups, group_count);
+  if (splice_pwm) {
+    fprintf(stderr, "Splice PWM training complete (min donor=%.3f, min acceptor=%.3f)\n",
+            splice_pwm->min_donor_score, splice_pwm->min_acceptor_score);
+    // TODO: Store PWM in model file for use during prediction
+    free(splice_pwm);
+  } else {
+    fprintf(stderr, "Warning: Failed to train splice PWM model\n");
+  }
 
   const int kBaumWelchMaxIterations = 100;
   const double kBaumWelchThreshold = 10.0;
@@ -2002,7 +2374,7 @@ static void handle_predict(int argc, char* argv[]) {
 
   fprintf(stderr,
           "Feature configuration: %d wavelet dims + %d k-mer dims = %d total\n",
-          g_num_wavelet_scales * 2, g_kmer_feature_count,
+          g_num_wavelet_scales * 4, g_kmer_feature_count,
           g_total_feature_count);
 
   // Initialize output queue
