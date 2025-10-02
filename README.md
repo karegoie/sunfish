@@ -85,6 +85,12 @@ This creates `sunfish.hmm.model` containing the trained HMM parameters.
 Both the forward sequence and its reverse complement are used so the model
 learns features on the positive and negative strands simultaneously.
 
+Training proceeds in two stages: first the model parameters are initialized
+supervisedly from the supplied GFF3 annotations, then a Baum-Welch EM loop
+refines the parameters on the full (now unlabeled) feature set. This
+semi-supervised schedule lets the model benefit from curated annotations while
+still adapting to unlabeled regions of the genome.
+
 ### Prediction
 
 Predict genes in unannotated sequences:

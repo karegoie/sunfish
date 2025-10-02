@@ -559,7 +559,8 @@ static void predict_sequence_worker(void* arg) {
     goto cleanup;
   }
 
-  double log_prob = hmm_viterbi(task->model, observations, seq_len, states);
+  double log_prob =
+      hmm_viterbi(task->model, observations, task->sequence, seq_len, states);
   double normalized_score = (seq_len > 0) ? (log_prob / seq_len) : log_prob;
   const int original_length =
       (task->original_length > 0) ? task->original_length : seq_len;
@@ -955,6 +956,36 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
   }
 }
 
+static void normalize_observations_in_place(double*** observations,
+                                            const int* seq_lengths,
+                                            int total_sequences,
+                                            const HMMModel* model) {
+  if (!observations || !seq_lengths || !model)
+    return;
+
+  for (int seq = 0; seq < total_sequences; seq++) {
+    double** seq_obs = observations[seq];
+    int len = seq_lengths[seq];
+
+    if (!seq_obs || len <= 0)
+      continue;
+
+    for (int t = 0; t < len; t++) {
+      double* feature_vec = seq_obs[t];
+      if (!feature_vec)
+        continue;
+
+      for (int f = 0; f < model->num_features; f++) {
+        double stddev = model->global_feature_stddev[f];
+        if (stddev < 1e-10)
+          stddev = 1e-10;
+        feature_vec[f] =
+            (feature_vec[f] - model->global_feature_mean[f]) / stddev;
+      }
+    }
+  }
+}
+
 static void accumulate_statistics_for_sequence(
     const HMMModel* model, double*** observations, int* seq_lengths,
     int obs_idx, int seq_len, const int* state_labels,
@@ -983,6 +1014,8 @@ static void accumulate_statistics_for_sequence(
   if (effective_len <= 0)
     return;
 
+  (void)model;
+
   for (int t = 0; t < effective_len; t++) {
     int state = state_labels[t];
     if (state < 0 || state >= NUM_STATES)
@@ -999,13 +1032,65 @@ static void accumulate_statistics_for_sequence(
     }
 
     for (int f = 0; f < g_num_wavelet_scales; f++) {
-      double raw_val = obs[t][f];
-      double normalized_val = (raw_val - model->global_feature_mean[f]) /
-                              model->global_feature_stddev[f];
+      double normalized_val = obs[t][f];
       emission_sum[state][f] += normalized_val;
       emission_sum_sq[state][f] += normalized_val * normalized_val;
     }
     state_observation_counts[state]++;
+  }
+}
+
+static void enforce_exon_cycle_constraints(HMMModel* model) {
+  if (!model)
+    return;
+
+  const HMMState exon_cycle[] = {STATE_EXON_F0, STATE_EXON_F1, STATE_EXON_F2};
+  const size_t exon_cycle_len = sizeof(exon_cycle) / sizeof(exon_cycle[0]);
+
+  for (size_t idx = 0; idx < exon_cycle_len; idx++) {
+    HMMState state = exon_cycle[idx];
+    HMMState expected_next = exon_cycle[(idx + 1) % exon_cycle_len];
+    int row = (int)state;
+
+    double exon_transition_mass = 0.0;
+    for (size_t target_idx = 0; target_idx < exon_cycle_len; target_idx++) {
+      HMMState exon_target = exon_cycle[target_idx];
+      exon_transition_mass += model->transition[row][(int)exon_target];
+    }
+    if (exon_transition_mass < 1e-10)
+      exon_transition_mass = 1e-10;
+
+    model->transition[row][(int)expected_next] = exon_transition_mass;
+    for (size_t target_idx = 0; target_idx < exon_cycle_len; target_idx++) {
+      HMMState exon_target = exon_cycle[target_idx];
+      if (exon_target == expected_next)
+        continue;
+      model->transition[row][(int)exon_target] = 1e-10;
+    }
+
+    for (int col = 0; col < NUM_STATES; col++) {
+      if (!is_exon_state(col) && model->transition[row][col] < 1e-10)
+        model->transition[row][col] = 1e-10;
+    }
+
+    double row_sum = 0.0;
+    for (int col = 0; col < NUM_STATES; col++) {
+      row_sum += model->transition[row][col];
+    }
+
+    if (row_sum <= 0.0) {
+      for (int col = 0; col < NUM_STATES; col++) {
+        model->transition[row][col] = (col == (int)expected_next) ? 1.0 : 1e-10;
+      }
+      row_sum = 0.0;
+      for (int col = 0; col < NUM_STATES; col++) {
+        row_sum += model->transition[row][col];
+      }
+    }
+
+    for (int col = 0; col < NUM_STATES; col++) {
+      model->transition[row][col] /= row_sum;
+    }
   }
 }
 
@@ -1287,6 +1372,11 @@ static void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Global statistics computed from %lld observations\n",
           total_count);
 
+  fprintf(stderr,
+          "Applying Z-score normalization to training observations...\n");
+  normalize_observations_in_place(observations, seq_lengths, total_sequences,
+                                  &model);
+
   // =========================================================================
   // PASS 2: Supervised parameter estimation using GFF annotations
   // =========================================================================
@@ -1402,7 +1492,24 @@ static void handle_train(int argc, char* argv[]) {
             state_observation_counts[i]);
   }
 
+  enforce_exon_cycle_constraints(&model);
+
   fprintf(stderr, "Supervised training complete.\n");
+
+  const int kBaumWelchMaxIterations = 25;
+  const double kBaumWelchThreshold = 1e-3;
+
+  fprintf(
+      stderr,
+      "Starting Baum-Welch refinement on %d sequences (semi-supervised)...\n",
+      total_sequences);
+  if (!hmm_train_baum_welch(&model, observations, seq_lengths, total_sequences,
+                            kBaumWelchMaxIterations, kBaumWelchThreshold)) {
+    fprintf(stderr, "Baum-Welch refinement failed\n");
+    exit(1);
+  }
+  enforce_exon_cycle_constraints(&model);
+  fprintf(stderr, "Baum-Welch refinement complete.\n");
 
   // Save model
   if (!hmm_save_model(&model, "sunfish.model")) {

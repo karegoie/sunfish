@@ -1,4 +1,4 @@
-==> ./include/cwt.h <==
+==> include/cwt.h <==
 #ifndef CWT_H
 #define CWT_H
 
@@ -59,7 +59,7 @@ bool compute_cwt_features(const char* sequence, int seq_len,
                           double** features);
 
 
-==> ./include/fft.h <==
+==> include/fft.h <==
 #ifndef FFT_H
 #define FFT_H
 
@@ -99,7 +99,7 @@ bool is_power_of_2(int n);
 int next_power_of_2(int n);
 
 
-==> ./include/hmm.h <==
+==> include/hmm.h <==
 #ifndef HMM_H
 #define HMM_H
 
@@ -185,8 +185,8 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
  * @param states Output state sequence (must be pre-allocated)
  * @return Log probability of most likely path
  */
-double hmm_viterbi(const HMMModel* model, double** observations, int seq_len,
-                   int* states);
+double hmm_viterbi(const HMMModel* model, double** observations,
+                   const char* sequence, int seq_len, int* states);
 
 /**
  * Save HMM model to file.
@@ -205,7 +205,7 @@ bool hmm_save_model(const HMMModel* model, const char* filename);
 bool hmm_load_model(HMMModel* model, const char* filename);
 
 
-==> ./include/sunfish.h <==
+==> include/sunfish.h <==
 #ifndef SUNFISH_H
 #define SUNFISH_H
 
@@ -274,7 +274,7 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count);
 char* reverse_complement(const char* sequence);
 
 
-==> ./include/thread_pool.h <==
+==> include/thread_pool.h <==
 #ifndef THREAD_POOL_H
 #define THREAD_POOL_H
 
@@ -336,7 +336,7 @@ void thread_pool_wait(thread_pool_t* pool);
 void thread_pool_destroy(thread_pool_t* pool);
 
 
-==> ./src/cwt.c <==
+==> src/cwt.c <==
 #include <complex.h>
 #include <ctype.h>
 #include <math.h>
@@ -474,7 +474,7 @@ bool compute_cwt_features(const char* sequence, int seq_len,
   free(signal);
   return true;
 
-==> ./src/fft.c <==
+==> src/fft.c <==
 #include <complex.h>
 #include <math.h>
 #include <stdbool.h>
@@ -577,7 +577,7 @@ void fft(cplx* x, int N, bool inverse) {
 void ifft(cplx* x, int N) {
   fft(x, N, true);
 
-==> ./src/hmm.c <==
+==> src/hmm.c <==
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -589,6 +589,73 @@ void ifft(cplx* x, int N) {
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+static inline bool hmm_is_exon_state(int state) {
+  return state == STATE_EXON_F0 || state == STATE_EXON_F1 ||
+         state == STATE_EXON_F2;
+}
+
+static inline char normalize_base(char base) {
+  if (base >= 'a' && base <= 'z') {
+    return (char)(base - ('a' - 'A'));
+  }
+  return base;
+}
+
+static inline bool is_strict_dna_base(char base) {
+  switch (base) {
+  case 'A':
+  case 'C':
+  case 'G':
+  case 'T':
+    return true;
+  default:
+    return false;
+  }
+}
+
+static double splice_signal_adjustment(const char* sequence, int seq_len,
+                                       int prev_state, int curr_state,
+                                       int position) {
+  if (!sequence || seq_len <= 0) {
+    return 0.0;
+  }
+
+  // Empirically chosen log-scale bonuses and penalties
+  static const double kMatchBonus = 1.0986122886681098;       // log(3.0)
+  static const double kMismatchPenalty = -1.2039728043259361; // log(0.3)
+
+  if (hmm_is_exon_state(prev_state) && curr_state == STATE_INTRON) {
+    if (position + 1 >= seq_len) {
+      return 0.0;
+    }
+
+    char first = normalize_base(sequence[position]);
+    char second = normalize_base(sequence[position + 1]);
+    if (!is_strict_dna_base(first) || !is_strict_dna_base(second)) {
+      return 0.0;
+    }
+
+    return (first == 'G' && second == 'T') ? kMatchBonus : kMismatchPenalty;
+  }
+
+  if (prev_state == STATE_INTRON && hmm_is_exon_state(curr_state)) {
+    if (position - 2 < 0 || position - 1 < 0) {
+      return 0.0;
+    }
+
+    char penultimate = normalize_base(sequence[position - 2]);
+    char ultimate = normalize_base(sequence[position - 1]);
+    if (!is_strict_dna_base(penultimate) || !is_strict_dna_base(ultimate)) {
+      return 0.0;
+    }
+
+    return (penultimate == 'A' && ultimate == 'G') ? kMatchBonus
+                                                   : kMismatchPenalty;
+  }
+
+  return 0.0;
+}
 
 void hmm_init(HMMModel* model, int num_features) {
   if (num_features > MAX_NUM_WAVELETS) {
@@ -914,8 +981,8 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
   return true;
 }
 
-double hmm_viterbi(const HMMModel* model, double** observations, int seq_len,
-                   int* states) {
+double hmm_viterbi(const HMMModel* model, double** observations,
+                   const char* sequence, int seq_len, int* states) {
   // Allocate Viterbi matrices
   double** delta = (double**)malloc(seq_len * sizeof(double*));
   int** psi = (int**)malloc(seq_len * sizeof(int*));
@@ -941,7 +1008,9 @@ double hmm_viterbi(const HMMModel* model, double** observations, int seq_len,
       int max_state = 0;
 
       for (int i = 0; i < NUM_STATES; i++) {
-        double val = delta[t - 1][i] + log(model->transition[i][j]);
+        double transition_log = log(model->transition[i][j]);
+        transition_log += splice_signal_adjustment(sequence, seq_len, i, j, t);
+        double val = delta[t - 1][i] + transition_log;
         if (val > max_val) {
           max_val = val;
           max_state = i;
@@ -1207,7 +1276,7 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
   fclose(fp);
   return true;
 
-==> ./src/sunfish.c <==
+==> src/sunfish.c <==
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
@@ -1614,19 +1683,140 @@ typedef struct {
   int original_length;
 } prediction_task_t;
 
+typedef struct {
+  int start;
+  int end;
+  int phase;
+} PredictedExon;
+
+static bool is_exon_state(int state) {
+  return state == STATE_EXON_F0 || state == STATE_EXON_F1 ||
+         state == STATE_EXON_F2;
+}
+
+static int exon_state_to_phase(int state) {
+  switch (state) {
+  case STATE_EXON_F0:
+    return 0;
+  case STATE_EXON_F1:
+    return 1;
+  case STATE_EXON_F2:
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+static void output_predicted_gene(const prediction_task_t* task,
+                                  const PredictedExon* exons, size_t exon_count,
+                                  int gene_seq_start, int gene_seq_end,
+                                  double normalized_score,
+                                  int original_length) {
+  if (!task || !exons || exon_count == 0)
+    return;
+
+  if (original_length <= 0)
+    return;
+
+  if (gene_seq_start < 0 || gene_seq_end < gene_seq_start)
+    return;
+
+  const char* seq_id = task->seq_id ? task->seq_id : "(unknown)";
+
+  int gene_id = 0;
+  pthread_mutex_lock(&g_gene_counter_mutex);
+  gene_id = ++g_gene_counter;
+  pthread_mutex_unlock(&g_gene_counter_mutex);
+
+  int output_start = 0;
+  int output_end = 0;
+
+  if (task->strand == '+') {
+    output_start = gene_seq_start + 1;
+    output_end = gene_seq_end + 1;
+  } else {
+    output_start = original_length - gene_seq_end;
+    output_end = original_length - gene_seq_start;
+  }
+
+  if (output_start < 1)
+    output_start = 1;
+  if (output_end < output_start) {
+    int tmp = output_start;
+    output_start = output_end;
+    output_end = tmp;
+  }
+  if (output_end > original_length)
+    output_end = original_length;
+
+  char gff_line[1024];
+  snprintf(gff_line, sizeof(gff_line),
+           "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n", seq_id,
+           output_start, output_end, normalized_score, task->strand, gene_id);
+  output_queue_add(&g_output_queue, gff_line);
+
+  if (task->strand == '+') {
+    for (size_t idx = 0; idx < exon_count; idx++) {
+      const PredictedExon* exon = &exons[idx];
+      int cds_start = exon->start + 1;
+      int cds_end = exon->end + 1;
+      if (cds_start < 1)
+        cds_start = 1;
+      if (cds_end > original_length)
+        cds_end = original_length;
+
+      snprintf(gff_line, sizeof(gff_line),
+               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
+               "gene%d\n",
+               seq_id, cds_start, cds_end, normalized_score, task->strand,
+               exon->phase, gene_id, idx + 1, gene_id);
+      output_queue_add(&g_output_queue, gff_line);
+    }
+  } else {
+    for (size_t reverse_idx = exon_count; reverse_idx-- > 0;) {
+      const PredictedExon* exon = &exons[reverse_idx];
+      int cds_start = original_length - exon->end;
+      int cds_end = original_length - exon->start;
+      if (cds_start < 1)
+        cds_start = 1;
+      if (cds_end > original_length)
+        cds_end = original_length;
+
+      snprintf(gff_line, sizeof(gff_line),
+               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
+               "gene%d\n",
+               seq_id, cds_start, cds_end, normalized_score, task->strand,
+               exon->phase, gene_id, exon_count - reverse_idx, gene_id);
+      output_queue_add(&g_output_queue, gff_line);
+    }
+  }
+}
+
 // Worker function for parallel prediction
 static void predict_sequence_worker(void* arg) {
   prediction_task_t* task = (prediction_task_t*)arg;
-
-  int seq_len = strlen(task->sequence);
+  if (!task)
+    return;
 
   double** observations = NULL;
   int* states = NULL;
+  PredictedExon* exon_buffer = NULL;
+  size_t exon_capacity = 0;
+  size_t exon_count = 0;
+  int seq_len = 0;
+  const char* seq_id = task->seq_id ? task->seq_id : "(unknown)";
+
+  if (!task->sequence)
+    goto cleanup;
+
+  seq_len = strlen(task->sequence);
+  if (seq_len <= 0)
+    goto cleanup;
 
   if (!build_observation_matrix(task->sequence, seq_len, &observations)) {
     fprintf(stderr,
             "Warning: Failed to compute CWT features for %s (%c strand)\n",
-            task->seq_id, task->strand);
+            seq_id, task->strand);
     goto cleanup;
   }
 
@@ -1644,94 +1834,131 @@ static void predict_sequence_worker(void* arg) {
   if (!states) {
     fprintf(stderr,
             "Warning: Failed to allocate state buffer for %s (%c strand)\n",
-            task->seq_id, task->strand);
+            seq_id, task->strand);
     goto cleanup;
   }
 
-  double log_prob = hmm_viterbi(task->model, observations, seq_len, states);
+  double log_prob =
+      hmm_viterbi(task->model, observations, task->sequence, seq_len, states);
   double normalized_score = (seq_len > 0) ? (log_prob / seq_len) : log_prob;
   const int original_length =
       (task->original_length > 0) ? task->original_length : seq_len;
 
-  // Process state sequence to identify genes
-  // Find contiguous exon regions and output as GFF3
-  int in_gene = 0;
-  int gene_start = -1;
-  int gene_id;
+  exon_capacity = 8;
+  exon_buffer = (PredictedExon*)malloc(exon_capacity * sizeof(PredictedExon));
+  if (!exon_buffer) {
+    fprintf(stderr,
+            "Warning: Failed to allocate exon buffer for %s (%c strand)\n",
+            seq_id, task->strand);
+    goto cleanup;
+  }
+
+  bool gene_active = false;
+  int current_exon_start = -1;
+  int gene_seq_start = -1;
+  int gene_seq_end = -1;
 
   for (int i = 0; i < seq_len; i++) {
-    int is_exon = (states[i] == STATE_EXON_F0 || states[i] == STATE_EXON_F1 ||
-                   states[i] == STATE_EXON_F2);
+    int state = states[i];
+    bool exon_state = is_exon_state(state);
+    bool intron_state = (state == STATE_INTRON);
 
-    if (is_exon && !in_gene) {
-      // Start of a new gene
-      in_gene = 1;
-      gene_start = i;
-    } else if (!is_exon && in_gene) {
-      // End of gene
-      int gene_end = i - 1;
+    if (!gene_active) {
+      if (exon_state) {
+        gene_active = true;
+        gene_seq_start = i;
+        gene_seq_end = i;
+        exon_count = 0;
+        current_exon_start = i;
+      }
+      continue;
+    }
 
-      // Get thread-safe gene counter
-      pthread_mutex_lock(&g_gene_counter_mutex);
-      gene_id = ++g_gene_counter;
-      pthread_mutex_unlock(&g_gene_counter_mutex);
+    if (exon_state) {
+      if (current_exon_start == -1)
+        current_exon_start = i;
+      gene_seq_end = i;
+      continue;
+    }
 
-      // Format GFF3 output
-      int output_start = gene_start + 1;
-      int output_end = gene_end + 1;
-      if (task->strand == '-') {
-        output_start = original_length - gene_end;
-        output_end = original_length - gene_start;
+    if (current_exon_start != -1) {
+      int exon_end = i - 1;
+      if (exon_end < current_exon_start)
+        exon_end = current_exon_start;
+
+      if (exon_count >= exon_capacity) {
+        size_t new_capacity = exon_capacity * 2;
+        PredictedExon* tmp = (PredictedExon*)realloc(
+            exon_buffer, new_capacity * sizeof(PredictedExon));
+        if (!tmp) {
+          fprintf(stderr,
+                  "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                  seq_id, task->strand);
+          goto cleanup;
+        }
+        exon_buffer = tmp;
+        exon_capacity = new_capacity;
       }
 
-      char gff_line[1024];
-      snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-               task->seq_id, output_start, output_end, normalized_score,
-               task->strand, gene_id);
+      exon_buffer[exon_count].start = current_exon_start;
+      exon_buffer[exon_count].end = exon_end;
+      exon_buffer[exon_count].phase =
+          exon_state_to_phase(states[current_exon_start]);
+      exon_count++;
 
-      output_queue_add(&g_output_queue, gff_line);
+      current_exon_start = -1;
+      gene_seq_end = exon_end;
+    }
 
-      snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
-               task->seq_id, output_start, output_end, normalized_score,
-               task->strand, gene_id);
+    if (!intron_state) {
+      if (exon_count > 0 && gene_seq_start >= 0 &&
+          gene_seq_end >= gene_seq_start) {
+        output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                              gene_seq_end, normalized_score, original_length);
+      }
 
-      output_queue_add(&g_output_queue, gff_line);
-
-      in_gene = 0;
+      gene_active = false;
+      gene_seq_start = -1;
+      gene_seq_end = -1;
+      exon_count = 0;
+      current_exon_start = -1;
     }
   }
 
-  // Handle gene extending to end of sequence
-  if (in_gene) {
-    pthread_mutex_lock(&g_gene_counter_mutex);
-    gene_id = ++g_gene_counter;
-    pthread_mutex_unlock(&g_gene_counter_mutex);
-
-    int gene_end = seq_len - 1;
-    int output_start = gene_start + 1;
-    int output_end = gene_end + 1;
-    if (task->strand == '-') {
-      output_start = original_length - gene_end;
-      output_end = original_length - gene_start;
+  if (current_exon_start != -1) {
+    int exon_end = seq_len - 1;
+    if (exon_count >= exon_capacity) {
+      size_t new_capacity = exon_capacity * 2;
+      PredictedExon* tmp = (PredictedExon*)realloc(
+          exon_buffer, new_capacity * sizeof(PredictedExon));
+      if (!tmp) {
+        fprintf(stderr,
+                "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                seq_id, task->strand);
+        goto cleanup;
+      }
+      exon_buffer = tmp;
+      exon_capacity = new_capacity;
     }
 
-    char gff_line[1024];
-    snprintf(gff_line, sizeof(gff_line),
-             "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-             task->seq_id, output_start, output_end, normalized_score,
-             task->strand, gene_id);
-    output_queue_add(&g_output_queue, gff_line);
+    exon_buffer[exon_count].start = current_exon_start;
+    exon_buffer[exon_count].end = exon_end;
+    exon_buffer[exon_count].phase =
+        exon_state_to_phase(states[current_exon_start]);
+    exon_count++;
+    gene_seq_end = exon_end;
+    current_exon_start = -1;
+  }
 
-    snprintf(gff_line, sizeof(gff_line),
-             "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
-             task->seq_id, output_start, output_end, normalized_score,
-             task->strand, gene_id);
-    output_queue_add(&g_output_queue, gff_line);
+  if (gene_active && exon_count > 0 && gene_seq_start >= 0 &&
+      gene_seq_end >= gene_seq_start) {
+    output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
+                          gene_seq_end, normalized_score, original_length);
   }
 
 cleanup:
+  if (exon_buffer)
+    free(exon_buffer);
   if (states)
     free(states);
   if (observations)
@@ -1979,7 +2206,7 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
       for (int pos = rc->start; pos <= rc->end && pos < seq_len; pos++) {
         if (pos < 0)
           continue;
-        int offset = pos - rc->start;
+        int offset = rc->end - pos;
         HMMState state = frame_to_state(rc->phase + offset);
         state_labels[pos] = state;
       }
@@ -2455,6 +2682,61 @@ static void handle_train(int argc, char* argv[]) {
             state_observation_counts[i]);
   }
 
+  {
+    const HMMState exon_cycle[] = {STATE_EXON_F0, STATE_EXON_F1, STATE_EXON_F2};
+    const size_t exon_cycle_len = sizeof(exon_cycle) / sizeof(exon_cycle[0]);
+
+    for (size_t idx = 0; idx < exon_cycle_len; idx++) {
+      HMMState state = exon_cycle[idx];
+      HMMState expected_next = exon_cycle[(idx + 1) % exon_cycle_len];
+      int row = (int)state;
+
+      double exon_transition_mass = 0.0;
+      for (size_t target_idx = 0; target_idx < exon_cycle_len; target_idx++) {
+        HMMState exon_target = exon_cycle[target_idx];
+        exon_transition_mass += model.transition[row][(int)exon_target];
+      }
+      if (exon_transition_mass < 1e-10) {
+        exon_transition_mass = 1e-10;
+      }
+
+      model.transition[row][(int)expected_next] = exon_transition_mass;
+      for (size_t target_idx = 0; target_idx < exon_cycle_len; target_idx++) {
+        HMMState exon_target = exon_cycle[target_idx];
+        if (exon_target == expected_next) {
+          continue;
+        }
+        model.transition[row][(int)exon_target] = 1e-10;
+      }
+
+      for (int col = 0; col < NUM_STATES; col++) {
+        if (!is_exon_state(col) && model.transition[row][col] < 1e-10) {
+          model.transition[row][col] = 1e-10;
+        }
+      }
+
+      double row_sum = 0.0;
+      for (int col = 0; col < NUM_STATES; col++) {
+        row_sum += model.transition[row][col];
+      }
+
+      if (row_sum <= 0.0) {
+        for (int col = 0; col < NUM_STATES; col++) {
+          model.transition[row][col] =
+              (col == (int)expected_next) ? 1.0 : 1e-10;
+        }
+        row_sum = 0.0;
+        for (int col = 0; col < NUM_STATES; col++) {
+          row_sum += model.transition[row][col];
+        }
+      }
+
+      for (int col = 0; col < NUM_STATES; col++) {
+        model.transition[row][col] /= row_sum;
+      }
+    }
+  }
+
   fprintf(stderr, "Supervised training complete.\n");
 
   // Save model
@@ -2656,7 +2938,7 @@ int main(int argc, char* argv[]) {
 
   return 0;
 
-==> ./src/thread_pool.c <==
+==> src/thread_pool.c <==
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -2856,7 +3138,7 @@ void thread_pool_destroy(thread_pool_t* pool) {
   pthread_mutex_destroy(&pool->queue_mutex);
   free(pool);
 
-==> ./src/utils.c <==
+==> src/utils.c <==
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>

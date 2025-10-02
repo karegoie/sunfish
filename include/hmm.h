@@ -83,8 +83,8 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
  * @param states Output state sequence (must be pre-allocated)
  * @return Log probability of most likely path
  */
-double hmm_viterbi(const HMMModel* model, double** observations, int seq_len,
-                   int* states);
+double hmm_viterbi(const HMMModel* model, double** observations,
+                   const char* sequence, int seq_len, int* states);
 
 /**
  * Save HMM model to file.

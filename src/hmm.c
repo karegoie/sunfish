@@ -10,6 +10,73 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+static inline bool hmm_is_exon_state(int state) {
+  return state == STATE_EXON_F0 || state == STATE_EXON_F1 ||
+         state == STATE_EXON_F2;
+}
+
+static inline char normalize_base(char base) {
+  if (base >= 'a' && base <= 'z') {
+    return (char)(base - ('a' - 'A'));
+  }
+  return base;
+}
+
+static inline bool is_strict_dna_base(char base) {
+  switch (base) {
+  case 'A':
+  case 'C':
+  case 'G':
+  case 'T':
+    return true;
+  default:
+    return false;
+  }
+}
+
+static double splice_signal_adjustment(const char* sequence, int seq_len,
+                                       int prev_state, int curr_state,
+                                       int position) {
+  if (!sequence || seq_len <= 0) {
+    return 0.0;
+  }
+
+  // Empirically chosen log-scale bonuses and penalties
+  static const double kMatchBonus = 1.0986122886681098;       // log(3.0)
+  static const double kMismatchPenalty = -1.2039728043259361; // log(0.3)
+
+  if (hmm_is_exon_state(prev_state) && curr_state == STATE_INTRON) {
+    if (position + 1 >= seq_len) {
+      return 0.0;
+    }
+
+    char first = normalize_base(sequence[position]);
+    char second = normalize_base(sequence[position + 1]);
+    if (!is_strict_dna_base(first) || !is_strict_dna_base(second)) {
+      return 0.0;
+    }
+
+    return (first == 'G' && second == 'T') ? kMatchBonus : kMismatchPenalty;
+  }
+
+  if (prev_state == STATE_INTRON && hmm_is_exon_state(curr_state)) {
+    if (position - 2 < 0 || position - 1 < 0) {
+      return 0.0;
+    }
+
+    char penultimate = normalize_base(sequence[position - 2]);
+    char ultimate = normalize_base(sequence[position - 1]);
+    if (!is_strict_dna_base(penultimate) || !is_strict_dna_base(ultimate)) {
+      return 0.0;
+    }
+
+    return (penultimate == 'A' && ultimate == 'G') ? kMatchBonus
+                                                   : kMismatchPenalty;
+  }
+
+  return 0.0;
+}
+
 void hmm_init(HMMModel* model, int num_features) {
   if (num_features > MAX_NUM_WAVELETS) {
     num_features = MAX_NUM_WAVELETS;
@@ -334,8 +401,8 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
   return true;
 }
 
-double hmm_viterbi(const HMMModel* model, double** observations, int seq_len,
-                   int* states) {
+double hmm_viterbi(const HMMModel* model, double** observations,
+                   const char* sequence, int seq_len, int* states) {
   // Allocate Viterbi matrices
   double** delta = (double**)malloc(seq_len * sizeof(double*));
   int** psi = (int**)malloc(seq_len * sizeof(int*));
@@ -361,7 +428,9 @@ double hmm_viterbi(const HMMModel* model, double** observations, int seq_len,
       int max_state = 0;
 
       for (int i = 0; i < NUM_STATES; i++) {
-        double val = delta[t - 1][i] + log(model->transition[i][j]);
+        double transition_log = log(model->transition[i][j]);
+        transition_log += splice_signal_adjustment(sequence, seq_len, i, j, t);
+        double val = delta[t - 1][i] + transition_log;
         if (val > max_val) {
           max_val = val;
           max_state = i;
