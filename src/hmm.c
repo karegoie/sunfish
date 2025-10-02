@@ -50,11 +50,11 @@ static inline int base_to_index(char base) {
 }
 
 static double pwm_score_at(const double pwm[][DONOR_MOTIF_SIZE], int pwm_len,
-                          const char* sequence, int seq_len, int start_pos) {
+                           const char* sequence, int seq_len, int start_pos) {
   if (!sequence || start_pos < 0 || start_pos + pwm_len > seq_len) {
     return 0.0;
   }
-  
+
   double score = 0.0;
   for (int i = 0; i < pwm_len; i++) {
     char base = normalize_base(sequence[start_pos + i]);
@@ -68,11 +68,12 @@ static double pwm_score_at(const double pwm[][DONOR_MOTIF_SIZE], int pwm_len,
 }
 
 static double pwm_score_acceptor(const double pwm[][ACCEPTOR_MOTIF_SIZE],
-                                 const char* sequence, int seq_len, int start_pos) {
+                                 const char* sequence, int seq_len,
+                                 int start_pos) {
   if (!sequence || start_pos < 0 || start_pos + ACCEPTOR_MOTIF_SIZE > seq_len) {
     return 0.0;
   }
-  
+
   double score = 0.0;
   for (int i = 0; i < ACCEPTOR_MOTIF_SIZE; i++) {
     char base = normalize_base(sequence[start_pos + i]);
@@ -108,14 +109,16 @@ static double splice_signal_adjustment(const char* sequence, int seq_len,
     char first = normalize_base(sequence[position]);
     char second = normalize_base(sequence[position + 1]);
     if (is_strict_dna_base(first) && is_strict_dna_base(second)) {
-      adjustment += (first == 'G' && second == 'T') ? kMatchBonus : kMismatchPenalty;
+      adjustment +=
+          (first == 'G' && second == 'T') ? kMatchBonus : kMismatchPenalty;
     }
 
     // Add PWM score if available
     if (pwm && pwm->has_donor) {
       int donor_start = position;
-      double pwm_score = pwm_score_at((const double (*)[DONOR_MOTIF_SIZE])pwm->donor_pwm,
-                                     DONOR_MOTIF_SIZE, sequence, seq_len, donor_start);
+      double pwm_score =
+          pwm_score_at((const double (*)[DONOR_MOTIF_SIZE])pwm->donor_pwm,
+                       DONOR_MOTIF_SIZE, sequence, seq_len, donor_start);
       adjustment += pwm_score * pwm->pwm_weight;
     }
   }
@@ -130,14 +133,16 @@ static double splice_signal_adjustment(const char* sequence, int seq_len,
     char penultimate = normalize_base(sequence[position - 2]);
     char ultimate = normalize_base(sequence[position - 1]);
     if (is_strict_dna_base(penultimate) && is_strict_dna_base(ultimate)) {
-      adjustment += (penultimate == 'A' && ultimate == 'G') ? kMatchBonus : kMismatchPenalty;
+      adjustment += (penultimate == 'A' && ultimate == 'G') ? kMatchBonus
+                                                            : kMismatchPenalty;
     }
 
     // Add PWM score if available
     if (pwm && pwm->has_acceptor) {
       int acceptor_start = position - ACCEPTOR_MOTIF_SIZE;
-      double pwm_score = pwm_score_acceptor((const double (*)[ACCEPTOR_MOTIF_SIZE])pwm->acceptor_pwm,
-                                           sequence, seq_len, acceptor_start);
+      double pwm_score = pwm_score_acceptor(
+          (const double (*)[ACCEPTOR_MOTIF_SIZE])pwm->acceptor_pwm, sequence,
+          seq_len, acceptor_start);
       adjustment += pwm_score * pwm->pwm_weight;
     }
   }
@@ -203,6 +208,16 @@ void hmm_init(HMMModel* model, int num_features) {
       model->pwm.acceptor_pwm[i][j] = 0.0;
     }
   }
+
+  // Initialize chunking metadata defaults
+  model->chunk_size = 0;
+  model->chunk_overlap = 0;
+  model->use_chunking = 0;
+
+  // Initialize wavelet scales metadata
+  model->num_wavelet_scales = 0;
+  for (int i = 0; i < MAX_NUM_WAVELETS; i++)
+    model->wavelet_scales[i] = 0.0;
 }
 
 double gaussian_log_pdf(const double* observation, const double* mean,
@@ -520,7 +535,8 @@ double hmm_viterbi(const HMMModel* model, double** observations,
 
       for (int i = 0; i < NUM_STATES; i++) {
         double transition_log = log(model->transition[i][j]);
-        transition_log += splice_signal_adjustment(sequence, seq_len, i, j, t, &model->pwm);
+        transition_log +=
+            splice_signal_adjustment(sequence, seq_len, i, j, t, &model->pwm);
         double val = delta[t - 1][i] + transition_log;
         if (val > max_val) {
           max_val = val;
@@ -625,7 +641,7 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   if (model->pwm.has_donor || model->pwm.has_acceptor) {
     fprintf(fp, "PWM\n");
     fprintf(fp, "WEIGHT %.10f\n", model->pwm.pwm_weight);
-    
+
     if (model->pwm.has_donor) {
       fprintf(fp, "DONOR %d\n", DONOR_MOTIF_SIZE);
       fprintf(fp, "A:");
@@ -650,7 +666,7 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
       fprintf(fp, "\n");
       fprintf(fp, "MIN_SCORE %.10f\n", model->pwm.min_donor_score);
     }
-    
+
     if (model->pwm.has_acceptor) {
       fprintf(fp, "ACCEPTOR %d\n", ACCEPTOR_MOTIF_SIZE);
       fprintf(fp, "A:");
@@ -677,6 +693,21 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     }
   }
 
+  // Save chunking metadata
+  fprintf(fp, "#chunk_size %d\n", model->chunk_size);
+  fprintf(fp, "#chunk_overlap %d\n", model->chunk_overlap);
+  fprintf(fp, "#use_chunking %d\n", model->use_chunking);
+
+  // Save wavelet scales metadata (if present)
+  if (model->num_wavelet_scales > 0) {
+    fprintf(fp, "#num_wavelet_scales %d\n", model->num_wavelet_scales);
+    fprintf(fp, "#wavelet_scales");
+    for (int i = 0; i < model->num_wavelet_scales; i++) {
+      fprintf(fp, " %.10f", model->wavelet_scales[i]);
+    }
+    fprintf(fp, "\n");
+  }
+
   fclose(fp);
   return true;
 }
@@ -699,6 +730,12 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
   model->wavelet_feature_count = 0;
   model->kmer_feature_count = 0;
   model->kmer_size = 0;
+  model->chunk_size = 0;
+  model->chunk_overlap = 0;
+  model->use_chunking = 0;
+  model->num_wavelet_scales = 0;
+  for (int i = 0; i < MAX_NUM_WAVELETS; i++)
+    model->wavelet_scales[i] = 0.0;
 
   int tmp_num_states = NUM_STATES;
 
@@ -724,6 +761,34 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
       continue;
     if (sscanf(line, "#kmer_size %d", &model->kmer_size) == 1)
       continue;
+    if (sscanf(line, "#chunk_size %d", &model->chunk_size) == 1)
+      continue;
+    if (sscanf(line, "#chunk_overlap %d", &model->chunk_overlap) == 1)
+      continue;
+    if (sscanf(line, "#use_chunking %d", &model->use_chunking) == 1)
+      continue;
+    if (sscanf(line, "#num_wavelet_scales %d", &model->num_wavelet_scales) == 1)
+      continue;
+    if (strncmp(line, "#wavelet_scales", 15) == 0) {
+      // parse space separated doubles after tag
+      char* ptr = line + 15;
+      int idx = 0;
+      while (ptr && *ptr != '\0' && idx < MAX_NUM_WAVELETS) {
+        double v = 0.0;
+        if (sscanf(ptr, "%lf", &v) != 1)
+          break;
+        model->wavelet_scales[idx++] = v;
+        char* next = strchr(ptr, ' ');
+        if (!next)
+          break;
+        ptr = next + 1;
+      }
+      // if num_wavelet_scales wasn't set earlier, infer from parsed values
+      if (model->num_wavelet_scales == 0)
+        model->num_wavelet_scales =
+            0; // will set later based on wavelet_feature_count
+      continue;
+    }
     (void)sscanf(line, "#num_states %d", &tmp_num_states);
   }
 
@@ -914,44 +979,64 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
     while (fgets(line, sizeof(line), fp) != NULL) {
       if (strncmp(line, "DONOR", 5) == 0) {
         int donor_size = 0;
-        if (sscanf(line, "DONOR %d", &donor_size) == 1 && 
+        if (sscanf(line, "DONOR %d", &donor_size) == 1 &&
             donor_size == DONOR_MOTIF_SIZE) {
           model->pwm.has_donor = 1;
-          
+
           // Read A: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "A:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "A:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[0][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[0][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read C: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "C:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "C:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[1][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[1][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read G: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "G:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "G:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[2][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[2][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read T: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "T:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "T:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[3][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.donor_pwm[3][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read MIN_SCORE line
@@ -961,44 +1046,64 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
         }
       } else if (strncmp(line, "ACCEPTOR", 8) == 0) {
         int acceptor_size = 0;
-        if (sscanf(line, "ACCEPTOR %d", &acceptor_size) == 1 && 
+        if (sscanf(line, "ACCEPTOR %d", &acceptor_size) == 1 &&
             acceptor_size == ACCEPTOR_MOTIF_SIZE) {
           model->pwm.has_acceptor = 1;
-          
+
           // Read A: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "A:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "A:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[0][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[0][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read C: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "C:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "C:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[1][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[1][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read G: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "G:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "G:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[2][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[2][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read T: line
-          if (fgets(line, sizeof(line), fp) != NULL && strncmp(line, "T:", 2) == 0) {
+          if (fgets(line, sizeof(line), fp) != NULL &&
+              strncmp(line, "T:", 2) == 0) {
             char* ptr = line + 2;
             for (int j = 0; j < ACCEPTOR_MOTIF_SIZE; j++) {
-              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[3][j]) != 1) break;
+              if (sscanf(ptr, "%lf", &model->pwm.acceptor_pwm[3][j]) != 1)
+                break;
               ptr = strchr(ptr, ' ');
-              if (ptr) ptr++; else break;
+              if (ptr)
+                ptr++;
+              else
+                break;
             }
           }
           // Read MIN_SCORE line

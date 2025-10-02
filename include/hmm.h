@@ -58,6 +58,8 @@ typedef struct {
   int wavelet_feature_count;
   int kmer_feature_count;
   int kmer_size;
+  int num_wavelet_scales;
+  double wavelet_scales[MAX_NUM_WAVELETS];
 
   // Global feature statistics for Z-score normalization
   double global_feature_mean[MAX_NUM_FEATURES];
@@ -65,6 +67,13 @@ typedef struct {
 
   // PWM model for splice site scoring
   PWMModel pwm;
+
+  // Chunking configuration stored with the model so prediction can reuse
+  // the chunk size and overlap that were used during training.
+  int chunk_size;    // recommended chunk size in bases (0 = unspecified)
+  int chunk_overlap; // recommended chunk overlap in bases
+  int use_chunking; // boolean (0/1) whether chunking was enabled when model was
+                    // trained
 } HMMModel;
 
 /**

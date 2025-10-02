@@ -13,7 +13,12 @@ void free_cds_groups(CdsGroup* groups, int count) {
     return;
   for (int i = 0; i < count; i++) {
     free(groups[i].parent_id);
-    free(groups[i].exons);
+    if (groups[i].exons) {
+      for (int j = 0; j < groups[i].exon_count; j++) {
+        free(groups[i].exons[j].seqid);
+      }
+      free(groups[i].exons);
+    }
   }
   free(groups);
 }

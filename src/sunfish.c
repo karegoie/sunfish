@@ -29,10 +29,10 @@ static int g_kmer_feature_count = 16; // 4^2 for default k-mer size 2
 static int g_total_feature_count =
     32; // 16 wavelet + 16 k-mer features by default
 
-// Chunk-based training configuration
+// Chunk-based prediction configuration
 static int g_chunk_size = 50000;    // Default chunk size: 50kb
 static int g_chunk_overlap = 5000;  // Default overlap: 5kb
-static bool g_use_chunking = true;  // Enable chunking by default
+static bool g_use_chunking = false; // Disabled by default; enable via CLI
 
 // Thread-safe output queue
 typedef struct output_node_t {
@@ -65,6 +65,24 @@ static int parse_threads_value(const char* arg) {
     return -1;
 
   return (int)value;
+}
+
+static bool parse_non_negative_int(const char* arg, int* out_value) {
+  if (arg == NULL || out_value == NULL)
+    return false;
+
+  char* endptr = NULL;
+  errno = 0;
+  long value = strtol(arg, &endptr, 10);
+
+  if (errno != 0 || endptr == arg || *endptr != '\0')
+    return false;
+
+  if (value < 0 || value > INT_MAX)
+    return false;
+
+  *out_value = (int)value;
+  return true;
 }
 
 static int detect_hardware_threads(void) {
@@ -381,9 +399,18 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
   if (seq_len <= 0)
     return false;
 
-  int wavelet_feature_rows = g_num_wavelet_scales * 2;
+  int wavelet_feature_rows = g_num_wavelet_scales * 4;
   int kmer_feature_rows = g_kmer_feature_count;
   int num_feature_rows = g_total_feature_count;
+
+  if (wavelet_feature_rows < 0 || kmer_feature_rows < 0)
+    return false;
+
+  if (wavelet_feature_rows + kmer_feature_rows != num_feature_rows) {
+    // Fallback to recomputing from trusted pieces to avoid mismatches that
+    // would otherwise corrupt memory when writing feature rows.
+    num_feature_rows = wavelet_feature_rows + kmer_feature_rows;
+  }
 
   if (num_feature_rows <= 0 || num_feature_rows > MAX_NUM_FEATURES)
     return false;
@@ -507,9 +534,9 @@ typedef struct {
   size_t error_message_size;
   int sequence_number;
   // Chunk-specific fields
-  int chunk_start;  // Start position in original sequence
-  int chunk_end;    // End position in original sequence
-  bool is_chunk;    // Whether this is a chunk or full sequence
+  int chunk_start; // Start position in original sequence
+  int chunk_end;   // End position in original sequence
+  bool is_chunk;   // Whether this is a chunk or full sequence
 } training_task_t;
 
 static void training_observation_worker(void* arg) {
@@ -528,9 +555,10 @@ static void training_observation_worker(void* arg) {
   if (task->is_chunk) {
     effective_len = task->chunk_end - task->chunk_start;
     chunk_seq = (char*)malloc((effective_len + 1) * sizeof(char));
-    if (!chunk_seq) goto cleanup;
+    if (!chunk_seq)
+      goto cleanup;
     memcpy(chunk_seq, sequence + task->chunk_start, effective_len);
-    chunk_seq[effective_len] = ' ';
+    chunk_seq[effective_len] = '\0';
     sequence = chunk_seq;
   }
 
@@ -558,7 +586,8 @@ cleanup:
       *(task->error_flag) = true;
       if (task->is_chunk) {
         snprintf(task->error_message, task->error_message_size,
-                 "Failed to compute feature matrix for chunk [%d-%d] of sequence %s (%c strand)",
+                 "Failed to compute feature matrix for chunk [%d-%d] of "
+                 "sequence %s (%c strand)",
                  task->chunk_start, task->chunk_end,
                  task->seq_id ? task->seq_id : "(unknown)", task->strand);
       } else {
@@ -596,20 +625,46 @@ static int calculate_num_chunks(int seq_len, int chunk_size, int overlap) {
 
 // Helper function to get chunk boundaries
 static void get_chunk_bounds(int seq_len, int chunk_size, int overlap,
-                            int chunk_idx, int* start, int* end) {
+                             int chunk_idx, int* start, int* end) {
   if (!g_use_chunking || seq_len <= chunk_size) {
     *start = 0;
     *end = seq_len;
     return;
   }
-  
+
   int step = chunk_size - overlap;
   *start = chunk_idx * step;
   *end = *start + chunk_size;
-  
+
   // Adjust last chunk to include remainder
   if (*end > seq_len) {
     *end = seq_len;
+  }
+}
+
+static void validate_chunk_configuration_or_exit(const char* context) {
+  if (!g_use_chunking)
+    return;
+
+  if (g_chunk_size <= 0) {
+    fprintf(stderr, "Error (%s): chunk size must be greater than zero\n",
+            context);
+    exit(1);
+  }
+
+  if (g_chunk_overlap < 0) {
+    fprintf(stderr,
+            "Error (%s): chunk overlap must be a non-negative integer\n",
+            context);
+    exit(1);
+  }
+
+  if (g_chunk_overlap >= g_chunk_size) {
+    fprintf(
+        stderr,
+        "Error (%s): chunk overlap (%d) must be smaller than chunk size (%d)\n",
+        context, g_chunk_overlap, g_chunk_size);
+    exit(1);
   }
 }
 
@@ -619,6 +674,9 @@ typedef struct {
   char strand;
   HMMModel* model;
   int original_length;
+  int chunk_offset; // Offset of this chunk within the full sequence (0-based)
+  int chunk_index;  // Index of this chunk within the sequence (0-based)
+  int chunk_count;  // Total number of chunks for the originating sequence
 } prediction_task_t;
 
 typedef struct {
@@ -758,6 +816,9 @@ static void output_predicted_gene(const prediction_task_t* task,
 
 // Validate ORF: check start codon, stop codon, in-frame stops, and length
 static bool is_valid_orf(const char* cds_sequence) {
+  // FOR DEBUGGING PURPOSE ONLY; FIXME
+  //  return true;
+
   if (!cds_sequence) {
     return false;
   }
@@ -820,6 +881,7 @@ static void predict_sequence_worker(void* arg) {
   size_t exon_count = 0;
   int seq_len = 0;
   const char* seq_id = task->seq_id ? task->seq_id : "(unknown)";
+  const int chunk_offset = (task->chunk_offset >= 0) ? task->chunk_offset : 0;
 
   if (!task->sequence)
     goto cleanup;
@@ -962,16 +1024,39 @@ static void predict_sequence_worker(void* arg) {
           cds_seq[cds_len] = '\0';
 
           // Validate ORF before outputting
+          int global_gene_start = gene_seq_start + chunk_offset;
+          int global_gene_end = gene_seq_end + chunk_offset;
+          for (size_t e = 0; e < exon_count; e++) {
+            exon_buffer[e].start += chunk_offset;
+            exon_buffer[e].end += chunk_offset;
+          }
+
           if (is_valid_orf(cds_seq)) {
-            output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
-                                  gene_seq_end, prediction_score,
-                                  original_length);
+            output_predicted_gene(task, exon_buffer, exon_count,
+                                  global_gene_start, global_gene_end,
+                                  prediction_score, original_length);
+          }
+
+          for (size_t e = 0; e < exon_count; e++) {
+            exon_buffer[e].start -= chunk_offset;
+            exon_buffer[e].end -= chunk_offset;
           }
           free(cds_seq);
         } else {
           // Memory allocation failed, output without validation
-          output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
-                                gene_seq_end, prediction_score, original_length);
+          int global_gene_start = gene_seq_start + chunk_offset;
+          int global_gene_end = gene_seq_end + chunk_offset;
+          for (size_t e = 0; e < exon_count; e++) {
+            exon_buffer[e].start += chunk_offset;
+            exon_buffer[e].end += chunk_offset;
+          }
+          output_predicted_gene(task, exon_buffer, exon_count,
+                                global_gene_start, global_gene_end,
+                                prediction_score, original_length);
+          for (size_t e = 0; e < exon_count; e++) {
+            exon_buffer[e].start -= chunk_offset;
+            exon_buffer[e].end -= chunk_offset;
+          }
         }
       }
 
@@ -1027,15 +1112,38 @@ static void predict_sequence_worker(void* arg) {
       cds_seq[cds_len] = '\0';
 
       // Validate ORF before outputting
+      int global_gene_start = gene_seq_start + chunk_offset;
+      int global_gene_end = gene_seq_end + chunk_offset;
+      for (size_t e = 0; e < exon_count; e++) {
+        exon_buffer[e].start += chunk_offset;
+        exon_buffer[e].end += chunk_offset;
+      }
+
       if (is_valid_orf(cds_seq)) {
-        output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
-                              gene_seq_end, prediction_score, original_length);
+        output_predicted_gene(task, exon_buffer, exon_count, global_gene_start,
+                              global_gene_end, prediction_score,
+                              original_length);
+      }
+
+      for (size_t e = 0; e < exon_count; e++) {
+        exon_buffer[e].start -= chunk_offset;
+        exon_buffer[e].end -= chunk_offset;
       }
       free(cds_seq);
     } else {
       // Memory allocation failed, output without validation
-      output_predicted_gene(task, exon_buffer, exon_count, gene_seq_start,
-                            gene_seq_end, prediction_score, original_length);
+      int global_gene_start = gene_seq_start + chunk_offset;
+      int global_gene_end = gene_seq_end + chunk_offset;
+      for (size_t e = 0; e < exon_count; e++) {
+        exon_buffer[e].start += chunk_offset;
+        exon_buffer[e].end += chunk_offset;
+      }
+      output_predicted_gene(task, exon_buffer, exon_count, global_gene_start,
+                            global_gene_end, prediction_score, original_length);
+      for (size_t e = 0; e < exon_count; e++) {
+        exon_buffer[e].start -= chunk_offset;
+        exon_buffer[e].end -= chunk_offset;
+      }
     }
   }
 
@@ -1057,12 +1165,11 @@ static void print_help(const char* progname) {
   printf("Usage:\n");
   printf("  %s <command> [options]\n\n", progname);
   printf("Commands:\n");
-  printf(
-      "  help                         Show this help message\n"
-      "  train <train.fasta> <train.gff> [--wavelet-scales|-w S1,S2,...]"
-      " [--wavelet|-w S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]\n"
-      "  predict <target.fasta> [--wavelet-scales|-w S1,S2,...]"
-      " [--wavelet|-w S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]\n\n");
+  printf("  help                         Show this help message\n"
+         "  train <train.fasta> <train.gff> [--wavelet|-w S1,S2,...|s:e:step]"
+         " [--kmer|-k K] [--threads|-t N] [--chunk-size N] [--chunk-overlap M]"
+         " [--chunk|--no-chunk]\n"
+         "  predict <target.fasta> [--threads|-t N]\n\n");
   printf("Options:\n");
   printf("  -h, --help                   Show this help message\n");
   printf(
@@ -1072,7 +1179,11 @@ static void print_help(const char* progname) {
       "(default: 2; use 0 to "
       "disable)\n"
       "  --threads, -t N             Number of worker threads (default: auto-"
-      "detected)\n\n");
+      "detected)\n"
+      "  --chunk-size N              Chunk size in bases for long sequences\n"
+      "  --chunk-overlap M           Overlap size in bases between chunks\n"
+      "  --chunk                     Enable chunked processing (default: off)\n"
+      "  --no-chunk                  Disable chunked processing\n\n");
   printf("Examples:\n");
   printf("  %s train data.fa data.gff --wavelet 3,9,81\n", progname);
   printf("  %s predict genome.fa --threads 8 > predictions.gff3\n\n", progname);
@@ -1687,7 +1798,8 @@ static SplicePWM* train_splice_model(const FastaData* genome,
 
     double min_log_odds = 0.0;
     for (int base = 0; base < NUM_NUCLEOTIDES; base++) {
-      double freq = (counts->donor_counts[base][pos] + pseudocount) / position_sum;
+      double freq =
+          (counts->donor_counts[base][pos] + pseudocount) / position_sum;
       double log_odds = log(freq / bg_freq);
       pwm->donor_pwm[base][pos] = log_odds;
       if (log_odds < min_log_odds) {
@@ -1707,7 +1819,8 @@ static SplicePWM* train_splice_model(const FastaData* genome,
 
     double min_log_odds = 0.0;
     for (int base = 0; base < NUM_NUCLEOTIDES; base++) {
-      double freq = (counts->acceptor_counts[base][pos] + pseudocount) / position_sum;
+      double freq =
+          (counts->acceptor_counts[base][pos] + pseudocount) / position_sum;
       double log_odds = log(freq / bg_freq);
       pwm->acceptor_pwm[base][pos] = log_odds;
       if (log_odds < min_log_odds) {
@@ -1717,7 +1830,8 @@ static SplicePWM* train_splice_model(const FastaData* genome,
     pwm->min_acceptor_score += min_log_odds;
   }
 
-  fprintf(stderr, "Trained splice PWM from %d donor sites and %d acceptor sites\n",
+  fprintf(stderr,
+          "Trained splice PWM from %d donor sites and %d acceptor sites\n",
           counts->total_donor_sites, counts->total_acceptor_sites);
 
   free(counts);
@@ -1726,10 +1840,12 @@ static SplicePWM* train_splice_model(const FastaData* genome,
 
 static void handle_train(int argc, char* argv[]) {
   if (argc < 4) {
-    fprintf(stderr,
-            "Usage: %s train <train.fasta> <train.gff> [--wavelet|-w "
-            "S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]\n",
-            argv[0]);
+    fprintf(
+        stderr,
+        "Usage: %s train <train.fasta> <train.gff> [--wavelet|-w "
+        "S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N] [--chunk-size N]"
+        " [--chunk-overlap M] [--chunk|--no-chunk]\n",
+        argv[0]);
     exit(1);
   }
 
@@ -1816,8 +1932,38 @@ static void handle_train(int argc, char* argv[]) {
       }
       g_num_threads = parsed_threads;
       threads_specified = true;
+    } else if (strcmp(argv[i], "--chunk-size") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Error: %s requires a positive integer\n", argv[i]);
+        exit(1);
+      }
+      int value = 0;
+      if (!parse_non_negative_int(argv[++i], &value) || value <= 0) {
+        fprintf(stderr, "Error: Invalid chunk size '%s'\n", argv[i]);
+        exit(1);
+      }
+      g_chunk_size = value;
+      g_use_chunking = true;
+    } else if (strcmp(argv[i], "--chunk-overlap") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Error: %s requires a non-negative integer\n", argv[i]);
+        exit(1);
+      }
+      int value = 0;
+      if (!parse_non_negative_int(argv[++i], &value)) {
+        fprintf(stderr, "Error: Invalid chunk overlap '%s'\n", argv[i]);
+        exit(1);
+      }
+      g_chunk_overlap = value;
+      g_use_chunking = true;
+    } else if (strcmp(argv[i], "--chunk") == 0) {
+      g_use_chunking = true;
+    } else if (strcmp(argv[i], "--no-chunk") == 0) {
+      g_use_chunking = false;
     }
   }
+
+  validate_chunk_configuration_or_exit("train");
 
   if (!update_feature_counts()) {
     fprintf(stderr,
@@ -1941,6 +2087,7 @@ static void handle_train(int argc, char* argv[]) {
       break;
     }
 
+    memset(forward_task, 0, sizeof(training_task_t));
     forward_task->sequence = seq;
     forward_task->seq_id = seq_id;
     forward_task->seq_len = seq_len;
@@ -1953,6 +2100,9 @@ static void handle_train(int argc, char* argv[]) {
     forward_task->error_message = error_message;
     forward_task->error_message_size = sizeof(error_message);
     forward_task->sequence_number = i + 1;
+    forward_task->chunk_start = 0;
+    forward_task->chunk_end = seq_len;
+    forward_task->is_chunk = false;
 
     if (!thread_pool_add_task(pool, training_observation_worker,
                               forward_task)) {
@@ -1984,6 +2134,7 @@ static void handle_train(int argc, char* argv[]) {
       break;
     }
 
+    memset(reverse_task, 0, sizeof(training_task_t));
     reverse_task->sequence = seq;
     reverse_task->seq_id = seq_id;
     reverse_task->seq_len = seq_len;
@@ -1996,6 +2147,9 @@ static void handle_train(int argc, char* argv[]) {
     reverse_task->error_message = error_message;
     reverse_task->error_message_size = sizeof(error_message);
     reverse_task->sequence_number = i + 1;
+    reverse_task->chunk_start = 0;
+    reverse_task->chunk_end = seq_len;
+    reverse_task->is_chunk = false;
 
     if (!thread_pool_add_task(pool, training_observation_worker,
                               reverse_task)) {
@@ -2228,16 +2382,18 @@ static void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Training splice site PWM model...\n");
   SplicePWM* splice_pwm = train_splice_model(genome, groups, group_count);
   if (splice_pwm) {
-    fprintf(stderr, "Splice PWM training complete (min donor=%.3f, min acceptor=%.3f)\n",
-            splice_pwm->min_donor_score, splice_pwm->min_acceptor_score);
-    
+    fprintf(
+        stderr,
+        "Splice PWM training complete (min donor=%.3f, min acceptor=%.3f)\n",
+        splice_pwm->min_donor_score, splice_pwm->min_acceptor_score);
+
     // Store PWM in model for use during prediction
     model.pwm.has_donor = 1;
     model.pwm.has_acceptor = 1;
     model.pwm.pwm_weight = 1.0;
     model.pwm.min_donor_score = splice_pwm->min_donor_score;
     model.pwm.min_acceptor_score = splice_pwm->min_acceptor_score;
-    
+
     // Copy PWM matrices
     for (int i = 0; i < NUM_NUCLEOTIDES; i++) {
       for (int j = 0; j < DONOR_MOTIF_SIZE; j++) {
@@ -2247,14 +2403,14 @@ static void handle_train(int argc, char* argv[]) {
         model.pwm.acceptor_pwm[i][j] = splice_pwm->acceptor_pwm[i][j];
       }
     }
-    
+
     free(splice_pwm);
     fprintf(stderr, "PWM integrated into model.\n");
   } else {
     fprintf(stderr, "Warning: Failed to train splice PWM model\n");
   }
 
-  const int kBaumWelchMaxIterations = 100;
+  const int kBaumWelchMaxIterations = 10; // FIXME
   const double kBaumWelchThreshold = 10.0;
 
   fprintf(
@@ -2270,6 +2426,17 @@ static void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Baum-Welch refinement complete.\n");
 
   // Save model
+  // Store chunking metadata into model before saving
+  model.chunk_size = g_chunk_size;
+  model.chunk_overlap = g_chunk_overlap;
+  model.use_chunking = g_use_chunking ? 1 : 0;
+
+  // Store wavelet scales used for training so prediction can reuse them
+  model.num_wavelet_scales = g_num_wavelet_scales;
+  for (int i = 0; i < g_num_wavelet_scales && i < MAX_NUM_WAVELETS; i++) {
+    model.wavelet_scales[i] = g_wavelet_scales[i];
+  }
+
   if (!hmm_save_model(&model, "sunfish.model")) {
     fprintf(stderr, "Failed to save model\n");
     exit(1);
@@ -2292,81 +2459,20 @@ static void handle_train(int argc, char* argv[]) {
 // Prediction mode: Parallel Viterbi prediction
 static void handle_predict(int argc, char* argv[]) {
   if (argc < 3) {
-    fprintf(stderr,
-            "Usage: %s predict <target.fasta> [--wavelet|-w "
-            "S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]\n",
-            argv[0]);
+    fprintf(
+        stderr,
+        "Usage: %s predict <target.fasta> [--wavelet|-w "
+        "S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N] [--chunk-size N]"
+        " [--chunk-overlap M] [--chunk|--no-chunk]\n",
+        argv[0]);
     exit(1);
   }
 
   const char* fasta_path = argv[2];
 
   bool threads_specified = false;
-  bool kmer_specified = false;
   for (int i = 3; i < argc; i++) {
-    if ((strcmp(argv[i], "--wavelet") == 0 || strcmp(argv[i], "-w") == 0)) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Error: %s requires an argument\n", argv[i]);
-        exit(1);
-      }
-      const char* arg = argv[++i];
-      if (strchr(arg, ':')) {
-        int parsed =
-            parse_wavelet_range(arg, g_wavelet_scales, MAX_NUM_WAVELETS);
-        if (parsed < 0) {
-          fprintf(stderr, "Error: Invalid wavelet range '%s'\n", arg);
-          exit(1);
-        }
-        g_num_wavelet_scales = parsed;
-        fprintf(stderr, "Using %d wavelet scales (range)\n",
-                g_num_wavelet_scales);
-      } else if (strchr(arg, ',')) {
-        g_num_wavelet_scales =
-            parse_wavelet_scales(arg, g_wavelet_scales, MAX_NUM_WAVELETS);
-        fprintf(stderr, "Using %d wavelet scales (list)\n",
-                g_num_wavelet_scales);
-      } else {
-        double v = atof(arg);
-        if (v <= 0.0) {
-          fprintf(stderr, "Error: Invalid wavelet scale '%s'\n", arg);
-          exit(1);
-        }
-        g_wavelet_scales[0] = v;
-        g_num_wavelet_scales = 1;
-        fprintf(stderr, "Using single wavelet scale %.2f\n", v);
-      }
-    } else if ((strcmp(argv[i], "--kmer") == 0 || strcmp(argv[i], "-k") == 0)) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Error: %s requires a non-negative integer\n", argv[i]);
-        exit(1);
-      }
-
-      const char* arg = argv[++i];
-      char* endptr = NULL;
-      errno = 0;
-      long parsed = strtol(arg, &endptr, 10);
-      if (errno != 0 || endptr == arg || *endptr != '\0' || parsed < 0 ||
-          parsed > INT_MAX) {
-        fprintf(stderr, "Error: Invalid k-mer size '%s'\n", arg);
-        exit(1);
-      }
-
-      int candidate = (int)parsed;
-      if (candidate > 0) {
-        int possible = compute_kmer_feature_count(candidate);
-        if (possible < 0) {
-          fprintf(stderr,
-                  "Error: k-mer size %d is too large for the maximum feature "
-                  "capacity (%d)\n",
-                  candidate, MAX_NUM_FEATURES);
-          exit(1);
-        }
-      }
-
-      g_kmer_size = candidate;
-      kmer_specified = true;
-    } else if ((strcmp(argv[i], "--threads") == 0 ||
-                strcmp(argv[i], "-t") == 0)) {
+    if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-t") == 0)) {
       if (i + 1 >= argc) {
         fprintf(stderr, "Error: %s requires a positive integer\n", argv[i]);
         exit(1);
@@ -2378,8 +2484,16 @@ static void handle_predict(int argc, char* argv[]) {
       }
       g_num_threads = parsed_threads;
       threads_specified = true;
+    } else {
+      fprintf(stderr,
+              "Error: Unknown or unsupported option '%s' for predict. "
+              "Predict uses parameters stored in the model file.\n",
+              argv[i]);
+      exit(1);
     }
   }
+
+  validate_chunk_configuration_or_exit("predict");
 
   if (!update_feature_counts()) {
     fprintf(stderr,
@@ -2410,16 +2524,30 @@ static void handle_predict(int argc, char* argv[]) {
     }
   }
 
-  if (kmer_specified) {
-    if (g_kmer_size != model.kmer_size) {
-      fprintf(stderr,
-              "Error: Model trained with k-mer size %d but CLI specified %d. "
-              "Please supply matching --kmer value.\n",
-              model.kmer_size, g_kmer_size);
-      exit(1);
-    }
+  // Enforce training parameters from model for predict to ensure parity
+  // Wavelet scales
+  if (model.num_wavelet_scales > 0) {
+    g_num_wavelet_scales = model.num_wavelet_scales;
+    for (int i = 0; i < g_num_wavelet_scales && i < MAX_NUM_WAVELETS; i++)
+      g_wavelet_scales[i] = model.wavelet_scales[i];
+    fprintf(stderr, "Using wavelet scales from model (%d scales)\n",
+            g_num_wavelet_scales);
+  }
+
+  // k-mer settings
+  g_kmer_size = model.kmer_size;
+  g_kmer_feature_count = model.kmer_feature_count;
+
+  // Chunking settings
+  g_chunk_size = model.chunk_size > 0 ? model.chunk_size : g_chunk_size;
+  g_chunk_overlap =
+      model.chunk_overlap >= 0 ? model.chunk_overlap : g_chunk_overlap;
+  g_use_chunking = model.use_chunking ? true : false;
+  if (g_use_chunking) {
+    fprintf(stderr, "Using chunking from model: size=%d overlap=%d\n",
+            g_chunk_size, g_chunk_overlap);
   } else {
-    g_kmer_size = model.kmer_size;
+    fprintf(stderr, "Chunking disabled by model settings\n");
   }
 
   if (!update_feature_counts()) {
@@ -2437,18 +2565,13 @@ static void handle_predict(int argc, char* argv[]) {
             "%d, k-mer %d). Align --wavelet/--kmer with training.\n",
             model.num_features, model.wavelet_feature_count,
             model.kmer_feature_count, g_total_feature_count,
-            g_num_wavelet_scales * 2, g_kmer_feature_count);
+            g_num_wavelet_scales * 4, g_kmer_feature_count);
     exit(1);
   }
 
   if (g_kmer_size > 0) {
-    if (kmer_specified) {
-      fprintf(stderr, "Using k-mer size %d (%d features)\n", g_kmer_size,
-              g_kmer_feature_count);
-    } else {
-      fprintf(stderr, "Model k-mer size %d (%d features) in use\n", g_kmer_size,
-              g_kmer_feature_count);
-    }
+    fprintf(stderr, "Model k-mer size %d (%d features) in use\n", g_kmer_size,
+            g_kmer_feature_count);
   }
 
   fprintf(stderr,
@@ -2475,72 +2598,178 @@ static void handle_predict(int argc, char* argv[]) {
     exit(1);
   }
 
+  if (g_use_chunking) {
+    int step = (g_chunk_size > g_chunk_overlap)
+                   ? (g_chunk_size - g_chunk_overlap)
+                   : g_chunk_size;
+    fprintf(stderr,
+            "Chunking enabled: chunk size %d bp, overlap %d bp (step %d bp)\n",
+            g_chunk_size, g_chunk_overlap, step);
+  } else {
+    fprintf(stderr, "Chunking disabled; processing full sequences\n");
+  }
+
   printf("##gff-version 3\n");
 
   // Submit prediction tasks to thread pool
   for (int i = 0; i < genome->count; i++) {
-    // Process forward strand
-    {
+    const char* seq = genome->records[i].sequence;
+    const char* seq_id = genome->records[i].id;
+    int seq_len = strlen(seq);
+    int chunk_count =
+        calculate_num_chunks(seq_len, g_chunk_size, g_chunk_overlap);
+    if (chunk_count < 1)
+      chunk_count = 1;
+
+    if (chunk_count > 1) {
+      fprintf(
+          stderr,
+          "Splitting %s into %d chunk(s) per strand (size %d, overlap %d)\n",
+          seq_id, chunk_count, g_chunk_size, g_chunk_overlap);
+    }
+
+    for (int chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
+      int chunk_start = 0;
+      int chunk_end = 0;
+      get_chunk_bounds(seq_len, g_chunk_size, g_chunk_overlap, chunk_idx,
+                       &chunk_start, &chunk_end);
+      int chunk_len = chunk_end - chunk_start;
+      if (chunk_len <= 0)
+        continue;
+
       prediction_task_t* task =
           (prediction_task_t*)malloc(sizeof(prediction_task_t));
       if (!task) {
-        fprintf(stderr, "Warning: Failed to allocate task for %s (+ strand)\n",
-                genome->records[i].id);
-      } else {
-        task->sequence = strdup(genome->records[i].sequence);
-        task->seq_id = strdup(genome->records[i].id);
-        task->strand = '+';
-        task->model = &model;
-        task->original_length = strlen(genome->records[i].sequence);
+        fprintf(
+            stderr,
+            "Warning: Failed to allocate task for %s (+ strand chunk %d/%d)\n",
+            seq_id, chunk_idx + 1, chunk_count);
+        continue;
+      }
 
-        if (!task->sequence || !task->seq_id) {
-          fprintf(stderr,
-                  "Warning: Failed to duplicate inputs for %s (+ strand)\n",
-                  genome->records[i].id);
-          free(task->sequence);
-          free(task->seq_id);
-          free(task);
+      char* chunk_seq = (char*)malloc((size_t)chunk_len + 1);
+      if (!chunk_seq) {
+        fprintf(stderr,
+                "Warning: Failed to allocate sequence buffer for %s (+ strand "
+                "chunk %d/%d)\n",
+                seq_id, chunk_idx + 1, chunk_count);
+        free(task);
+        continue;
+      }
+      memcpy(chunk_seq, seq + chunk_start, (size_t)chunk_len);
+      chunk_seq[chunk_len] = '\0';
+
+      char* seq_id_copy = strdup(seq_id);
+      if (!seq_id_copy) {
+        fprintf(stderr,
+                "Warning: Failed to duplicate sequence ID for %s (+ strand)\n",
+                seq_id);
+        free(chunk_seq);
+        free(task);
+        continue;
+      }
+
+      task->sequence = chunk_seq;
+      task->seq_id = seq_id_copy;
+      task->strand = '+';
+      task->model = &model;
+      task->original_length = seq_len;
+      task->chunk_offset = chunk_start;
+      task->chunk_index = chunk_idx;
+      task->chunk_count = chunk_count;
+
+      if (!thread_pool_add_task(pool, predict_sequence_worker, task)) {
+        fprintf(stderr,
+                "Warning: Failed to enqueue %s (+ strand chunk %d/%d)\n",
+                seq_id, chunk_idx + 1, chunk_count);
+        free(task->sequence);
+        free(task->seq_id);
+        free(task);
+      } else {
+        if (chunk_count > 1) {
+          fprintf(stderr, "Processing %s (+ strand chunk %d/%d)...\n", seq_id,
+                  chunk_idx + 1, chunk_count);
         } else {
-          thread_pool_add_task(pool, predict_sequence_worker, task);
-          fprintf(stderr, "Processing %s (+ strand)...\n", task->seq_id);
+          fprintf(stderr, "Processing %s (+ strand)...\n", seq_id);
         }
       }
     }
 
-    // Process reverse strand
-    char* rc_sequence = reverse_complement(genome->records[i].sequence);
-    if (!rc_sequence) {
+    char* rc_full = reverse_complement(seq);
+    if (!rc_full) {
       fprintf(stderr, "Warning: Failed to generate reverse complement for %s\n",
-              genome->records[i].id);
+              seq_id);
       continue;
     }
 
-    prediction_task_t* task =
-        (prediction_task_t*)malloc(sizeof(prediction_task_t));
-    if (!task) {
-      fprintf(stderr, "Warning: Failed to allocate task for %s (- strand)\n",
-              genome->records[i].id);
-      free(rc_sequence);
-      continue;
+    for (int chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
+      int chunk_start = 0;
+      int chunk_end = 0;
+      get_chunk_bounds(seq_len, g_chunk_size, g_chunk_overlap, chunk_idx,
+                       &chunk_start, &chunk_end);
+      int chunk_len = chunk_end - chunk_start;
+      if (chunk_len <= 0)
+        continue;
+
+      prediction_task_t* task =
+          (prediction_task_t*)malloc(sizeof(prediction_task_t));
+      if (!task) {
+        fprintf(
+            stderr,
+            "Warning: Failed to allocate task for %s (- strand chunk %d/%d)\n",
+            seq_id, chunk_idx + 1, chunk_count);
+        continue;
+      }
+
+      char* chunk_seq = (char*)malloc((size_t)chunk_len + 1);
+      if (!chunk_seq) {
+        fprintf(stderr,
+                "Warning: Failed to allocate sequence buffer for %s (- strand "
+                "chunk %d/%d)\n",
+                seq_id, chunk_idx + 1, chunk_count);
+        free(task);
+        continue;
+      }
+      memcpy(chunk_seq, rc_full + chunk_start, (size_t)chunk_len);
+      chunk_seq[chunk_len] = '\0';
+
+      char* seq_id_copy = strdup(seq_id);
+      if (!seq_id_copy) {
+        fprintf(stderr,
+                "Warning: Failed to duplicate sequence ID for %s (- strand)\n",
+                seq_id);
+        free(chunk_seq);
+        free(task);
+        continue;
+      }
+
+      task->sequence = chunk_seq;
+      task->seq_id = seq_id_copy;
+      task->strand = '-';
+      task->model = &model;
+      task->original_length = seq_len;
+      task->chunk_offset = chunk_start;
+      task->chunk_index = chunk_idx;
+      task->chunk_count = chunk_count;
+
+      if (!thread_pool_add_task(pool, predict_sequence_worker, task)) {
+        fprintf(stderr,
+                "Warning: Failed to enqueue %s (- strand chunk %d/%d)\n",
+                seq_id, chunk_idx + 1, chunk_count);
+        free(task->sequence);
+        free(task->seq_id);
+        free(task);
+      } else {
+        if (chunk_count > 1) {
+          fprintf(stderr, "Processing %s (- strand chunk %d/%d)...\n", seq_id,
+                  chunk_idx + 1, chunk_count);
+        } else {
+          fprintf(stderr, "Processing %s (- strand)...\n", seq_id);
+        }
+      }
     }
 
-    task->sequence = rc_sequence;
-    task->seq_id = strdup(genome->records[i].id);
-    task->strand = '-';
-    task->model = &model;
-    task->original_length = strlen(genome->records[i].sequence);
-
-    if (!task->seq_id) {
-      fprintf(stderr,
-              "Warning: Failed to duplicate sequence ID for %s (- strand)\n",
-              genome->records[i].id);
-      free(task->sequence);
-      free(task);
-      continue;
-    }
-
-    thread_pool_add_task(pool, predict_sequence_worker, task);
-    fprintf(stderr, "Processing %s (- strand)...\n", task->seq_id);
+    free(rc_full);
   }
 
   // Wait for all tasks to complete
