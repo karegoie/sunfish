@@ -769,7 +769,7 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
       for (int pos = rc->start; pos <= rc->end && pos < seq_len; pos++) {
         if (pos < 0)
           continue;
-        int offset = pos - rc->start;
+        int offset = rc->end - pos;
         HMMState state = frame_to_state(rc->phase + offset);
         state_labels[pos] = state;
       }
