@@ -18,9 +18,10 @@
 #include "../include/thread_pool.h"
 
 // Global configuration
-static int g_num_wavelet_scales = 5;
-static double g_wavelet_scales[MAX_NUM_WAVELETS] = {3.0, 9.0, 81.0, 243.0,
-                                                    6561.0};
+// Default wavelet scales: powers of 3 from 3 up to (<= 2001)
+static int g_num_wavelet_scales = 8;
+static double g_wavelet_scales[MAX_NUM_WAVELETS] = {
+    3.0, 9.0, 27.0, 81.0, 243.0, 729.0, 2187.0, 6561.0};
 // Default: 0 means "not set"; we'll use number of online processors at runtime
 static int g_num_threads = 0;
 
@@ -255,6 +256,69 @@ static int parse_wavelet_scales(const char* arg, double* scales,
   return count;
 }
 
+// Parse range in the form start:end:step and populate scales (up to max_scales)
+// Returns number of scales parsed, or -1 on error.
+static int parse_wavelet_range(const char* arg, double* scales,
+                               int max_scales) {
+  if (!arg || !scales || max_scales <= 0)
+    return -1;
+
+  // Copy and split by ':'
+  char* copy = strdup(arg);
+  if (!copy)
+    return -1;
+
+  char* saveptr = NULL;
+  char* token = strtok_r(copy, ":", &saveptr);
+  if (!token) {
+    free(copy);
+    return -1;
+  }
+  char* endptr = NULL;
+  double start = strtod(token, &endptr);
+  if (endptr == token) {
+    free(copy);
+    return -1;
+  }
+
+  token = strtok_r(NULL, ":", &saveptr);
+  if (!token) {
+    free(copy);
+    return -1;
+  }
+  double endv = strtod(token, &endptr);
+  if (endptr == token) {
+    free(copy);
+    return -1;
+  }
+
+  token = strtok_r(NULL, ":", &saveptr);
+  if (!token) {
+    free(copy);
+    return -1;
+  }
+  double step = strtod(token, &endptr);
+  if (endptr == token || step <= 0.0) {
+    free(copy);
+    return -1;
+  }
+
+  int count = 0;
+  // Support increasing or decreasing ranges
+  if (start <= endv) {
+    for (double v = start; v <= endv && count < max_scales; v += step) {
+      scales[count++] = v;
+    }
+  } else {
+    for (double v = start; v >= endv && count < max_scales; v -= step) {
+      scales[count++] = v;
+    }
+  }
+
+  free(copy);
+  return count;
+}
+
 static void free_observation_sequence(double** observations, int seq_len) {
   if (!observations)
     return;
@@ -478,6 +542,17 @@ static void output_predicted_gene(const prediction_task_t* task,
            output_start, output_end, normalized_score, task->strand, gene_id);
   output_queue_add(&g_output_queue, gff_line);
 
+  /* Also emit an mRNA feature corresponding to this gene so downstream
+    tools (like gffcompare) that expect transcript/mRNA entries can compute
+    exon-level statistics. We treat the gene as the parent (gene -> mRNA). */
+  char mrna_id[64];
+  snprintf(mrna_id, sizeof(mrna_id), "mRNA-gene%d", gene_id);
+  snprintf(gff_line, sizeof(gff_line),
+           "%s\tsunfish\tmRNA\t%d\t%d\t%.2f\t%c\t.\tID=%s;Parent=gene%d\n",
+           seq_id, output_start, output_end, normalized_score, task->strand,
+           mrna_id, gene_id);
+  output_queue_add(&g_output_queue, gff_line);
+
   if (task->strand == '+') {
     for (size_t idx = 0; idx < exon_count; idx++) {
       const PredictedExon* exon = &exons[idx];
@@ -487,6 +562,14 @@ static void output_predicted_gene(const prediction_task_t* task,
         cds_start = 1;
       if (cds_end > original_length)
         cds_end = original_length;
+
+      /* Emit exon feature corresponding to this CDS (Parent = mRNA) */
+      snprintf(
+          gff_line, sizeof(gff_line),
+          "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;Parent=%s\n",
+          seq_id, cds_start, cds_end, normalized_score, task->strand, mrna_id,
+          idx + 1, mrna_id);
+      output_queue_add(&g_output_queue, gff_line);
 
       snprintf(gff_line, sizeof(gff_line),
                "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
@@ -504,6 +587,14 @@ static void output_predicted_gene(const prediction_task_t* task,
         cds_start = 1;
       if (cds_end > original_length)
         cds_end = original_length;
+
+      /* Emit exon feature corresponding to this CDS (Parent = mRNA) */
+      snprintf(
+          gff_line, sizeof(gff_line),
+          "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;Parent=%s\n",
+          seq_id, cds_start, cds_end, normalized_score, task->strand, mrna_id,
+          exon_count - reverse_idx, mrna_id);
+      output_queue_add(&g_output_queue, gff_line);
 
       snprintf(gff_line, sizeof(gff_line),
                "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
@@ -699,17 +790,18 @@ static void print_help(const char* progname) {
   printf("Commands:\n");
   printf("  help                         Show this help message\n"
          "  train <train.fasta> <train.gff> [--wavelet-scales|-w S1,S2,...]"
-         " [--threads|-t N]\n"
+         " [--wavelet|-w S1,S2,...|s:e:step] [--threads|-t N]\n"
          "  predict <target.fasta> [--wavelet-scales|-w S1,S2,...]"
-         " [--threads|-t N]\n\n");
+         " [--wavelet|-w S1,S2,...|s:e:step] [--threads|-t N]\n\n");
   printf("Options:\n");
   printf("  -h, --help                   Show this help message\n");
   printf(
-      "  --wavelet-scales, -w        Comma-separated list of wavelet scales\n"
+      "  --wavelet, -w               Comma-separated list (a,b,c) or range "
+      "s:e:step\n"
       "  --threads, -t N             Number of worker threads (default: auto-"
       "detected)\n\n");
   printf("Examples:\n");
-  printf("  %s train data.fa data.gff --wavelet-scales 3,9,81\n", progname);
+  printf("  %s train data.fa data.gff --wavelet 3,9,81\n", progname);
   printf("  %s predict genome.fa --threads 8 > predictions.gff3\n\n", progname);
 }
 
@@ -1016,7 +1108,9 @@ static void accumulate_statistics_for_sequence(
   if (effective_len <= 0)
     return;
 
-  (void)model;
+  int num_features = model->num_features;
+  if (num_features > MAX_NUM_WAVELETS)
+    num_features = MAX_NUM_WAVELETS;
 
   for (int t = 0; t < effective_len; t++) {
     int state = state_labels[t];
@@ -1033,7 +1127,7 @@ static void accumulate_statistics_for_sequence(
       transition_counts[state][next_state]++;
     }
 
-    for (int f = 0; f < g_num_wavelet_scales; f++) {
+    for (int f = 0; f < num_features; f++) {
       double normalized_val = obs[t][f];
       emission_sum[state][f] += normalized_val;
       emission_sum_sq[state][f] += normalized_val * normalized_val;
@@ -1099,8 +1193,8 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
 static void handle_train(int argc, char* argv[]) {
   if (argc < 4) {
     fprintf(stderr,
-            "Usage: %s train <train.fasta> <train.gff> [--wavelet-scales|-w "
-            "S1,S2,...] [--threads|-t N]\n",
+            "Usage: %s train <train.fasta> <train.gff> [--wavelet|-w "
+            "S1,S2,...|s:e:step] [--threads|-t N]\n",
             argv[0]);
     exit(1);
   }
@@ -1111,15 +1205,39 @@ static void handle_train(int argc, char* argv[]) {
   // Parse optional arguments
   bool threads_specified = false;
   for (int i = 4; i < argc; i++) {
-    if ((strcmp(argv[i], "--wavelet-scales") == 0 ||
-         strcmp(argv[i], "-w") == 0)) {
+    if ((strcmp(argv[i], "--wavelet") == 0 || strcmp(argv[i], "-w") == 0)) {
       if (i + 1 >= argc) {
         fprintf(stderr, "Error: %s requires an argument\n", argv[i]);
         exit(1);
       }
-      g_num_wavelet_scales =
-          parse_wavelet_scales(argv[++i], g_wavelet_scales, MAX_NUM_WAVELETS);
-      fprintf(stderr, "Using %d wavelet scales\n", g_num_wavelet_scales);
+      const char* arg = argv[++i];
+      // If argument contains ':' treat as range start:end:step
+      if (strchr(arg, ':')) {
+        int parsed =
+            parse_wavelet_range(arg, g_wavelet_scales, MAX_NUM_WAVELETS);
+        if (parsed < 0) {
+          fprintf(stderr, "Error: Invalid wavelet range '%s'\n", arg);
+          exit(1);
+        }
+        g_num_wavelet_scales = parsed;
+        fprintf(stderr, "Using %d wavelet scales (range)\n",
+                g_num_wavelet_scales);
+      } else if (strchr(arg, ',')) {
+        g_num_wavelet_scales =
+            parse_wavelet_scales(arg, g_wavelet_scales, MAX_NUM_WAVELETS);
+        fprintf(stderr, "Using %d wavelet scales (list)\n",
+                g_num_wavelet_scales);
+      } else {
+        // Single numeric value
+        double v = atof(arg);
+        if (v <= 0.0) {
+          fprintf(stderr, "Error: Invalid wavelet scale '%s'\n", arg);
+          exit(1);
+        }
+        g_wavelet_scales[0] = v;
+        g_num_wavelet_scales = 1;
+        fprintf(stderr, "Using single wavelet scale %.2f\n", v);
+      }
     } else if ((strcmp(argv[i], "--threads") == 0 ||
                 strcmp(argv[i], "-t") == 0)) {
       if (i + 1 >= argc) {
@@ -1346,7 +1464,9 @@ static void handle_train(int argc, char* argv[]) {
   double sum_sq[MAX_NUM_WAVELETS] = {0};
   long long total_count = 0;
 
-  int num_features = g_num_wavelet_scales * 2;
+  int global_num_features = model.num_features;
+  if (global_num_features > MAX_NUM_WAVELETS)
+    global_num_features = MAX_NUM_WAVELETS;
 
   for (int seq_idx = 0; seq_idx < total_sequences; seq_idx++) {
     if (!observations[seq_idx] || seq_lengths[seq_idx] == 0) {
@@ -1355,7 +1475,7 @@ static void handle_train(int argc, char* argv[]) {
 
     int seq_len = seq_lengths[seq_idx];
     for (int t = 0; t < seq_len; t++) {
-      for (int f = 0; f < num_features; f++) {
+      for (int f = 0; f < global_num_features; f++) {
         double val = observations[seq_idx][t][f];
         sum[f] += val;
         sum_sq[f] += val * val;
@@ -1365,7 +1485,7 @@ static void handle_train(int argc, char* argv[]) {
   }
 
   // Calculate mean and standard deviation
-  for (int f = 0; f < num_features; f++) {
+  for (int f = 0; f < global_num_features; f++) {
     model.global_feature_mean[f] = sum[f] / total_count;
     double variance =
         (sum_sq[f] / total_count) -
@@ -1415,10 +1535,10 @@ static void handle_train(int argc, char* argv[]) {
         seq_lengths[forward_obs_idx] > 0) {
       initialize_state_labels(state_labels, seq_len);
       label_forward_states(groups, group_count, seq_id, seq_len, state_labels);
-      printf("DEBUG FWD LABELS for %s:\n", seq_id);
-      for (int k = 0; k < seq_len; k++) {
-        printf("%d", state_labels[k]);
-      }
+      // printf("DEBUG FWD LABELS for %s:\n", seq_id);
+      // for (int k = 0; k < seq_len; k++) {
+      //   printf("%d", state_labels[k]);
+      // }
       printf("\n");
       accumulate_statistics_for_sequence(
           &model, observations, seq_lengths, forward_obs_idx, seq_len,
@@ -1430,10 +1550,10 @@ static void handle_train(int argc, char* argv[]) {
         seq_lengths[reverse_obs_idx] > 0) {
       initialize_state_labels(state_labels, seq_len);
       label_reverse_states(groups, group_count, seq_id, seq_len, state_labels);
-      printf("DEBUG REV LABELS for %s:\n", seq_id);
-      for (int k = 0; k < seq_len; k++) {
-        printf("%d", state_labels[k]);
-      }
+      // printf("DEBUG REV LABELS for %s:\n", seq_id);
+      // for (int k = 0; k < seq_len; k++) {
+      //   printf("%d", state_labels[k]);
+      // }
       printf("\n");
       accumulate_statistics_for_sequence(
           &model, observations, seq_lengths, reverse_obs_idx, seq_len,
@@ -1484,10 +1604,13 @@ static void handle_train(int argc, char* argv[]) {
   }
 
   // Finalize emission parameters (mean and variance)
+  int num_features = model.num_features;
+  if (num_features > MAX_NUM_WAVELETS)
+    num_features = MAX_NUM_WAVELETS;
   for (int i = 0; i < NUM_STATES; i++) {
-    model.emission[i].num_features = g_num_wavelet_scales;
+    model.emission[i].num_features = num_features;
 
-    for (int f = 0; f < g_num_wavelet_scales; f++) {
+    for (int f = 0; f < num_features; f++) {
       if (state_observation_counts[i] > 0) {
         double mean = emission_sum[i][f] / state_observation_counts[i];
         double mean_sq = emission_sum_sq[i][f] / state_observation_counts[i];
@@ -1510,8 +1633,8 @@ static void handle_train(int argc, char* argv[]) {
 
   fprintf(stderr, "Supervised training complete.\n");
 
-  const int kBaumWelchMaxIterations = 25;
-  const double kBaumWelchThreshold = 1e-3;
+  const int kBaumWelchMaxIterations = 100;
+  const double kBaumWelchThreshold = 10.0;
 
   fprintf(
       stderr,
@@ -1522,7 +1645,7 @@ static void handle_train(int argc, char* argv[]) {
     fprintf(stderr, "Baum-Welch refinement failed\n");
     exit(1);
   }
-  // enforce_exon_cycle_constraints(&model);
+  enforce_exon_cycle_constraints(&model);
   fprintf(stderr, "Baum-Welch refinement complete.\n");
 
   // Save model
@@ -1549,8 +1672,8 @@ static void handle_train(int argc, char* argv[]) {
 static void handle_predict(int argc, char* argv[]) {
   if (argc < 3) {
     fprintf(stderr,
-            "Usage: %s predict <target.fasta> [--wavelet-scales|-w S1,S2,...] "
-            "[--threads|-t N]\n",
+            "Usage: %s predict <target.fasta> [--wavelet|-w "
+            "S1,S2,...|s:e:step] [--threads|-t N]\n",
             argv[0]);
     exit(1);
   }
@@ -1559,15 +1682,37 @@ static void handle_predict(int argc, char* argv[]) {
 
   bool threads_specified = false;
   for (int i = 3; i < argc; i++) {
-    if ((strcmp(argv[i], "--wavelet-scales") == 0 ||
-         strcmp(argv[i], "-w") == 0)) {
+    if ((strcmp(argv[i], "--wavelet") == 0 || strcmp(argv[i], "-w") == 0)) {
       if (i + 1 >= argc) {
         fprintf(stderr, "Error: %s requires an argument\n", argv[i]);
         exit(1);
       }
-      g_num_wavelet_scales =
-          parse_wavelet_scales(argv[++i], g_wavelet_scales, MAX_NUM_WAVELETS);
-      fprintf(stderr, "Using %d wavelet scales\n", g_num_wavelet_scales);
+      const char* arg = argv[++i];
+      if (strchr(arg, ':')) {
+        int parsed =
+            parse_wavelet_range(arg, g_wavelet_scales, MAX_NUM_WAVELETS);
+        if (parsed < 0) {
+          fprintf(stderr, "Error: Invalid wavelet range '%s'\n", arg);
+          exit(1);
+        }
+        g_num_wavelet_scales = parsed;
+        fprintf(stderr, "Using %d wavelet scales (range)\n",
+                g_num_wavelet_scales);
+      } else if (strchr(arg, ',')) {
+        g_num_wavelet_scales =
+            parse_wavelet_scales(arg, g_wavelet_scales, MAX_NUM_WAVELETS);
+        fprintf(stderr, "Using %d wavelet scales (list)\n",
+                g_num_wavelet_scales);
+      } else {
+        double v = atof(arg);
+        if (v <= 0.0) {
+          fprintf(stderr, "Error: Invalid wavelet scale '%s'\n", arg);
+          exit(1);
+        }
+        g_wavelet_scales[0] = v;
+        g_num_wavelet_scales = 1;
+        fprintf(stderr, "Using single wavelet scale %.2f\n", v);
+      }
     } else if ((strcmp(argv[i], "--threads") == 0 ||
                 strcmp(argv[i], "-t") == 0)) {
       if (i + 1 >= argc) {

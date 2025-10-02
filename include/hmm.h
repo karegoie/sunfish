@@ -14,7 +14,8 @@ typedef enum {
 } HMMState;
 
 // Maximum number of wavelet scales (features)
-#define MAX_NUM_WAVELETS 10
+// Increased to support user-specified ranges up to 100 scales.
+#define MAX_NUM_WAVELETS 100
 
 // Gaussian emission parameters for a single state
 typedef struct {
