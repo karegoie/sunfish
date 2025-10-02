@@ -9,138 +9,115 @@
 
 #include "../include/sunfish.h"
 
-// Safety limits (defaults are exposed in header)
-#ifndef MAX_SITES_PER_WINDOW
-#define MAX_SITES_PER_WINDOW DEFAULT_MAX_SITES_PER_WINDOW
-#endif
-#ifndef MAX_RECURSION_PER_WINDOW
-#define MAX_RECURSION_PER_WINDOW DEFAULT_MAX_RECURSIONS_PER_WINDOW
-#endif
-
-// Global splice site model
 static SplicePWM g_splice_pwm;
 static SpliceCounts g_splice_counts;
 
-// Nucleotide to index conversion for PWM
-static int nt_to_idx(char nt) {
-  switch (toupper(nt)) {
-  case 'A':
-    return 0;
-  case 'C':
-    return 1;
-  case 'G':
-    return 2;
-  case 'T':
-    return 3;
-  default:
-    return -1;
-  }
+static const struct {
+  int min_occ;
+  double lr;
+  int iters;
+  double l1;
+} kTrainingDefaults = {20, 0.01, 1000, 0.0001};
+
+static const ModelParams kFallbackModelParams = {
+    .intron_penalty_base = 0.10,
+    .intron_penalty_per_intron = 0.07,
+    .intron_margin_cutoff = 1.0,
+    .intron_margin_weight = 0.10,
+    .intron_length_target = (45.0 + 600.0) / 2.0,
+    .intron_length_weight = 0.05,
+    .min_exon_nt = 300,
+    .min_orf_nt = 900,
+    .pstat_threshold = 0.75,
+    .single_min_margin = 0.0,
+    .single_max_overlap = 0.4,
+    .single_window_size = 10000,
+    .single_max_per_window = 4};
+
+static const double kSpliceScorePercentile = 0.05;
+
+enum {
+  MAX_SITES_PER_WINDOW = 500,
+  MAX_RECURSION_PER_WINDOW = 2000,
+  MAX_TRACKED_EXONS = 64
+};
+
+static const int kDefaultMaxAlternativeIsoforms = 3;
+static const int kDefaultMaxSplicePairs = 11;
+static const int kSpliceWindowSize = 10000;
+static const int kSpliceWindowSlide = 10000;
+
+static inline ModelParams fallback_model_params(void) {
+  return kFallbackModelParams;
 }
 
-// Initialize counts for splice site PWMs
-static void init_splice_counts() {
-  memset(&g_splice_counts, 0, sizeof(SpliceCounts));
+typedef struct {
+  double* data;
+  int count;
+  int capacity;
+} DoubleVector;
+
+static void double_vector_init(DoubleVector* vec) {
+  vec->data = NULL;
+  vec->count = 0;
+  vec->capacity = 0;
 }
 
-// Update splice site counts from a true splice site
-static void update_splice_counts(const char* seq, int pos, int is_donor) {
-  int size = is_donor ? DONOR_MOTIF_SIZE : ACCEPTOR_MOTIF_SIZE;
-  int offset = is_donor ? 3 : 12; // offset to GT or AG
-
-  if (pos - offset < 0)
-    return;
-  if (pos + (size - offset) >= (int)strlen(seq))
-    return;
-
-  for (int i = 0; i < size; i++) {
-    int seq_pos = pos - offset + i;
-    int idx = nt_to_idx(seq[seq_pos]);
-    if (idx == -1)
-      continue;
-
-    if (is_donor) {
-      g_splice_counts.donor_counts[idx][i]++;
-    } else {
-      g_splice_counts.acceptor_counts[idx][i]++;
-    }
-  }
-
-  if (is_donor) {
-    g_splice_counts.total_donor_sites++;
-  } else {
-    g_splice_counts.total_acceptor_sites++;
-  }
+static bool double_vector_reserve(DoubleVector* vec, int needed) {
+  if (needed <= vec->capacity)
+    return true;
+  int new_cap = vec->capacity ? vec->capacity * 2 : 64;
+  while (new_cap < needed)
+    new_cap *= 2;
+  double* tmp = (double*)realloc(vec->data, (size_t)new_cap * sizeof(double));
+  if (!tmp)
+    return false;
+  vec->data = tmp;
+  vec->capacity = new_cap;
+  return true;
 }
 
-// Calculate PWM from counts
-static void calculate_pwm_from_counts() {
-  // Calculate donor PWM
-  for (int i = 0; i < DONOR_MOTIF_SIZE; i++) {
-    double col_total = PWM_PSEUDOCOUNT * NUM_NUCLEOTIDES;
-    for (int j = 0; j < NUM_NUCLEOTIDES; j++) {
-      col_total += g_splice_counts.donor_counts[j][i];
-    }
-    for (int j = 0; j < NUM_NUCLEOTIDES; j++) {
-      g_splice_pwm.donor_pwm[j][i] =
-          (g_splice_counts.donor_counts[j][i] + PWM_PSEUDOCOUNT) / col_total;
-    }
-  }
-
-  // Calculate acceptor PWM
-  for (int i = 0; i < ACCEPTOR_MOTIF_SIZE; i++) {
-    double col_total = PWM_PSEUDOCOUNT * NUM_NUCLEOTIDES;
-    for (int j = 0; j < NUM_NUCLEOTIDES; j++) {
-      col_total += g_splice_counts.acceptor_counts[j][i];
-    }
-    for (int j = 0; j < NUM_NUCLEOTIDES; j++) {
-      g_splice_pwm.acceptor_pwm[j][i] =
-          (g_splice_counts.acceptor_counts[j][i] + PWM_PSEUDOCOUNT) / col_total;
-    }
-  }
-
-  // Set initial score thresholds
-  if (g_splice_counts.total_donor_sites > 0) {
-    g_splice_pwm.min_donor_score =
-        -10.0; // Will be updated after scoring all sites
-  }
-  if (g_splice_counts.total_acceptor_sites > 0) {
-    g_splice_pwm.min_acceptor_score =
-        -15.0; // Will be updated after scoring all sites
-  }
-}
-// Calculate PWM score for a potential splice site
-static double calculate_pwm_score(const char* seq, int pos, int is_donor) {
-  int size = is_donor ? DONOR_MOTIF_SIZE : ACCEPTOR_MOTIF_SIZE;
-  int offset = is_donor ? 3 : 12; // offset to GT or AG
-  double score = 0.0;
-
-  // Check sequence bounds
-  if (pos - offset < 0)
-    return -1000.0;
-  if ((size - offset) < 0)
-    return -1000.0;
-  if ((size - offset) + pos >= (int)strlen(seq))
-    return -1000.0;
-
-  // Calculate PWM score
-  for (int i = 0; i < size; i++) {
-    int seq_pos = pos - offset + i;
-    int idx = nt_to_idx(seq[seq_pos]);
-    if (idx == -1)
-      return -1000.0;
-
-    if (is_donor) {
-      score += log2(g_splice_pwm.donor_pwm[idx][i]);
-    } else {
-      score += log2(g_splice_pwm.acceptor_pwm[idx][i]);
-    }
-  }
-
-  return score;
+static bool double_vector_push(DoubleVector* vec, double value) {
+  if (!double_vector_reserve(vec, vec->count + 1))
+    return false;
+  vec->data[vec->count++] = value;
+  return true;
 }
 
-// Comparator for qsort (ascending)
-static int double_cmp(const void* a, const void* b) {
+static void double_vector_free(DoubleVector* vec) {
+  free(vec->data);
+  vec->data = NULL;
+  vec->count = 0;
+  vec->capacity = 0;
+}
+
+static double double_vector_sum(const DoubleVector* vec) {
+  if (!vec || vec->count == 0)
+    return 0.0;
+  double sum = 0.0;
+  for (int i = 0; i < vec->count; ++i)
+    sum += vec->data[i];
+  return sum;
+}
+
+static double double_vector_mean(const DoubleVector* vec) {
+  if (!vec || vec->count == 0)
+    return 0.0;
+  return double_vector_sum(vec) / (double)vec->count;
+}
+
+static double double_vector_stddev(const DoubleVector* vec, double mean) {
+  if (!vec || vec->count <= 1)
+    return 0.0;
+  double accum = 0.0;
+  for (int i = 0; i < vec->count; ++i) {
+    double diff = vec->data[i] - mean;
+    accum += diff * diff;
+  }
+  return sqrt(accum / (double)vec->count);
+}
+
+static int cmp_double_asc(const void* a, const void* b) {
   double da = *(const double*)a;
   double db = *(const double*)b;
   if (da < db)
@@ -150,118 +127,290 @@ static int double_cmp(const void* a, const void* b) {
   return 0;
 }
 
-// Compute percentile value from sorted array (p in [0,1])
-static double compute_percentile(double* arr, int n, double p) {
-  if (n <= 0)
+static double compute_percentile(const double* values, int count,
+                                 double percentile) {
+  if (!values || count <= 0)
     return 0.0;
-  if (p <= 0.0)
-    return arr[0];
-  if (p >= 1.0)
-    return arr[n - 1];
-  double idx = p * (n - 1);
-  int lo = (int)floor(idx);
-  int hi = (int)ceil(idx);
-  if (lo == hi)
-    return arr[lo];
-  double frac = idx - lo;
-  return arr[lo] * (1.0 - frac) + arr[hi] * frac;
+  if (percentile <= 0.0)
+    percentile = 0.0;
+  if (percentile >= 1.0)
+    percentile = 1.0;
+  double* copy = (double*)malloc((size_t)count * sizeof(double));
+  if (!copy)
+    return values[count / 2];
+  memcpy(copy, values, (size_t)count * sizeof(double));
+  qsort(copy, (size_t)count, sizeof(double), cmp_double_asc);
+  double idx = percentile * (double)(count - 1);
+  int lower = (int)floor(idx);
+  int upper = (int)ceil(idx);
+  double frac = idx - (double)lower;
+  double result = copy[lower];
+  if (upper > lower)
+    result = copy[lower] + (copy[upper] - copy[lower]) * frac;
+  free(copy);
+  return result;
 }
 
-// Core Logistic Regression Engine
+static double clamp_double(double value, double min_value, double max_value) {
+  if (value < min_value)
+    return min_value;
+  if (value > max_value)
+    return max_value;
+  return value;
+}
 
-double sigmoid(double z) { return 1.0 / (1.0 + exp(-z)); }
+static double sigmoid(double x) {
+  if (x >= 0) {
+    double z = exp(-x);
+    return 1.0 / (1.0 + z);
+  }
+  double z = exp(x);
+  return z / (1.0 + z);
+}
 
-double soft_thresholding(double z, double lambda) {
-  if (z > 0 && lambda < fabs(z)) {
-    return z - lambda;
-  } else if (z < 0 && lambda < fabs(z)) {
-    return z + lambda;
-  } else {
-    return 0.0;
+static int aa_index(char aa) {
+  switch (toupper((unsigned char)aa)) {
+  case 'A':
+    return 0;
+  case 'C':
+    return 1;
+  case 'D':
+    return 2;
+  case 'E':
+    return 3;
+  case 'F':
+    return 4;
+  case 'G':
+    return 5;
+  case 'H':
+    return 6;
+  case 'I':
+    return 7;
+  case 'K':
+    return 8;
+  case 'L':
+    return 9;
+  case 'M':
+    return 10;
+  case 'N':
+    return 11;
+  case 'P':
+    return 12;
+  case 'Q':
+    return 13;
+  case 'R':
+    return 14;
+  case 'S':
+    return 15;
+  case 'T':
+    return 16;
+  case 'V':
+    return 17;
+  case 'W':
+    return 18;
+  case 'Y':
+    return 19;
+  default:
+    return -1;
   }
 }
 
-void train_logistic_regression(const double* const* X, const int* y,
-                               int n_samples, int n_features,
-                               double* out_coeffs, double learning_rate,
-                               int iterations, double lambda) {
-  for (int i = 0; i <= n_features; ++i)
-    out_coeffs[i] = 0.0;
-  for (int iter = 0; iter < iterations; ++iter) {
-    double* gradients = (double*)calloc(n_features + 1, sizeof(double));
-    if (!gradients)
-      return;
-    for (int i = 0; i < n_samples; ++i) {
-      double z = out_coeffs[0];
-      for (int j = 0; j < n_features; ++j)
-        z += out_coeffs[j + 1] * X[i][j];
-      double h = sigmoid(z);
-      double error = h - y[i];
-      gradients[0] += error;
-      for (int j = 0; j < n_features; ++j)
-        gradients[j + 1] += error * X[i][j];
-    }
-    out_coeffs[0] -= learning_rate * gradients[0] / n_samples;
-    for (int j = 0; j < n_features; ++j) {
-      double simple_update =
-          out_coeffs[j + 1] - learning_rate * gradients[j + 1] / n_samples;
-      out_coeffs[j + 1] =
-          soft_thresholding(simple_update, learning_rate * lambda);
-    }
-    free(gradients);
-  }
-}
-
-// Bioinformatics Helpers
-
-static const char AA_CHARS[NUM_AMINO_ACIDS] = {
-    'A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L',
-    'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y'};
-
-int aa_char_to_index(char c) {
-  c = toupper(c);
+static void count_amino_acids(const char* peptide,
+                              int counts[NUM_AMINO_ACIDS]) {
   for (int i = 0; i < NUM_AMINO_ACIDS; i++)
-    if (AA_CHARS[i] == c)
-      return i;
-  return -1;
-}
-
-void count_amino_acids(const char* peptide, int counts[NUM_AMINO_ACIDS]) {
-  memset(counts, 0, NUM_AMINO_ACIDS * sizeof(int));
-  for (size_t i = 0; peptide[i]; i++) {
-    int idx = aa_char_to_index(peptide[i]);
+    counts[i] = 0;
+  if (!peptide)
+    return;
+  for (const char* p = peptide; *p; ++p) {
+    int idx = aa_index(*p);
     if (idx >= 0)
       counts[idx]++;
   }
 }
 
-char* reverse_complement(const char* dna) {
+static int nt_index(char base) {
+  switch (toupper((unsigned char)base)) {
+  case 'A':
+    return 0;
+  case 'C':
+    return 1;
+  case 'G':
+    return 2;
+  case 'T':
+  case 'U':
+    return 3;
+  default:
+    return -1;
+  }
+}
+
+static char complement_base(char base) {
+  switch (toupper((unsigned char)base)) {
+  case 'A':
+    return 'T';
+  case 'C':
+    return 'G';
+  case 'G':
+    return 'C';
+  case 'T':
+    return 'A';
+  default:
+    return 'N';
+  }
+}
+
+static char* reverse_complement(const char* dna) {
+  if (!dna)
+    return NULL;
   size_t len = strlen(dna);
   char* rc = (char*)malloc(len + 1);
   if (!rc)
     return NULL;
-  for (size_t i = 0; i < len; i++) {
-    char c = toupper(dna[len - 1 - i]);
-    switch (c) {
-    case 'A':
-      rc[i] = 'T';
-      break;
-    case 'T':
-      rc[i] = 'A';
-      break;
-    case 'G':
-      rc[i] = 'C';
-      break;
-    case 'C':
-      rc[i] = 'G';
-      break;
-    default:
-      rc[i] = 'N';
-      break;
-    }
-  }
+  for (size_t i = 0; i < len; ++i)
+    rc[i] = complement_base(dna[len - 1 - i]);
   rc[len] = '\0';
   return rc;
+}
+
+static void init_splice_counts(void) {
+  memset(&g_splice_counts, 0, sizeof(g_splice_counts));
+  memset(&g_splice_pwm, 0, sizeof(g_splice_pwm));
+}
+
+static void update_splice_counts(const char* sequence, int pos, int is_donor) {
+  if (!sequence)
+    return;
+  int len = (int)strlen(sequence);
+  if (is_donor) {
+    int start = pos - 3;
+    int end = pos + 5;
+    if (start < 0 || end >= len)
+      return;
+    for (int offset = 0; offset < DONOR_MOTIF_SIZE; ++offset) {
+      int idx = nt_index(sequence[start + offset]);
+      if (idx >= 0)
+        g_splice_counts.donor_counts[idx][offset]++;
+    }
+    g_splice_counts.total_donor_sites++;
+  } else {
+    int start = pos - 12;
+    int end = pos + 2;
+    if (start < 0 || end >= len)
+      return;
+    for (int offset = 0; offset < ACCEPTOR_MOTIF_SIZE; ++offset) {
+      int idx = nt_index(sequence[start + offset]);
+      if (idx >= 0)
+        g_splice_counts.acceptor_counts[idx][offset]++;
+    }
+    g_splice_counts.total_acceptor_sites++;
+  }
+}
+
+static void calculate_pwm_from_counts(void) {
+  const double background = 0.25;
+  for (int pos = 0; pos < DONOR_MOTIF_SIZE; ++pos) {
+    double total = 0.0;
+    for (int nt = 0; nt < NUM_NUCLEOTIDES; ++nt)
+      total += g_splice_counts.donor_counts[nt][pos];
+    total += PWM_PSEUDOCOUNT * 4.0;
+    for (int nt = 0; nt < NUM_NUCLEOTIDES; ++nt) {
+      double count = g_splice_counts.donor_counts[nt][pos] + PWM_PSEUDOCOUNT;
+      double prob = count / total;
+      g_splice_pwm.donor_pwm[nt][pos] = log(prob / background);
+    }
+  }
+  for (int pos = 0; pos < ACCEPTOR_MOTIF_SIZE; ++pos) {
+    double total = 0.0;
+    for (int nt = 0; nt < NUM_NUCLEOTIDES; ++nt)
+      total += g_splice_counts.acceptor_counts[nt][pos];
+    total += PWM_PSEUDOCOUNT * 4.0;
+    for (int nt = 0; nt < NUM_NUCLEOTIDES; ++nt) {
+      double count = g_splice_counts.acceptor_counts[nt][pos] + PWM_PSEUDOCOUNT;
+      double prob = count / total;
+      g_splice_pwm.acceptor_pwm[nt][pos] = log(prob / background);
+    }
+  }
+  g_splice_pwm.min_donor_score = -10.0;
+  g_splice_pwm.min_acceptor_score = -10.0;
+}
+
+static double calculate_pwm_score(const char* sequence, int pos, int is_donor) {
+  if (!sequence)
+    return -1e9;
+  int len = (int)strlen(sequence);
+  double score = 0.0;
+  if (is_donor) {
+    int start = pos - 3;
+    int end = pos + 5;
+    if (start < 0 || end >= len)
+      return -1e9;
+    for (int offset = 0; offset < DONOR_MOTIF_SIZE; ++offset) {
+      int idx = nt_index(sequence[start + offset]);
+      if (idx < 0)
+        return -1e9;
+      score += g_splice_pwm.donor_pwm[idx][offset];
+    }
+  } else {
+    int start = pos - 12;
+    int end = pos + 2;
+    if (start < 0 || end >= len)
+      return -1e9;
+    for (int offset = 0; offset < ACCEPTOR_MOTIF_SIZE; ++offset) {
+      int idx = nt_index(sequence[start + offset]);
+      if (idx < 0)
+        return -1e9;
+      score += g_splice_pwm.acceptor_pwm[idx][offset];
+    }
+  }
+  return score;
+}
+
+static void train_logistic_regression(const double* const* X, const int* y,
+                                      int samples, int features,
+                                      double* weights, double lr, int iters,
+                                      double l1) {
+  if (!weights)
+    return;
+  if (lr <= 0.0)
+    lr = 0.01;
+  if (iters <= 0)
+    iters = 1000;
+  if (l1 < 0.0)
+    l1 = 0.0;
+  for (int i = 0; i <= features; ++i)
+    weights[i] = 0.0;
+  double* grads = (double*)malloc((size_t)(features + 1) * sizeof(double));
+  if (!grads)
+    return;
+  for (int iter = 0; iter < iters; ++iter) {
+    for (int i = 0; i <= features; ++i)
+      grads[i] = 0.0;
+    for (int s = 0; s < samples; ++s) {
+      double z = weights[0];
+      for (int f = 0; f < features; ++f)
+        z += weights[f + 1] * X[s][f];
+      double pred = sigmoid(z);
+      double diff = pred - (double)y[s];
+      grads[0] += diff;
+      for (int f = 0; f < features; ++f)
+        grads[f + 1] += diff * X[s][f];
+    }
+    double inv = 1.0 / (double)samples;
+    weights[0] -= lr * (grads[0] * inv);
+    for (int f = 0; f < features; ++f) {
+      double grad = grads[f + 1] * inv;
+      if (l1 > 0.0) {
+        if (weights[f + 1] > 0)
+          grad += l1;
+        else if (weights[f + 1] < 0)
+          grad -= l1;
+        else
+          grad += 0.0;
+      }
+      weights[f + 1] -= lr * grad;
+    }
+  }
+  free(grads);
 }
 
 static const char* CODON_TABLE[] = {
@@ -506,22 +655,24 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
 
 // Load model and metadata. Returns true on success. If header contains
 // a min_occ, means or stds lines they are filled into the provided buffers.
-bool load_model(const char* path,
-                double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
-                double means[NUM_AMINO_ACIDS], double stds[NUM_AMINO_ACIDS],
-                int* out_min_occ, SplicePWM* splice_pwm) {
+bool load_model(const char* path, SunfishModel* model) {
   FILE* fp = fopen(path, "r");
   if (!fp) {
     fprintf(stderr, "Error: Cannot open model file: %s\n", path);
     return false;
   }
-  // initialize defaults
+  // Initialize defaults
+  memset(model, 0, sizeof(SunfishModel));
   for (int i = 0; i < NUM_AMINO_ACIDS; i++) {
-    means[i] = 0.0;
-    stds[i] = 1.0;
+    model->means[i] = 0.0;
+    model->stds[i] = 1.0;
   }
-  if (out_min_occ)
-    *out_min_occ = -1;
+  model->min_occ = kTrainingDefaults.min_occ;
+  model->params = fallback_model_params();
+  for (int i = 0; i < NUM_AMINO_ACIDS; i++) {
+    for (int j = 0; j <= NUM_AMINO_ACIDS; j++)
+      model->coeffs[i][j] = 0.0;
+  }
 
   char line[MAX_LINE_LEN];
   // Read header lines and splice PWM section in a single pass
@@ -536,8 +687,8 @@ bool load_model(const char* path,
     // Parse header tokens
     if (strncmp(line, "#min_occ", 8) == 0) {
       int v = atoi(line + 8);
-      if (out_min_occ)
-        *out_min_occ = v;
+      if (v > 0)
+        model->min_occ = v;
     } else if (strncmp(line, "#means", 6) == 0) {
       char* p = line + 6;
       for (int i = 0; i < NUM_AMINO_ACIDS; i++) {
@@ -545,7 +696,7 @@ bool load_model(const char* path,
           p++;
         if (!*p)
           break;
-        means[i] = strtod(p, &p);
+        model->means[i] = strtod(p, &p);
       }
     } else if (strncmp(line, "#stds", 5) == 0) {
       char* p = line + 5;
@@ -554,15 +705,15 @@ bool load_model(const char* path,
           p++;
         if (!*p)
           break;
-        stds[i] = strtod(p, &p);
-        if (stds[i] == 0.0)
-          stds[i] = 1.0;
+        model->stds[i] = strtod(p, &p);
+        if (model->stds[i] == 0.0)
+          model->stds[i] = 1.0;
       }
     } else if (strncmp(line, "#splice_pwm", 11) == 0) {
       // Read donor PWM
       for (int nt = 0; nt < NUM_NUCLEOTIDES; nt++) {
         for (int pos = 0; pos < DONOR_MOTIF_SIZE; pos++) {
-          if (fscanf(fp, "%lf", &splice_pwm->donor_pwm[nt][pos]) != 1) {
+          if (fscanf(fp, "%lf", &model->splice_pwm.donor_pwm[nt][pos]) != 1) {
             fprintf(stderr, "Error: Invalid splice PWM format (donor)\n");
             fclose(fp);
             return false;
@@ -572,7 +723,8 @@ bool load_model(const char* path,
       // Read acceptor PWM
       for (int nt = 0; nt < NUM_NUCLEOTIDES; nt++) {
         for (int pos = 0; pos < ACCEPTOR_MOTIF_SIZE; pos++) {
-          if (fscanf(fp, "%lf", &splice_pwm->acceptor_pwm[nt][pos]) != 1) {
+          if (fscanf(fp, "%lf", &model->splice_pwm.acceptor_pwm[nt][pos]) !=
+              1) {
             fprintf(stderr, "Error: Invalid splice PWM format (acceptor)\n");
             fclose(fp);
             return false;
@@ -580,8 +732,8 @@ bool load_model(const char* path,
         }
       }
       // Read score thresholds
-      if (fscanf(fp, "%lf %lf", &splice_pwm->min_donor_score,
-                 &splice_pwm->min_acceptor_score) != 2) {
+      if (fscanf(fp, "%lf %lf", &model->splice_pwm.min_donor_score,
+                 &model->splice_pwm.min_acceptor_score) != 2) {
         fprintf(stderr, "Error: Invalid splice score thresholds format\n");
         fclose(fp);
         return false;
@@ -590,13 +742,45 @@ bool load_model(const char* path,
       if (fgets(line, sizeof(line), fp) == NULL) {
         /* ignore */
       }
+    } else if (strncmp(line, "#param", 6) == 0) {
+      char key[64];
+      double value = 0.0;
+      if (sscanf(line + 6, "%63s %lf", key, &value) == 2) {
+        if (strcmp(key, "min_exon_nt") == 0) {
+          model->params.min_exon_nt = (int)lrint(value);
+        } else if (strcmp(key, "min_orf_nt") == 0) {
+          model->params.min_orf_nt = (int)lrint(value);
+        } else if (strcmp(key, "pstat_threshold") == 0) {
+          model->params.pstat_threshold = value;
+        } else if (strcmp(key, "single_min_margin") == 0) {
+          model->params.single_min_margin = value;
+        } else if (strcmp(key, "single_max_overlap") == 0) {
+          model->params.single_max_overlap = value;
+        } else if (strcmp(key, "single_window_size") == 0) {
+          model->params.single_window_size = (int)lrint(value);
+        } else if (strcmp(key, "single_max_per_window") == 0) {
+          model->params.single_max_per_window = (int)lrint(value);
+        } else if (strcmp(key, "intron_penalty_base") == 0) {
+          model->params.intron_penalty_base = value;
+        } else if (strcmp(key, "intron_penalty_per_intron") == 0) {
+          model->params.intron_penalty_per_intron = value;
+        } else if (strcmp(key, "intron_margin_cutoff") == 0) {
+          model->params.intron_margin_cutoff = value;
+        } else if (strcmp(key, "intron_margin_weight") == 0) {
+          model->params.intron_margin_weight = value;
+        } else if (strcmp(key, "intron_length_target") == 0) {
+          model->params.intron_length_target = value;
+        } else if (strcmp(key, "intron_length_weight") == 0) {
+          model->params.intron_length_weight = value;
+        }
+      }
     }
   }
 
   // Read amino acid models
   for (int j = 0; j < NUM_AMINO_ACIDS; j++) {
     for (int k = 0; k <= NUM_AMINO_ACIDS; k++) {
-      if (fscanf(fp, "%lf", &models[j][k]) != 1) {
+      if (fscanf(fp, "%lf", &model->coeffs[j][k]) != 1) {
         fprintf(stderr, "Error: Invalid model file format\n");
         fclose(fp);
         return false;
@@ -604,6 +788,35 @@ bool load_model(const char* path,
     }
   }
   fclose(fp);
+  ModelParams fallback = fallback_model_params();
+  if (model->params.min_exon_nt <= 0)
+    model->params.min_exon_nt = fallback.min_exon_nt;
+  if (model->params.min_orf_nt <= 0)
+    model->params.min_orf_nt = fallback.min_orf_nt;
+  if (model->params.pstat_threshold <= 0.0)
+    model->params.pstat_threshold = fallback.pstat_threshold;
+  if (model->params.single_min_margin < 0.0)
+    model->params.single_min_margin = fallback.single_min_margin;
+  if (model->params.single_max_overlap <= 0.0 ||
+      model->params.single_max_overlap > 1.0)
+    model->params.single_max_overlap = fallback.single_max_overlap;
+  if (model->params.single_window_size <= 0)
+    model->params.single_window_size = fallback.single_window_size;
+  if (model->params.single_max_per_window <= 0)
+    model->params.single_max_per_window = fallback.single_max_per_window;
+  if (model->params.intron_penalty_base <= 0.0)
+    model->params.intron_penalty_base = fallback.intron_penalty_base;
+  if (model->params.intron_penalty_per_intron <= 0.0)
+    model->params.intron_penalty_per_intron =
+        fallback.intron_penalty_per_intron;
+  if (model->params.intron_margin_cutoff <= 0.0)
+    model->params.intron_margin_cutoff = fallback.intron_margin_cutoff;
+  if (model->params.intron_margin_weight <= 0.0)
+    model->params.intron_margin_weight = fallback.intron_margin_weight;
+  if (model->params.intron_length_target <= 0.0)
+    model->params.intron_length_target = fallback.intron_length_target;
+  if (model->params.intron_length_weight <= 0.0)
+    model->params.intron_length_weight = fallback.intron_length_weight;
   return true;
 }
 
@@ -611,9 +824,10 @@ bool load_model(const char* path,
 // (P_stat). This function computes P_stat for each amino acid (using the
 // same logistic model computation as before), returns the average P_stat
 // across the NUM_AMINO_ACIDS amino acids, and sets out_pass to true only if
-// every P_stat is at least the DEFAULT_P_STAT_THRESHOLD (0.5 by default).
+// every P_stat is at least the configured p-stat threshold (default 0.5).
 static double calculate_peptide_score(
-    const char* peptide, double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
+    const char* peptide,
+    const double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
     const double means[NUM_AMINO_ACIDS], const double stds[NUM_AMINO_ACIDS],
     int min_occ, bool* out_pass) {
   int counts[NUM_AMINO_ACIDS];
@@ -749,9 +963,7 @@ static void print_gff_multi_spliced(const char* chr, int seq_len, char strand,
 
 // Context and helpers for splicing recursion
 
-#define MIN_INTRON_LEN 30
-#define MAX_INTRON_LEN 20000
-#define MAX_TRACKED_EXONS (DEFAULT_MAX_SPLICE_PAIRS * 2 + 2)
+enum { MIN_INTRON_LEN = 30, MAX_INTRON_LEN = 20000 };
 
 typedef struct {
   int pos;
@@ -790,27 +1002,13 @@ typedef struct SpliceDfsCtx {
   int min_exon;
   int max_pairs;
   int min_orf_nt;
-  double pstat_threshold;
-  double (*models)[NUM_AMINO_ACIDS + 1];
-  int min_occ;
+  const SunfishModel* model;
+  const ModelParams* params;
   int* gene_counter;
-  const double* means;
-  const double* stds;
   int max_recursions;
   int recursion_count;
   int max_alternatives;
   const SplicePWM* splice_pwm;
-  double base_intron_penalty;
-  double weak_site_penalty;
-  double strong_site_bonus;
-  double weak_margin_cutoff;
-  double strong_margin_cutoff;
-  double length_outside_penalty;
-  double min_intron_penalty;
-  double max_intron_penalty;
-  double extra_intron_penalty;
-  int len_soft_min;
-  int len_soft_max;
   IsoformBuffer* collector;
   OrfBuffer* single_buffer;
   bool* single_buffer_failed;
@@ -995,7 +1193,8 @@ static int interval_overlap(int s1, int e1, int s2, int e2) {
 }
 
 static void emit_orf_candidates(const char* chr_name, int seq_len, char strand,
-                                const OrfBuffer* buf, int* gene_counter) {
+                                const OrfBuffer* buf, int* gene_counter,
+                                const ModelParams* params) {
   if (!buf || buf->count == 0)
     return;
 
@@ -1004,7 +1203,7 @@ static void emit_orf_candidates(const char* chr_name, int seq_len, char strand,
   if (!sorted) {
     for (int i = 0; i < buf->count; ++i) {
       const OrfCandidate* cand = &buf->items[i];
-      if (cand->margin >= DEFAULT_SINGLE_ORF_MIN_MARGIN)
+      if (cand->margin >= params->single_min_margin)
         print_gff_single(chr_name, seq_len, strand, cand->start, cand->end,
                          gene_counter);
     }
@@ -1013,11 +1212,20 @@ static void emit_orf_candidates(const char* chr_name, int seq_len, char strand,
   memcpy(sorted, buf->items, (size_t)buf->count * sizeof(OrfCandidate));
   qsort(sorted, (size_t)buf->count, sizeof(OrfCandidate), orf_cmp_desc);
 
-  int window_size = DEFAULT_SINGLE_ORF_WINDOW_SIZE;
+  double min_margin = params->single_min_margin;
+  if (min_margin < 0.0)
+    min_margin = 0.0;
+  ModelParams fallback = fallback_model_params();
+  double max_overlap = params->single_max_overlap;
+  if (max_overlap <= 0.0 || max_overlap > 1.0)
+    max_overlap = fallback.single_max_overlap;
+  int max_per_window = params->single_max_per_window;
+  if (max_per_window <= 0)
+    max_per_window = fallback.single_max_per_window;
+
+  int window_size = params->single_window_size;
   if (window_size <= 0)
-    window_size = DEFAULT_SPLICE_WINDOW_SIZE;
-  if (window_size <= 0)
-    window_size = 10000;
+    window_size = fallback.single_window_size;
   int num_windows = seq_len / window_size + 1;
   int* window_counts = NULL;
   if (num_windows > 0)
@@ -1029,7 +1237,7 @@ static void emit_orf_candidates(const char* chr_name, int seq_len, char strand,
 
   for (int i = 0; i < buf->count; ++i) {
     OrfCandidate cand = sorted[i];
-    if (cand.margin < DEFAULT_SINGLE_ORF_MIN_MARGIN)
+    if (cand.margin < min_margin)
       continue;
     bool reject = false;
     for (int j = 0; j < accepted_count; ++j) {
@@ -1040,8 +1248,7 @@ static void emit_orf_candidates(const char* chr_name, int seq_len, char strand,
         continue;
       double frac_cand = (double)overlap / (double)cand.length;
       double frac_other = (double)overlap / (double)other.length;
-      if (frac_cand > DEFAULT_SINGLE_ORF_MAX_OVERLAP ||
-          frac_other > DEFAULT_SINGLE_ORF_MAX_OVERLAP) {
+      if (frac_cand > max_overlap || frac_other > max_overlap) {
         reject = true;
         break;
       }
@@ -1058,7 +1265,7 @@ static void emit_orf_candidates(const char* chr_name, int seq_len, char strand,
         win_end = num_windows - 1;
       bool window_full = false;
       for (int w = win_start; w <= win_end; ++w) {
-        if (window_counts[w] >= DEFAULT_SINGLE_ORF_MAX_PER_WINDOW) {
+        if (window_counts[w] >= max_per_window) {
           window_full = true;
           break;
         }
@@ -1258,27 +1465,31 @@ static int find_next_stop_codon(const char* sequence, int seq_len,
 static double compute_intron_penalty(const SpliceDfsCtx* ctx,
                                      const StackFrame* frame, int donor_idx,
                                      int accept_idx, int intron_len) {
-  double penalty = ctx->base_intron_penalty +
-                   (double)frame->intron_count * ctx->extra_intron_penalty;
+  const ModelParams* params = ctx->params;
   double donor_margin =
       ctx->donor[donor_idx].score - ctx->splice_pwm->min_donor_score;
   double accept_margin =
       ctx->accept[accept_idx].score - ctx->splice_pwm->min_acceptor_score;
-  if (donor_margin < ctx->weak_margin_cutoff)
-    penalty += ctx->weak_site_penalty;
-  if (accept_margin < ctx->weak_margin_cutoff)
-    penalty += ctx->weak_site_penalty;
-  if (donor_margin > ctx->strong_margin_cutoff)
-    penalty -= ctx->strong_site_bonus;
-  if (accept_margin > ctx->strong_margin_cutoff)
-    penalty -= ctx->strong_site_bonus;
-  if (intron_len < ctx->len_soft_min || intron_len > ctx->len_soft_max)
-    penalty += ctx->length_outside_penalty;
-  if (penalty < ctx->min_intron_penalty)
-    penalty = ctx->min_intron_penalty;
-  if (penalty > ctx->max_intron_penalty)
-    penalty = ctx->max_intron_penalty;
-  return penalty;
+  double margin = donor_margin < accept_margin ? donor_margin : accept_margin;
+
+  double penalty =
+      params->intron_penalty_base +
+      params->intron_penalty_per_intron * (double)(frame->intron_count + 1);
+
+  if (params->intron_margin_cutoff > 0.0 &&
+      margin < params->intron_margin_cutoff) {
+    penalty +=
+        params->intron_margin_weight * (params->intron_margin_cutoff - margin);
+  }
+
+  if (params->intron_length_target > 0.0 &&
+      params->intron_length_weight > 0.0) {
+    double deviation = fabs((double)intron_len - params->intron_length_target) /
+                       params->intron_length_target;
+    penalty += params->intron_length_weight * deviation;
+  }
+
+  return clamp_double(penalty, 0.0, 1.0);
 }
 
 static void finalize_spliced_candidate(const SpliceDfsCtx* ctx,
@@ -1310,12 +1521,16 @@ static void finalize_spliced_candidate(const SpliceDfsCtx* ctx,
   char* pep = translate_cds(temp_cds);
   if (pep) {
     bool pass = false;
-    double score = calculate_peptide_score(pep, ctx->models, ctx->means,
-                                           ctx->stds, ctx->min_occ, &pass);
+    double score =
+        calculate_peptide_score(pep, ctx->model->coeffs, ctx->model->means,
+                                ctx->model->stds, ctx->model->min_occ, &pass);
     double penalty = frame->penalty_accum;
     if (frame->intron_count < 0)
       penalty = 0.0;
     double final_score = score - penalty;
+    double threshold = ctx->params->pstat_threshold;
+    if (threshold <= 0.0)
+      threshold = fallback_model_params().pstat_threshold;
     if (frame->intron_count == 0) {
       if (ctx->single_buffer && ctx->single_buffer_failed &&
           !*(ctx->single_buffer_failed)) {
@@ -1323,20 +1538,22 @@ static void finalize_spliced_candidate(const SpliceDfsCtx* ctx,
         cand.start = frame->exon_starts_local[0];
         cand.end = frame->exon_ends_local[0];
         cand.score = final_score;
-        cand.margin = final_score - ctx->pstat_threshold;
+        cand.margin = final_score - threshold;
         cand.length = total_len;
         cand.pass_flag = pass ? 1 : 0;
         if (!orf_buffer_append(ctx->single_buffer, &cand)) {
           *(ctx->single_buffer_failed) = true;
-          if (final_score >= ctx->pstat_threshold) {
+          if (final_score >= threshold) {
             print_gff_single(ctx->chr_name, ctx->seq_len, ctx->strand,
                              cand.start, cand.end, ctx->gene_counter);
+            fflush(stdout);
           }
         }
-      } else if (final_score >= ctx->pstat_threshold) {
+      } else if (final_score >= threshold) {
         print_gff_single(ctx->chr_name, ctx->seq_len, ctx->strand,
                          frame->exon_starts_local[0], frame->exon_ends_local[0],
                          ctx->gene_counter);
+        fflush(stdout);
       }
       free(pep);
       free(temp_cds);
@@ -1356,19 +1573,21 @@ static void finalize_spliced_candidate(const SpliceDfsCtx* ctx,
         cand.exon_phases[i] = frame->exon_phases_local[i];
       }
       if (!isoform_buffer_append(ctx->collector, &cand)) {
-        if (final_score >= ctx->pstat_threshold) {
+        if (final_score >= threshold) {
           print_gff_multi_spliced(
               ctx->chr_name, ctx->seq_len, ctx->strand,
               frame->exon_starts_local, frame->exon_ends_local,
               frame->exon_phases_local, final_exon_count, ctx->gene_counter);
+          fflush(stdout);
         }
       }
     } else {
-      if (final_score >= ctx->pstat_threshold) {
+      if (final_score >= threshold) {
         print_gff_multi_spliced(
             ctx->chr_name, ctx->seq_len, ctx->strand, frame->exon_starts_local,
             frame->exon_ends_local, frame->exon_phases_local, final_exon_count,
             ctx->gene_counter);
+        fflush(stdout);
       }
     }
     free(pep);
@@ -1381,17 +1600,24 @@ static void finalize_spliced_candidate(const SpliceDfsCtx* ctx,
 // resource limits per window.
 
 // Unspliced ORF search
-void find_candidate_cds_iterative(
-    const char* sequence, const char* chr_name, char strand, int ref_len,
-    double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1], const double* means,
-    const double* stds, int min_occ, int min_orf_nt, double pstat_threshold,
-    int* gene_counter) {
+void find_candidate_cds_iterative(const char* sequence, const char* chr_name,
+                                  char strand, int ref_len,
+                                  const SunfishModel* model,
+                                  const ModelParams* params,
+                                  int* gene_counter) {
   int seq_len = (int)strlen(sequence);
   (void)ref_len;
   OrfBuffer buffer;
   orf_buffer_init(&buffer);
   bool buffer_failed = false;
   int buffered_candidates = 0;
+  ModelParams fallback = fallback_model_params();
+  int min_orf_nt = params->min_orf_nt;
+  if (min_orf_nt <= 0)
+    min_orf_nt = fallback.min_orf_nt;
+  double pstat_threshold = params->pstat_threshold;
+  if (pstat_threshold <= 0.0)
+    pstat_threshold = fallback.pstat_threshold;
   for (int start = 0; start < seq_len - 5; start++) {
     if (!is_atg_triplet(sequence, start)) {
       continue;
@@ -1419,8 +1645,8 @@ void find_candidate_cds_iterative(
     char* pep = translate_cds(orf_seq);
     if (pep) {
       bool pass = false;
-      double score =
-          calculate_peptide_score(pep, models, means, stds, min_occ, &pass);
+      double score = calculate_peptide_score(
+          pep, model->coeffs, model->means, model->stds, model->min_occ, &pass);
       if (score >= pstat_threshold) {
         if (buffer_failed) {
           print_gff_single(chr_name, seq_len, strand, start, end_of_orf,
@@ -1447,7 +1673,8 @@ void find_candidate_cds_iterative(
     free(orf_seq);
   }
   if (!buffer_failed)
-    emit_orf_candidates(chr_name, seq_len, strand, &buffer, gene_counter);
+    emit_orf_candidates(chr_name, seq_len, strand, &buffer, gene_counter,
+                        params);
   fprintf(stderr,
           "[DEBUG] %s strand %c buffered %d single-exon candidates (fail=%d)\n",
           chr_name, strand, buffered_candidates, buffer_failed ? 1 : 0);
@@ -1456,11 +1683,8 @@ void find_candidate_cds_iterative(
 
 // Main splicing search function
 void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
-                       int ref_len,
-                       double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1],
-                       const double* means, const double* stds, int min_occ,
-                       int min_exon, int min_orf_nt, double pstat_threshold,
-                       int* gene_counter) {
+                       int ref_len, const SunfishModel* model,
+                       const ModelParams* params, int* gene_counter) {
   int seq_len = (int)strlen(sequence);
   (void)ref_len;
   OrfBuffer single_orfs;
@@ -1468,11 +1692,21 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
   bool single_buffer_failed = false;
   const int site_cap = MAX_SITES_PER_WINDOW;
   const int recursion_cap = MAX_RECURSION_PER_WINDOW;
-  const int alt_limit_default = DEFAULT_MAX_ALTERNATIVE_ISOFORMS;
+  const int alt_limit_default = kDefaultMaxAlternativeIsoforms;
   const bool allow_no_stop = true;
-  // Adjust window size and slide interval in defaults.h
-  const int window_size = DEFAULT_SPLICE_WINDOW_SIZE;
-  const int window_slide = DEFAULT_SPLICE_WINDOW_SLIDE;
+  ModelParams fallback = fallback_model_params();
+  int min_exon = params->min_exon_nt;
+  if (min_exon <= 0)
+    min_exon = fallback.min_exon_nt;
+  int min_orf_nt = params->min_orf_nt;
+  if (min_orf_nt <= 0)
+    min_orf_nt = fallback.min_orf_nt;
+  double pstat_threshold = params->pstat_threshold;
+  if (pstat_threshold <= 0.0)
+    pstat_threshold = fallback.pstat_threshold;
+
+  const int window_size = kSpliceWindowSize;
+  const int window_slide = kSpliceWindowSlide;
   for (int win_start = 0; win_start < seq_len; win_start += window_slide) {
     int win_end = win_start + window_size;
     if (win_end > seq_len)
@@ -1496,6 +1730,7 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
               "[WARN] Too many donor/acceptor sites in window (nd=%d, na=%d), "
               "skipping window.\n",
               nd, na);
+      fflush(stderr);
       free(donors);
       free(acceptors);
       continue;
@@ -1509,50 +1744,37 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
     }
     build_donor_accept_ranges(donors, nd, acceptors, na, donor_ranges);
 
-    SpliceDfsCtx ctx = {
-        .sequence = sequence,
-        .chr_name = chr_name,
-        .strand = strand,
-        .seq_len = seq_len,
-        .donor = donors,
-        .nd = nd,
-        .accept = acceptors,
-        .na = na,
-        .donor_to_accept = donor_ranges,
-        .min_exon = min_exon,
-        .max_pairs = DEFAULT_MAX_SPLICE_PAIRS,
-        .min_orf_nt = min_orf_nt,
-        .pstat_threshold = pstat_threshold,
-        .models = models,
-        .min_occ = min_occ,
-        .gene_counter = gene_counter,
-        .means = means,
-        .stds = stds,
-        .max_recursions = recursion_cap,
-        .recursion_count = 0,
-        .max_alternatives = alt_limit_default > 0 ? alt_limit_default : 1,
-        .splice_pwm = &g_splice_pwm,
-        .base_intron_penalty = DEFAULT_INTRON_BASE_PENALTY,
-        .weak_site_penalty = DEFAULT_INTRON_WEAK_SITE_PENALTY,
-        .strong_site_bonus = DEFAULT_INTRON_STRONG_SITE_BONUS,
-        .weak_margin_cutoff = DEFAULT_INTRON_WEAK_MARGIN,
-        .strong_margin_cutoff = DEFAULT_INTRON_STRONG_MARGIN,
-        .length_outside_penalty = DEFAULT_INTRON_LENGTH_PENALTY,
-        .min_intron_penalty = DEFAULT_INTRON_MIN_PENALTY,
-        .max_intron_penalty = DEFAULT_INTRON_MAX_PENALTY,
-        .extra_intron_penalty = DEFAULT_INTRON_EXTRA_PER_ADDITIONAL,
-        .len_soft_min = DEFAULT_INTRON_LEN_SOFT_MIN,
-        .len_soft_max = DEFAULT_INTRON_LEN_SOFT_MAX,
-        .collector = NULL,
-        .single_buffer = &single_orfs,
-        .single_buffer_failed = &single_buffer_failed};
+    SpliceDfsCtx ctx = {.sequence = sequence,
+                        .chr_name = chr_name,
+                        .strand = strand,
+                        .seq_len = seq_len,
+                        .donor = donors,
+                        .nd = nd,
+                        .accept = acceptors,
+                        .na = na,
+                        .donor_to_accept = donor_ranges,
+                        .min_exon = min_exon,
+                        .max_pairs = kDefaultMaxSplicePairs,
+                        .min_orf_nt = min_orf_nt,
+                        .model = model,
+                        .params = params,
+                        .gene_counter = gene_counter,
+                        .max_recursions = recursion_cap,
+                        .recursion_count = 0,
+                        .max_alternatives =
+                            alt_limit_default > 0 ? alt_limit_default : 1,
+                        .splice_pwm = &model->splice_pwm,
+                        .collector = NULL,
+                        .single_buffer = &single_orfs,
+                        .single_buffer_failed = &single_buffer_failed};
     int window_recursions = 0;
     int cap_exons = ctx.max_pairs * 2 + 2;
     if (cap_exons > MAX_TRACKED_EXONS) {
       fprintf(stderr,
               "[WARN] Max tracked exons (%d) exceeds stack capacity (%d); "
-              "consider increasing DEFAULT_MAX_SPLICE_PAIRS.\n",
-              cap_exons, MAX_TRACKED_EXONS);
+              "consider increasing splice pair cap (current %d).\n",
+              cap_exons, MAX_TRACKED_EXONS, kDefaultMaxSplicePairs);
+      fflush(stderr);
       free(donor_ranges);
       free(donors);
       free(acceptors);
@@ -1566,10 +1788,8 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
       isoform_buffer_init(&isoforms);
       ctx.collector = &isoforms;
       ctx.recursion_count = 0;
-      // initialize base frame
       StackFrame* stack = NULL;
       int stack_cap = 0, stack_top = 0;
-      // push initial frame
       stack_cap = 16;
       stack = (StackFrame*)malloc(stack_cap * sizeof(StackFrame));
       if (!stack)
@@ -1595,7 +1815,7 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
           break;
         window_recursions++;
         StackFrame frame = stack[stack_top];
-        stack_top--; // pop
+        stack_top--;
         int exon_idx = frame.exon_idx;
         int acc_len = frame.accumulated_len;
         for (int p = frame.p; p + 2 < ctx.seq_len; p += 3) {
@@ -1669,7 +1889,7 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
       if (isoforms.count > 0) {
         qsort(isoforms.items, (size_t)isoforms.count, sizeof(IsoformCandidate),
               isoform_cmp_desc);
-        double thr = ctx.pstat_threshold;
+        double thr = pstat_threshold;
         int alt_limit = ctx.max_alternatives;
         if (alt_limit <= 0)
           alt_limit = 1;
@@ -1694,11 +1914,13 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
             print_gff_single(ctx.chr_name, ctx.seq_len, ctx.strand,
                              cand->exon_starts[0], cand->exon_ends[0],
                              ctx.gene_counter);
+            fflush(stdout);
           } else {
             print_gff_multi_spliced(ctx.chr_name, ctx.seq_len, ctx.strand,
                                     cand->exon_starts, cand->exon_ends,
                                     cand->exon_phases, cand->exon_count,
                                     ctx.gene_counter);
+            fflush(stdout);
           }
           emitted_refs[emitted++] = cand;
         }
@@ -1708,6 +1930,7 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
             print_gff_single(ctx.chr_name, ctx.seq_len, ctx.strand,
                              cand->exon_starts[0], cand->exon_ends[0],
                              ctx.gene_counter);
+            fflush(stdout);
             emitted_refs[emitted++] = cand;
           }
         }
@@ -1722,13 +1945,16 @@ void find_spliced_orfs(const char* sequence, const char* chr_name, char strand,
             "[INFO] Window %d-%d processed: donors=%d, acceptors=%d, "
             "recursions=%d\n",
             win_start, win_end, nd, na, window_recursions);
+    fflush(stderr);
   }
   if (!single_buffer_failed)
-    emit_orf_candidates(chr_name, seq_len, strand, &single_orfs, gene_counter);
+    emit_orf_candidates(chr_name, seq_len, strand, &single_orfs, gene_counter,
+                        params);
   fprintf(stderr,
           "[DEBUG] %s strand %c spliced search buffered %d single-exon "
           "candidates (fail=%d)\n",
           chr_name, strand, single_orfs.count, single_buffer_failed ? 1 : 0);
+  fflush(stderr);
   orf_buffer_free(&single_orfs);
 }
 
@@ -1747,10 +1973,10 @@ void handle_train(int argc, char* argv[]) {
   init_splice_counts();
   const char* fasta_path = argv[2];
   const char* gff_path = argv[3];
-  int min_occ = DEFAULT_MIN_OCC;
-  double lr = DEFAULT_LR;
-  int iters = DEFAULT_ITERS;
-  double l1 = DEFAULT_L1;
+  int min_occ = kTrainingDefaults.min_occ;
+  double lr = kTrainingDefaults.lr;
+  int iters = kTrainingDefaults.iters;
+  double l1 = kTrainingDefaults.l1;
   for (int i = 4; i < argc; i++) {
     if ((strcmp(argv[i], "--min-occ") == 0 || strcmp(argv[i], "-m") == 0) &&
         i + 1 < argc) {
@@ -1760,15 +1986,15 @@ void handle_train(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
       lr = strtod(argv[++i], NULL);
       if (!(lr > 0))
-        lr = 0.01;
+        lr = kTrainingDefaults.lr;
     } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
       iters = atoi(argv[++i]);
       if (iters < 1)
-        iters = 1000;
+        iters = kTrainingDefaults.iters;
     } else if (strcmp(argv[i], "--l1") == 0 && i + 1 < argc) {
       l1 = strtod(argv[++i], NULL);
       if (l1 < 0)
-        l1 = 0.05;
+        l1 = kTrainingDefaults.l1;
     } else {
       fprintf(stderr, "Warning: Unknown or incomplete option '%s' ignored\n",
               argv[i]);
@@ -1795,6 +2021,20 @@ void handle_train(int argc, char* argv[]) {
   PeptideInfo* peptides =
       (PeptideInfo*)malloc((size_t)group_count * sizeof(PeptideInfo));
   int peptide_count = 0;
+  DoubleVector cds_lengths;
+  DoubleVector exon_lengths;
+  DoubleVector intron_lengths;
+  DoubleVector single_scores;
+  DoubleVector multi_scores;
+  DoubleVector intron_counts_vec;
+  DoubleVector all_scores;
+  double_vector_init(&cds_lengths);
+  double_vector_init(&exon_lengths);
+  double_vector_init(&intron_lengths);
+  double_vector_init(&single_scores);
+  double_vector_init(&multi_scores);
+  double_vector_init(&intron_counts_vec);
+  double_vector_init(&all_scores);
   for (int g = 0; g < group_count; g++) {
     CdsGroup* grp = &groups[g];
 
@@ -1829,6 +2069,16 @@ void handle_train(int argc, char* argv[]) {
         update_splice_counts(chr_seq, grp->exons[e].end, 1); // Position of GT
       }
     }
+    for (int e = 0; e < grp->exon_count; e++) {
+      int exon_len = grp->exons[e].end - grp->exons[e].start + 1;
+      if (exon_len > 0)
+        double_vector_push(&exon_lengths, (double)exon_len);
+      if (e < grp->exon_count - 1) {
+        int intron_len = grp->exons[e + 1].start - grp->exons[e].end - 1;
+        if (intron_len > 0)
+          double_vector_push(&intron_lengths, (double)intron_len);
+      }
+    }
     for (int i = 0; i < grp->exon_count - 1; i++)
       for (int j = 0; j < grp->exon_count - 1 - i; j++)
         if (grp->exons[j].start > grp->exons[j + 1].start) {
@@ -1854,6 +2104,7 @@ void handle_train(int argc, char* argv[]) {
       }
     }
     cds_seq[cds_len] = '\0';
+    double_vector_push(&cds_lengths, (double)cds_len);
     if (grp->exons[0].strand == '-') {
       char* rc = reverse_complement(cds_seq);
       free(cds_seq);
@@ -1864,6 +2115,11 @@ void handle_train(int argc, char* argv[]) {
     if (pep && pep[0] != '\0') {
       peptides[peptide_count].sequence = pep;
       count_amino_acids(pep, peptides[peptide_count].counts);
+      peptides[peptide_count].exon_count = grp->exon_count;
+      peptides[peptide_count].cds_length_nt = (int)cds_len;
+      double_vector_push(&intron_counts_vec, grp->exon_count > 0
+                                                 ? (double)(grp->exon_count - 1)
+                                                 : 0.0);
       peptide_count++;
     }
   }
@@ -1871,6 +2127,13 @@ void handle_train(int argc, char* argv[]) {
   if (peptide_count == 0) {
     fprintf(stderr, "Error: No peptides extracted.\n");
     free(peptides);
+    double_vector_free(&cds_lengths);
+    double_vector_free(&exon_lengths);
+    double_vector_free(&intron_lengths);
+    double_vector_free(&single_scores);
+    double_vector_free(&multi_scores);
+    double_vector_free(&intron_counts_vec);
+    double_vector_free(&all_scores);
     free_cds_groups(groups, group_count);
     free_fasta_data(genome);
     exit(1);
@@ -1935,6 +2198,147 @@ void handle_train(int argc, char* argv[]) {
   free(Xraw);
   free(y_allocation);
 
+  double single_len_sum = 0.0;
+  double multi_len_sum = 0.0;
+  int single_len_count = 0;
+  int multi_len_count = 0;
+  for (int i = 0; i < peptide_count; ++i) {
+    bool pass_flag = false;
+    double score =
+        calculate_peptide_score(peptides[i].sequence, models, feature_means,
+                                feature_stds, min_occ, &pass_flag);
+    double_vector_push(&all_scores, score);
+    if (peptides[i].exon_count <= 1) {
+      double_vector_push(&single_scores, score);
+      single_len_sum += (double)peptides[i].cds_length_nt;
+      single_len_count++;
+    } else {
+      double_vector_push(&multi_scores, score);
+      multi_len_sum += (double)peptides[i].cds_length_nt;
+      multi_len_count++;
+    }
+  }
+
+  ModelParams fallback_params = fallback_model_params();
+  ModelParams learned_params = fallback_params;
+
+  if (exon_lengths.count > 0) {
+    double p10 =
+        compute_percentile(exon_lengths.data, exon_lengths.count, 0.10);
+    p10 = clamp_double(p10, 30.0, 4000.0);
+    learned_params.min_exon_nt = (int)lrint(p10);
+  }
+
+  if (cds_lengths.count > 0) {
+    double p15 = compute_percentile(cds_lengths.data, cds_lengths.count, 0.15);
+    p15 = clamp_double(p15, 300.0, 10000.0);
+    learned_params.min_orf_nt = (int)lrint(p15);
+  }
+
+  double threshold = fallback_params.pstat_threshold;
+  if (multi_scores.count >= 5) {
+    threshold = compute_percentile(multi_scores.data, multi_scores.count, 0.20);
+  } else if (all_scores.count > 0) {
+    threshold = compute_percentile(all_scores.data, all_scores.count, 0.20);
+  }
+  threshold = clamp_double(threshold, 0.20, 0.95);
+  learned_params.pstat_threshold = threshold;
+
+  double single_cut =
+      (single_scores.count > 0)
+          ? compute_percentile(single_scores.data, single_scores.count, 0.35)
+          : threshold;
+  double single_margin = single_cut - threshold;
+  if (single_margin < 0.0)
+    single_margin = 0.0;
+  learned_params.single_min_margin = clamp_double(single_margin, 0.0, 2.0);
+
+  double total_transcripts = (double)all_scores.count;
+  double single_fraction = total_transcripts > 0.0
+                               ? (double)single_scores.count / total_transcripts
+                               : 0.4;
+  double overlap =
+      clamp_double(0.25 + (0.25 * (1.0 - single_fraction)), 0.2, 0.7);
+  learned_params.single_max_overlap = overlap;
+
+  if (single_len_count + multi_len_count > 0) {
+    double avg_gene_len = (single_len_sum + multi_len_sum) /
+                          (double)(single_len_count + multi_len_count);
+    double window = clamp_double(avg_gene_len * 4.0, 2000.0, 50000.0);
+    double rounded = lrint(window / 500.0) * 500.0;
+    if (rounded < 2000.0)
+      rounded = 2000.0;
+    learned_params.single_window_size = (int)rounded;
+  }
+
+  double window_cap = clamp_double(2.0 + single_fraction * 4.0, 2.0, 8.0);
+  learned_params.single_max_per_window = (int)lrint(window_cap);
+  if (learned_params.single_max_per_window < 2)
+    learned_params.single_max_per_window = 2;
+
+  double mean_introns = double_vector_mean(&intron_counts_vec);
+  if (mean_introns <= 0.0)
+    mean_introns = 1.0;
+  double per_intron = clamp_double(0.03 + mean_introns * 0.01, 0.03, 0.12);
+  learned_params.intron_penalty_per_intron = per_intron;
+
+  if (intron_lengths.count > 0) {
+    double median_intron =
+        compute_percentile(intron_lengths.data, intron_lengths.count, 0.50);
+    median_intron = clamp_double(median_intron, 40.0, 20000.0);
+    learned_params.intron_length_target = median_intron;
+    double intron_mean = double_vector_mean(&intron_lengths);
+    double intron_std = double_vector_stddev(&intron_lengths, intron_mean);
+    if (intron_mean > 0.0) {
+      double weight = clamp_double((intron_std / intron_mean) * 0.2, 0.02, 0.2);
+      learned_params.intron_length_weight = weight;
+    }
+    double base = 0.06 + clamp_double(median_intron / 300.0, 0.0, 3.0) * 0.02;
+    base += clamp_double((mean_introns - 1.0) * 0.015, 0.0, 0.06);
+    learned_params.intron_penalty_base = clamp_double(base, 0.05, 0.25);
+  } else {
+    double base = 0.06 + clamp_double((mean_introns - 1.0) * 0.015, 0.0, 0.06);
+    learned_params.intron_penalty_base = clamp_double(base, 0.05, 0.25);
+  }
+
+  double multi_margin = fallback_params.intron_margin_cutoff;
+  if (multi_scores.count > 0) {
+    double multi_quant =
+        compute_percentile(multi_scores.data, multi_scores.count, 0.30);
+    multi_margin = multi_quant - threshold;
+  } else if (single_scores.count > 0) {
+    double single_quant =
+        compute_percentile(single_scores.data, single_scores.count, 0.60);
+    multi_margin = single_quant - threshold;
+  }
+  multi_margin = clamp_double(multi_margin, 0.5, 3.0);
+  learned_params.intron_margin_cutoff = multi_margin;
+
+  if (multi_scores.count > 1) {
+    double multi_mean = double_vector_mean(&multi_scores);
+    double multi_std = double_vector_stddev(&multi_scores, multi_mean);
+    double margin_weight = clamp_double(multi_std * 0.15, 0.05, 0.25);
+    learned_params.intron_margin_weight = margin_weight;
+  }
+
+  fprintf(stderr,
+          "Derived ModelParams: min_exon=%d, min_orf=%d, pthr=%.3f, "
+          "sing_margin=%.3f, "
+          "overlap=%.3f, win=%d, max_per=%d\n",
+          learned_params.min_exon_nt, learned_params.min_orf_nt,
+          learned_params.pstat_threshold, learned_params.single_min_margin,
+          learned_params.single_max_overlap, learned_params.single_window_size,
+          learned_params.single_max_per_window);
+  fprintf(
+      stderr,
+      "Derived intron params: base=%.3f, per=%.3f, margin_cut=%.3f, "
+      "margin_w=%.3f, "
+      "len_target=%.1f, len_w=%.3f\n",
+      learned_params.intron_penalty_base,
+      learned_params.intron_penalty_per_intron,
+      learned_params.intron_margin_cutoff, learned_params.intron_margin_weight,
+      learned_params.intron_length_target, learned_params.intron_length_weight);
+
   FILE* mf = fopen("sunfish.model", "w");
   if (!mf) {
     fprintf(stderr, "Error: Cannot create model file\n");
@@ -1949,6 +2353,30 @@ void handle_train(int argc, char* argv[]) {
   for (int k = 0; k < NUM_AMINO_ACIDS; k++)
     fprintf(mf, " %.10f", feature_stds[k]);
   fprintf(mf, "\n");
+
+  fprintf(mf, "#param min_exon_nt %d\n", learned_params.min_exon_nt);
+  fprintf(mf, "#param min_orf_nt %d\n", learned_params.min_orf_nt);
+  fprintf(mf, "#param pstat_threshold %.6f\n", learned_params.pstat_threshold);
+  fprintf(mf, "#param single_min_margin %.6f\n",
+          learned_params.single_min_margin);
+  fprintf(mf, "#param single_max_overlap %.6f\n",
+          learned_params.single_max_overlap);
+  fprintf(mf, "#param single_window_size %d\n",
+          learned_params.single_window_size);
+  fprintf(mf, "#param single_max_per_window %d\n",
+          learned_params.single_max_per_window);
+  fprintf(mf, "#param intron_penalty_base %.6f\n",
+          learned_params.intron_penalty_base);
+  fprintf(mf, "#param intron_penalty_per_intron %.6f\n",
+          learned_params.intron_penalty_per_intron);
+  fprintf(mf, "#param intron_margin_cutoff %.6f\n",
+          learned_params.intron_margin_cutoff);
+  fprintf(mf, "#param intron_margin_weight %.6f\n",
+          learned_params.intron_margin_weight);
+  fprintf(mf, "#param intron_length_target %.6f\n",
+          learned_params.intron_length_target);
+  fprintf(mf, "#param intron_length_weight %.6f\n",
+          learned_params.intron_length_weight);
 
   // Calculate PWM from collected counts and save splice site PWMs
   calculate_pwm_from_counts();
@@ -1996,16 +2424,19 @@ void handle_train(int argc, char* argv[]) {
     }
 
     if (donor_scores && nd_sites > 0) {
-      qsort(donor_scores, (size_t)nd_sites, sizeof(double), double_cmp);
-      g_splice_pwm.min_donor_score = compute_percentile(
-          donor_scores, nd_sites, DEFAULT_SPLICE_SCORE_PERCENTILE);
+      qsort(donor_scores, (size_t)nd_sites, sizeof(double), cmp_double_asc);
+      g_splice_pwm.min_donor_score =
+          compute_percentile(donor_scores, nd_sites, kSpliceScorePercentile);
     }
     if (acceptor_scores && na_sites > 0) {
-      qsort(acceptor_scores, (size_t)na_sites, sizeof(double), double_cmp);
-      g_splice_pwm.min_acceptor_score = compute_percentile(
-          acceptor_scores, na_sites, DEFAULT_SPLICE_SCORE_PERCENTILE);
+      qsort(acceptor_scores, (size_t)na_sites, sizeof(double), cmp_double_asc);
+      g_splice_pwm.min_acceptor_score =
+          compute_percentile(acceptor_scores, na_sites, kSpliceScorePercentile);
     }
   }
+
+  free(donor_scores);
+  free(acceptor_scores);
 
   fprintf(mf, "#splice_pwm\n");
   for (int nt = 0; nt < NUM_NUCLEOTIDES; nt++) {
@@ -2036,6 +2467,13 @@ void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Training complete. Model saved to sunfish.model\n");
   free(feature_means);
   free(feature_stds);
+  double_vector_free(&cds_lengths);
+  double_vector_free(&exon_lengths);
+  double_vector_free(&intron_lengths);
+  double_vector_free(&single_scores);
+  double_vector_free(&multi_scores);
+  double_vector_free(&intron_counts_vec);
+  double_vector_free(&all_scores);
   for (int i = 0; i < peptide_count; i++)
     free(peptides[i].sequence);
   free(peptides);
@@ -2050,41 +2488,35 @@ void handle_predict(int argc, char* argv[]) {
     exit(1);
   }
   const char* fasta_path = argv[2];
-  int min_occ = DEFAULT_MIN_OCC;
-  int min_exon = DEFAULT_MIN_EXON;
-  int min_orf_nt = DEFAULT_MIN_ORF_NT;
-  double pstat_threshold = DEFAULT_P_STAT_THRESHOLD;
+  bool min_occ_overridden = false;
+  int min_occ_override = kTrainingDefaults.min_occ;
   for (int i = 3; i < argc; i++) {
     if ((strcmp(argv[i], "--min-occ") == 0 || strcmp(argv[i], "-m") == 0) &&
         i + 1 < argc) {
-      min_occ = atoi(argv[++i]);
-      if (min_occ < 1)
-        min_occ = 1;
+      min_occ_override = atoi(argv[++i]);
+      if (min_occ_override < 1)
+        min_occ_override = 1;
+      min_occ_overridden = true;
     } else {
       fprintf(stderr, "Warning: Unknown or incomplete option '%s' ignored\n",
               argv[i]);
     }
   }
-  double models[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1];
-  double means[NUM_AMINO_ACIDS];
-  double stds[NUM_AMINO_ACIDS];
-  int model_min_occ = -1;
-  if (!load_model("sunfish.model", models, means, stds, &model_min_occ,
-                  &g_splice_pwm)) {
+
+  SunfishModel model;
+  if (!load_model("sunfish.model", &model)) {
     fprintf(stderr, "Failed to load model. Run 'train' first.\n");
     exit(1);
   }
-  if (model_min_occ > 0) {
-    bool user_specified = false;
-    for (int i = 3; i < argc; i++) {
-      if ((strcmp(argv[i], "--min-occ") == 0 || strcmp(argv[i], "-m") == 0)) {
-        user_specified = true;
-        break;
-      }
-    }
-    if (!user_specified)
-      min_occ = model_min_occ;
-  }
+  ModelParams runtime_params = model.params;
+  g_splice_pwm = model.splice_pwm;
+
+  int min_occ = model.min_occ;
+  if (min_occ <= 0)
+    min_occ = kTrainingDefaults.min_occ;
+  if (min_occ_overridden)
+    min_occ = min_occ_override;
+
   FastaData* genome = parse_fasta(fasta_path);
   if (!genome) {
     fprintf(stderr, "Failed to load FASTA file\n");
@@ -2098,22 +2530,20 @@ void handle_predict(int argc, char* argv[]) {
     int L = (int)strlen(seq);
     fprintf(stderr, "Processing %s (+ strand)...\n", id);
     fflush(stderr);
-    find_candidate_cds_iterative(seq, id, '+', L, models, means, stds, min_occ,
-                                 min_orf_nt, pstat_threshold, &gene_counter);
+    find_candidate_cds_iterative(seq, id, '+', L, &model, &runtime_params,
+                                 &gene_counter);
     fprintf(stderr, "Processing %s (- strand)...\n", id);
     fflush(stderr);
     char* rc = reverse_complement(seq);
     if (rc) {
       int rcL = (int)strlen(rc);
-      find_candidate_cds_iterative(rc, id, '-', rcL, models, means, stds,
-                                   min_occ, min_orf_nt, pstat_threshold,
+      find_candidate_cds_iterative(rc, id, '-', rcL, &model, &runtime_params,
                                    &gene_counter);
-      find_spliced_orfs(rc, id, '-', rcL, models, means, stds, min_occ,
-                        min_exon, min_orf_nt, pstat_threshold, &gene_counter);
+      find_spliced_orfs(rc, id, '-', rcL, &model, &runtime_params,
+                        &gene_counter);
       free(rc);
     }
-    find_spliced_orfs(seq, id, '+', L, models, means, stds, min_occ, min_exon,
-                      min_orf_nt, pstat_threshold, &gene_counter);
+    find_spliced_orfs(seq, id, '+', L, &model, &runtime_params, &gene_counter);
   }
   fprintf(stderr, "Prediction complete. Found %d genes.\n", gene_counter);
   free_fasta_data(genome);
