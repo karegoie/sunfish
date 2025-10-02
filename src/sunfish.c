@@ -420,6 +420,16 @@ static void predict_sequence_worker(void* arg) {
     goto cleanup;
   }
 
+  // Apply Z-score normalization using global statistics from the model
+  for (int t = 0; t < seq_len; t++) {
+    for (int f = 0; f < task->model->num_features; f++) {
+      double raw_val = observations[t][f];
+      double normalized_val = (raw_val - task->model->global_feature_mean[f]) / 
+                              task->model->global_feature_stddev[f];
+      observations[t][f] = normalized_val;
+    }
+  }
+
   states = (int*)malloc(seq_len * sizeof(int));
   if (!states) {
     fprintf(stderr,
@@ -774,16 +784,235 @@ static void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Computed CWT features for %d training sequences\n",
           total_sequences);
 
-  // Initialize and train HMM
+  // Initialize HMM model
   HMMModel model;
   hmm_init(&model, g_num_wavelet_scales);
 
-  fprintf(stderr, "Training HMM using Baum-Welch algorithm...\n");
-  if (!hmm_train_baum_welch(&model, observations, seq_lengths, total_sequences,
-                            100, 0.01)) {
-    fprintf(stderr, "Training failed\n");
-    exit(1);
+  fprintf(stderr, "Starting supervised training with two passes...\n");
+
+  // =========================================================================
+  // PASS 1: Calculate global statistics for Z-score normalization
+  // =========================================================================
+  fprintf(stderr, "Pass 1: Computing global feature statistics...\n");
+
+  double sum[MAX_NUM_WAVELETS] = {0};
+  double sum_sq[MAX_NUM_WAVELETS] = {0};
+  long long total_count = 0;
+
+  for (int seq_idx = 0; seq_idx < total_sequences; seq_idx++) {
+    if (!observations[seq_idx] || seq_lengths[seq_idx] == 0) {
+      continue;
+    }
+
+    int seq_len = seq_lengths[seq_idx];
+    for (int t = 0; t < seq_len; t++) {
+      for (int f = 0; f < g_num_wavelet_scales; f++) {
+        double val = observations[seq_idx][t][f];
+        sum[f] += val;
+        sum_sq[f] += val * val;
+      }
+      total_count++;
+    }
   }
+
+  // Calculate mean and standard deviation
+  for (int f = 0; f < g_num_wavelet_scales; f++) {
+    model.global_feature_mean[f] = sum[f] / total_count;
+    double variance = (sum_sq[f] / total_count) - 
+                      (model.global_feature_mean[f] * model.global_feature_mean[f]);
+    model.global_feature_stddev[f] = sqrt(variance > 1e-10 ? variance : 1e-10);
+  }
+
+  fprintf(stderr, "Global statistics computed from %lld observations\n", total_count);
+
+  // =========================================================================
+  // PASS 2: Supervised parameter estimation using GFF annotations
+  // =========================================================================
+  fprintf(stderr, "Pass 2: Learning HMM parameters from annotations...\n");
+
+  // Initialize accumulators
+  long long transition_counts[NUM_STATES][NUM_STATES] = {{0}};
+  double emission_sum[NUM_STATES][MAX_NUM_WAVELETS] = {{0}};
+  double emission_sum_sq[NUM_STATES][MAX_NUM_WAVELETS] = {{0}};
+  long long state_observation_counts[NUM_STATES] = {0};
+  long long initial_counts[NUM_STATES] = {0};
+
+  // Process each sequence to accumulate statistics
+  for (int seq_idx = 0; seq_idx < genome->count; seq_idx++) {
+    const char* seq_id = genome->records[seq_idx].id;
+    int seq_len = strlen(genome->records[seq_idx].sequence);
+
+    // Process both forward and reverse strand
+    for (int strand_idx = 0; strand_idx < 2; strand_idx++) {
+      int obs_idx = seq_idx * 2 + strand_idx;
+      
+      if (!observations[obs_idx] || seq_lengths[obs_idx] == 0) {
+        continue;
+      }
+
+      // Create state labels array for this sequence
+      int* state_labels = (int*)malloc(seq_len * sizeof(int));
+      if (!state_labels) {
+        fprintf(stderr, "Warning: Failed to allocate state labels for %s\n", seq_id);
+        continue;
+      }
+
+      // Initialize all positions as intergenic
+      for (int i = 0; i < seq_len; i++) {
+        state_labels[i] = STATE_INTERGENIC;
+      }
+
+      // Label positions based on GFF annotations
+      char strand_char = (strand_idx == 0) ? '+' : '-';
+      
+      // Find CDS groups for this sequence/strand
+      for (int g = 0; g < group_count; g++) {
+        if (groups[g].exon_count == 0)
+          continue;
+        
+        // Check if this group belongs to the current sequence
+        if (strcmp(groups[g].exons[0].seqid, seq_id) != 0)
+          continue;
+        
+        // Check if strand matches
+        if (groups[g].exons[0].strand != strand_char)
+          continue;
+
+        // Sort exons by start position
+        for (int i = 0; i < groups[g].exon_count - 1; i++) {
+          for (int j = i + 1; j < groups[g].exon_count; j++) {
+            if (groups[g].exons[j].start < groups[g].exons[i].start) {
+              Exon temp = groups[g].exons[i];
+              groups[g].exons[i] = groups[g].exons[j];
+              groups[g].exons[j] = temp;
+            }
+          }
+        }
+
+        // Label exons and introns
+        for (int e = 0; e < groups[g].exon_count; e++) {
+          int start = groups[g].exons[e].start - 1;  // Convert to 0-based
+          int end = groups[g].exons[e].end;          // Inclusive, 1-based -> exclusive 0-based
+          int phase = groups[g].exons[e].phase;
+
+          // Label exon positions with appropriate frame
+          for (int pos = start; pos < end && pos < seq_len; pos++) {
+            int offset_in_exon = pos - start;
+            int reading_frame = (phase + offset_in_exon) % 3;
+            
+            if (reading_frame == 0) {
+              state_labels[pos] = STATE_EXON_F0;
+            } else if (reading_frame == 1) {
+              state_labels[pos] = STATE_EXON_F1;
+            } else {
+              state_labels[pos] = STATE_EXON_F2;
+            }
+          }
+
+          // Label intron between this exon and the next
+          if (e < groups[g].exon_count - 1) {
+            int intron_start = end;
+            int intron_end = groups[g].exons[e + 1].start - 1;
+            for (int pos = intron_start; pos < intron_end && pos < seq_len; pos++) {
+              state_labels[pos] = STATE_INTRON;
+            }
+          }
+        }
+      }
+
+      // Accumulate transition counts and emission statistics
+      for (int t = 0; t < seq_len; t++) {
+        int state = state_labels[t];
+        
+        // Count initial state
+        if (t == 0) {
+          initial_counts[state]++;
+        }
+
+        // Count transitions
+        if (t < seq_len - 1) {
+          int next_state = state_labels[t + 1];
+          transition_counts[state][next_state]++;
+        }
+
+        // Apply Z-score normalization and accumulate emission statistics
+        for (int f = 0; f < g_num_wavelet_scales; f++) {
+          double raw_val = observations[obs_idx][t][f];
+          double normalized_val = (raw_val - model.global_feature_mean[f]) / 
+                                  model.global_feature_stddev[f];
+          
+          emission_sum[state][f] += normalized_val;
+          emission_sum_sq[state][f] += normalized_val * normalized_val;
+        }
+        state_observation_counts[state]++;
+      }
+
+      free(state_labels);
+    }
+  }
+
+  fprintf(stderr, "Finalizing HMM parameters...\n");
+
+  // Finalize initial probabilities
+  long long total_initial = 0;
+  for (int i = 0; i < NUM_STATES; i++) {
+    total_initial += initial_counts[i];
+  }
+  for (int i = 0; i < NUM_STATES; i++) {
+    if (total_initial > 0) {
+      model.initial[i] = (double)initial_counts[i] / total_initial;
+    } else {
+      model.initial[i] = 1.0 / NUM_STATES;
+    }
+    // Ensure minimum probability
+    if (model.initial[i] < 1e-10) {
+      model.initial[i] = 1e-10;
+    }
+  }
+
+  // Finalize transition probabilities
+  for (int i = 0; i < NUM_STATES; i++) {
+    long long row_sum = 0;
+    for (int j = 0; j < NUM_STATES; j++) {
+      row_sum += transition_counts[i][j];
+    }
+    
+    for (int j = 0; j < NUM_STATES; j++) {
+      if (row_sum > 0) {
+        model.transition[i][j] = (double)transition_counts[i][j] / row_sum;
+      } else {
+        model.transition[i][j] = 1.0 / NUM_STATES;
+      }
+      // Ensure minimum probability
+      if (model.transition[i][j] < 1e-10) {
+        model.transition[i][j] = 1e-10;
+      }
+    }
+  }
+
+  // Finalize emission parameters (mean and variance)
+  for (int i = 0; i < NUM_STATES; i++) {
+    model.emission[i].num_features = g_num_wavelet_scales;
+    
+    for (int f = 0; f < g_num_wavelet_scales; f++) {
+      if (state_observation_counts[i] > 0) {
+        double mean = emission_sum[i][f] / state_observation_counts[i];
+        double mean_sq = emission_sum_sq[i][f] / state_observation_counts[i];
+        double variance = mean_sq - mean * mean;
+        
+        model.emission[i].mean[f] = mean;
+        model.emission[i].variance[f] = (variance > 1e-6) ? variance : 1e-6;
+      } else {
+        // No observations for this state, use defaults
+        model.emission[i].mean[f] = 0.0;
+        model.emission[i].variance[f] = 1.0;
+      }
+    }
+    
+    fprintf(stderr, "State %d: %lld observations\n", i, state_observation_counts[i]);
+  }
+
+  fprintf(stderr, "Supervised training complete.\n");
 
   // Save model
   if (!hmm_save_model(&model, "sunfish.model")) {
