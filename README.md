@@ -41,7 +41,7 @@ This is an advanced version of the Sunfish gene annotation tool that uses a Cont
 Build the HMM-based tool:
 
 ```bash
-make sunfish_hmm
+make sunfish
 ```
 
 Build both versions (original + HMM):
@@ -52,22 +52,33 @@ make all
 
 ## Usage
 
+### Help
+
+```bash
+./bin/sunfish --help
+```
+
+Displays available commands, options, and examples.
+
+By default, both `train` and `predict` automatically use all available CPU cores. Use `--threads N` (or `-t N`) to limit execution to a specific number of worker threads.
+
 ### Training
 
 Train the HMM using annotated sequences:
 
 ```bash
-./bin/sunfish_hmm train <train.fasta> <train.gff> [--wavelet-scales S1,S2,...]
+./bin/sunfish train <train.fasta> <train.gff> [--wavelet-scales S1,S2,...] [--threads N]
 ```
 
 **Arguments:**
 - `train.fasta`: Training genome sequences in FASTA format
 - `train.gff`: Gene annotations in GFF3 format
 - `--wavelet-scales`: Comma-separated list of wavelet scales (default: 10.0,20.0,30.0,40.0,50.0)
+- `--threads`: Number of worker threads to use (default: auto-detected CPU count)
 
 **Example:**
 ```bash
-./bin/sunfish_hmm train reference.fasta reference.gff --wavelet-scales 10.0,20.0,30.0,40.0,50.0
+./bin/sunfish train reference.fasta reference.gff --wavelet-scales 10.0,20.0,30.0,40.0,50.0 --threads 32
 ```
 
 This creates `sunfish.hmm.model` containing the trained HMM parameters.
@@ -79,17 +90,17 @@ learns features on the positive and negative strands simultaneously.
 Predict genes in unannotated sequences:
 
 ```bash
-./bin/sunfish_hmm predict <target.fasta> [--wavelet-scales S1,S2,...] [--threads N]
+./bin/sunfish predict <target.fasta> [--wavelet-scales S1,S2,...] [--threads N]
 ```
 
 **Arguments:**
 - `target.fasta`: Target genome sequences in FASTA format
 - `--wavelet-scales`: Wavelet scales (must match training)
-- `--threads`: Number of parallel threads (default: 4)
+- `--threads`: Number of parallel threads (default: auto-detected CPU count)
 
 **Example:**
 ```bash
-./bin/sunfish_hmm predict genome.fasta --wavelet-scales 10.0,20.0,30.0,40.0,50.0 --threads 8 > predictions.gff3
+./bin/sunfish predict genome.fasta --wavelet-scales 10.0,20.0,30.0,40.0,50.0 --threads 8 > predictions.gff3
 ```
 
 Prediction automatically evaluates both strands and reports strand-specific
@@ -169,7 +180,7 @@ The original `sunfish` tool uses:
 - Single-threaded processing
 - Statistical validation (P_stat ≥ P_theory)
 
-The new `sunfish_hmm` tool uses:
+The new `sunfish` tool uses:
 - Hidden Markov Model with continuous emissions
 - CWT-based features from raw DNA
 - Multi-threaded parallel processing

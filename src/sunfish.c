@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
@@ -38,6 +39,47 @@ typedef struct {
 static output_queue_t g_output_queue;
 static pthread_mutex_t g_gene_counter_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_gene_counter = 0;
+
+static int parse_threads_value(const char* arg) {
+  if (arg == NULL)
+    return -1;
+
+  char* endptr = NULL;
+  errno = 0;
+  long value = strtol(arg, &endptr, 10);
+
+  if (errno != 0 || endptr == arg || *endptr != '\0')
+    return -1;
+
+  if (value < 1 || value > INT_MAX)
+    return -1;
+
+  return (int)value;
+}
+
+static int detect_hardware_threads(void) {
+  long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+  if (nprocs < 1)
+    nprocs = 1;
+  if (nprocs > INT_MAX)
+    nprocs = INT_MAX;
+  return (int)nprocs;
+}
+
+static void ensure_thread_count(const char* mode, bool threads_specified) {
+  bool auto_detected = false;
+  if (g_num_threads <= 0) {
+    g_num_threads = detect_hardware_threads();
+    auto_detected = true;
+  }
+
+  const char* source = auto_detected
+                           ? "auto-detected"
+                           : (threads_specified ? "user-specified" : "default");
+
+  fprintf(stderr, "Using %d threads for %s (%s)\n", g_num_threads, mode,
+          source);
+}
 
 static const char* get_field_ptr(const char* line, int field_index) {
   if (!line || field_index <= 0)
@@ -291,6 +333,70 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
 
 // Task structure for parallel processing
 typedef struct {
+  const char* sequence;
+  const char* seq_id;
+  int seq_len;
+  int array_index;
+  char strand;
+  double*** observations_array;
+  int* seq_lengths_array;
+  pthread_mutex_t* error_mutex;
+  bool* error_flag;
+  char* error_message;
+  size_t error_message_size;
+  int sequence_number;
+} training_task_t;
+
+static void training_observation_worker(void* arg) {
+  training_task_t* task = (training_task_t*)arg;
+  if (task == NULL)
+    return;
+
+  const char* sequence = task->sequence;
+  char* rc = NULL;
+  double** result = NULL;
+  bool success = false;
+
+  if (task->strand == '-') {
+    rc = reverse_complement(sequence);
+    if (!rc)
+      goto cleanup;
+    sequence = rc;
+  }
+
+  if (!build_observation_matrix(sequence, task->seq_len, &result))
+    goto cleanup;
+
+  task->observations_array[task->array_index] = result;
+  task->seq_lengths_array[task->array_index] = task->seq_len;
+  success = true;
+
+cleanup:
+  if (!success) {
+    if (result)
+      free_observation_sequence(result, task->seq_len);
+
+    pthread_mutex_lock(task->error_mutex);
+    if (!*(task->error_flag)) {
+      *(task->error_flag) = true;
+      snprintf(task->error_message, task->error_message_size,
+               "Failed to compute CWT features for sequence %s (%c strand, "
+               "index %d)",
+               task->seq_id ? task->seq_id : "(unknown)", task->strand,
+               task->sequence_number);
+    }
+    pthread_mutex_unlock(task->error_mutex);
+  }
+
+  if (rc)
+    free(rc);
+  if (!success && task->observations_array[task->array_index] == NULL)
+    task->seq_lengths_array[task->array_index] = 0;
+
+  free(task);
+}
+
+typedef struct {
   char* sequence;
   char* seq_id;
   char strand;
@@ -416,11 +522,32 @@ cleanup:
 }
 
 // Training mode: Baum-Welch HMM training
+static void print_help(const char* progname) {
+  printf("Sunfish HMM-based Gene Annotation Tool\n\n");
+  printf("Usage:\n");
+  printf("  %s <command> [options]\n\n", progname);
+  printf("Commands:\n");
+  printf("  help                         Show this help message\n"
+         "  train <train.fasta> <train.gff> [--wavelet-scales|-w S1,S2,...]"
+         " [--threads|-t N]\n"
+         "  predict <target.fasta> [--wavelet-scales|-w S1,S2,...]"
+         " [--threads|-t N]\n\n");
+  printf("Options:\n");
+  printf("  -h, --help                   Show this help message\n");
+  printf(
+      "  --wavelet-scales, -w        Comma-separated list of wavelet scales\n"
+      "  --threads, -t N             Number of worker threads (default: auto-"
+      "detected)\n\n");
+  printf("Examples:\n");
+  printf("  %s train data.fa data.gff --wavelet-scales 3,9,81\n", progname);
+  printf("  %s predict genome.fa --threads 8 > predictions.gff3\n\n", progname);
+}
+
 static void handle_train(int argc, char* argv[]) {
   if (argc < 4) {
     fprintf(stderr,
             "Usage: %s train <train.fasta> <train.gff> [--wavelet-scales|-w "
-            "S1,S2,...]\n",
+            "S1,S2,...] [--threads|-t N]\n",
             argv[0]);
     exit(1);
   }
@@ -429,15 +556,34 @@ static void handle_train(int argc, char* argv[]) {
   const char* gff_path = argv[3];
 
   // Parse optional arguments
+  bool threads_specified = false;
   for (int i = 4; i < argc; i++) {
     if ((strcmp(argv[i], "--wavelet-scales") == 0 ||
-         strcmp(argv[i], "-w") == 0) &&
-        i + 1 < argc) {
+         strcmp(argv[i], "-w") == 0)) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Error: %s requires an argument\n", argv[i]);
+        exit(1);
+      }
       g_num_wavelet_scales =
           parse_wavelet_scales(argv[++i], g_wavelet_scales, MAX_NUM_WAVELETS);
       fprintf(stderr, "Using %d wavelet scales\n", g_num_wavelet_scales);
+    } else if ((strcmp(argv[i], "--threads") == 0 ||
+                strcmp(argv[i], "-t") == 0)) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Error: %s requires a positive integer\n", argv[i]);
+        exit(1);
+      }
+      int parsed_threads = parse_threads_value(argv[++i]);
+      if (parsed_threads < 0) {
+        fprintf(stderr, "Error: Invalid thread count '%s'\n", argv[i]);
+        exit(1);
+      }
+      g_num_threads = parsed_threads;
+      threads_specified = true;
     }
   }
+
+  ensure_thread_count("training", threads_specified);
 
   // Load training data
   FastaData* genome = parse_fasta(fasta_path);
@@ -457,9 +603,7 @@ static void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Loaded %d CDS groups\n", group_count);
 
   // Extract observation sequences from CDS regions
-  // For simplicity, we'll just compute CWT features for all sequences
-  fprintf(stderr, "Computing CWT features for training sequences...\n");
-
+  // For simplicity, we'll compute CWT features for all sequences in parallel
   int total_sequences = genome->count * 2;
   double*** observations =
       (double***)malloc(total_sequences * sizeof(double**));
@@ -474,43 +618,161 @@ static void handle_train(int argc, char* argv[]) {
     exit(1);
   }
 
+  for (int i = 0; i < total_sequences; i++) {
+    observations[i] = NULL;
+    seq_lengths[i] = 0;
+  }
+
   fprintf(stderr,
           "Augmenting training data with reverse complements (%d total "
           "sequences)\n",
           total_sequences);
+  fprintf(stderr,
+          "Computing CWT features for training sequences using up to %d "
+          "threads...\n",
+          g_num_threads);
 
-  for (int i = 0; i < genome->count; i++) {
+  thread_pool_t* pool = thread_pool_create(g_num_threads);
+  if (pool == NULL) {
+    fprintf(stderr, "Failed to create thread pool for training\n");
+    free(observations);
+    free(seq_lengths);
+    free_cds_groups(groups, group_count);
+    free_fasta_data(genome);
+    exit(1);
+  }
+
+  pthread_mutex_t error_mutex;
+  if (pthread_mutex_init(&error_mutex, NULL) != 0) {
+    fprintf(stderr, "Failed to initialize training mutex\n");
+    thread_pool_destroy(pool);
+    free(observations);
+    free(seq_lengths);
+    free_cds_groups(groups, group_count);
+    free_fasta_data(genome);
+    exit(1);
+  }
+
+  bool worker_error = false;
+  char error_message[256] = {0};
+  bool scheduling_failed = false;
+
+  for (int i = 0; i < genome->count && !scheduling_failed; i++) {
     const char* seq = genome->records[i].sequence;
+    const char* seq_id = genome->records[i].id;
     int seq_len = strlen(seq);
     int forward_idx = i * 2;
     int reverse_idx = forward_idx + 1;
 
-    if (!build_observation_matrix(seq, seq_len, &observations[forward_idx])) {
-      fprintf(stderr,
-              "Failed to compute CWT features for sequence %d (+ strand)\n", i);
-      exit(1);
+    training_task_t* forward_task =
+        (training_task_t*)malloc(sizeof(training_task_t));
+    if (!forward_task) {
+      pthread_mutex_lock(&error_mutex);
+      if (!worker_error) {
+        worker_error = true;
+        snprintf(error_message, sizeof(error_message),
+                 "Failed to allocate training task for %s (+ strand)",
+                 seq_id ? seq_id : "(unknown)");
+      }
+      pthread_mutex_unlock(&error_mutex);
+      scheduling_failed = true;
+      break;
     }
-    seq_lengths[forward_idx] = seq_len;
 
-    char* rc = reverse_complement(seq);
-    if (!rc) {
-      fprintf(stderr, "Failed to allocate reverse complement for sequence %d\n",
-              i);
-      exit(1);
+    forward_task->sequence = seq;
+    forward_task->seq_id = seq_id;
+    forward_task->seq_len = seq_len;
+    forward_task->array_index = forward_idx;
+    forward_task->strand = '+';
+    forward_task->observations_array = observations;
+    forward_task->seq_lengths_array = seq_lengths;
+    forward_task->error_mutex = &error_mutex;
+    forward_task->error_flag = &worker_error;
+    forward_task->error_message = error_message;
+    forward_task->error_message_size = sizeof(error_message);
+    forward_task->sequence_number = i + 1;
+
+    if (!thread_pool_add_task(pool, training_observation_worker,
+                              forward_task)) {
+      pthread_mutex_lock(&error_mutex);
+      if (!worker_error) {
+        worker_error = true;
+        snprintf(error_message, sizeof(error_message),
+                 "Failed to enqueue training task for %s (+ strand)",
+                 seq_id ? seq_id : "(unknown)");
+      }
+      pthread_mutex_unlock(&error_mutex);
+      free(forward_task);
+      scheduling_failed = true;
+      break;
     }
 
-    if (!build_observation_matrix(rc, seq_len, &observations[reverse_idx])) {
-      fprintf(stderr,
-              "Failed to compute CWT features for sequence %d (- strand)\n", i);
-      free(rc);
-      exit(1);
+    training_task_t* reverse_task =
+        (training_task_t*)malloc(sizeof(training_task_t));
+    if (!reverse_task) {
+      pthread_mutex_lock(&error_mutex);
+      if (!worker_error) {
+        worker_error = true;
+        snprintf(error_message, sizeof(error_message),
+                 "Failed to allocate training task for %s (- strand)",
+                 seq_id ? seq_id : "(unknown)");
+      }
+      pthread_mutex_unlock(&error_mutex);
+      scheduling_failed = true;
+      break;
     }
-    seq_lengths[reverse_idx] = seq_len;
-    free(rc);
 
-    fprintf(stderr, "Processed sequence %d/%d (+/-)\r", i + 1, genome->count);
+    reverse_task->sequence = seq;
+    reverse_task->seq_id = seq_id;
+    reverse_task->seq_len = seq_len;
+    reverse_task->array_index = reverse_idx;
+    reverse_task->strand = '-';
+    reverse_task->observations_array = observations;
+    reverse_task->seq_lengths_array = seq_lengths;
+    reverse_task->error_mutex = &error_mutex;
+    reverse_task->error_flag = &worker_error;
+    reverse_task->error_message = error_message;
+    reverse_task->error_message_size = sizeof(error_message);
+    reverse_task->sequence_number = i + 1;
+
+    if (!thread_pool_add_task(pool, training_observation_worker,
+                              reverse_task)) {
+      pthread_mutex_lock(&error_mutex);
+      if (!worker_error) {
+        worker_error = true;
+        snprintf(error_message, sizeof(error_message),
+                 "Failed to enqueue training task for %s (- strand)",
+                 seq_id ? seq_id : "(unknown)");
+      }
+      pthread_mutex_unlock(&error_mutex);
+      free(reverse_task);
+      scheduling_failed = true;
+      break;
+    }
   }
-  fprintf(stderr, "\n");
+
+  thread_pool_wait(pool);
+  thread_pool_destroy(pool);
+  pthread_mutex_destroy(&error_mutex);
+
+  if (worker_error || scheduling_failed) {
+    fprintf(stderr, "%s\n",
+            error_message[0] ? error_message
+                             : "Failed to prepare training observations");
+    for (int i = 0; i < total_sequences; i++) {
+      if (observations[i]) {
+        free_observation_sequence(observations[i], seq_lengths[i]);
+      }
+    }
+    free(observations);
+    free(seq_lengths);
+    free_cds_groups(groups, group_count);
+    free_fasta_data(genome);
+    exit(1);
+  }
+
+  fprintf(stderr, "Computed CWT features for %d training sequences\n",
+          total_sequences);
 
   // Initialize and train HMM
   HMMModel model;
@@ -548,28 +810,41 @@ static void handle_predict(int argc, char* argv[]) {
   if (argc < 3) {
     fprintf(stderr,
             "Usage: %s predict <target.fasta> [--wavelet-scales|-w S1,S2,...] "
-            "[--threads N]\n",
+            "[--threads|-t N]\n",
             argv[0]);
     exit(1);
   }
 
   const char* fasta_path = argv[2];
 
-  // Parse optional arguments
+  bool threads_specified = false;
   for (int i = 3; i < argc; i++) {
     if ((strcmp(argv[i], "--wavelet-scales") == 0 ||
-         strcmp(argv[i], "-w") == 0) &&
-        i + 1 < argc) {
+         strcmp(argv[i], "-w") == 0)) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Error: %s requires an argument\n", argv[i]);
+        exit(1);
+      }
       g_num_wavelet_scales =
           parse_wavelet_scales(argv[++i], g_wavelet_scales, MAX_NUM_WAVELETS);
       fprintf(stderr, "Using %d wavelet scales\n", g_num_wavelet_scales);
-    } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-      g_num_threads = atoi(argv[++i]);
-      if (g_num_threads < 1)
-        g_num_threads = 1;
-      fprintf(stderr, "Using %d threads\n", g_num_threads);
+    } else if ((strcmp(argv[i], "--threads") == 0 ||
+                strcmp(argv[i], "-t") == 0)) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Error: %s requires a positive integer\n", argv[i]);
+        exit(1);
+      }
+      int parsed_threads = parse_threads_value(argv[++i]);
+      if (parsed_threads < 0) {
+        fprintf(stderr, "Error: Invalid thread count '%s'\n", argv[i]);
+        exit(1);
+      }
+      g_num_threads = parsed_threads;
+      threads_specified = true;
     }
   }
+
+  ensure_thread_count("prediction", threads_specified);
 
   // Load HMM model
   HMMModel model;
@@ -582,16 +857,6 @@ static void handle_predict(int argc, char* argv[]) {
   // Initialize output queue
   output_queue_init(&g_output_queue);
   g_gene_counter = 0;
-
-  // If threads not set explicitly, use number of online processors
-  if (g_num_threads <= 0) {
-    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nprocs > 0)
-      g_num_threads = (int)nprocs;
-    else
-      g_num_threads = 1; // fallback
-    fprintf(stderr, "Using %d threads (auto-detected)\n", g_num_threads);
-  }
 
   // Create thread pool
   thread_pool_t* pool = thread_pool_create(g_num_threads);
@@ -696,17 +961,14 @@ int main(int argc, char* argv[]) {
   setvbuf(stderr, NULL, _IONBF, 0);
 
   if (argc < 2) {
-    fprintf(stderr, "Sunfish HMM-based Gene Annotation Tool\n");
-    fprintf(stderr, "Usage:\n");
-    fprintf(
-        stderr,
-        "  %s train <train.fasta> <train.gff> [--wavelet-scales S1,S2,...]\n",
-        argv[0]);
-    fprintf(stderr,
-            "  %s predict <target.fasta> [--wavelet-scales S1,S2,...] "
-            "[--threads N]\n",
-            argv[0]);
-    return 1;
+    print_help(argv[0]);
+    return 0;
+  }
+
+  if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
+      strcmp(argv[1], "-h") == 0) {
+    print_help(argv[0]);
+    return 0;
   }
 
   if (strcmp(argv[1], "train") == 0) {
@@ -715,7 +977,8 @@ int main(int argc, char* argv[]) {
     handle_predict(argc, argv);
   } else {
     fprintf(stderr, "Error: Unknown mode '%s'\n", argv[1]);
-    fprintf(stderr, "Valid modes: train, predict\n");
+    fprintf(stderr, "Valid commands: help, train, predict\n");
+    print_help(argv[0]);
     return 1;
   }
 
