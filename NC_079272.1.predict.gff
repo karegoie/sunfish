@@ -1,7 +1,0 @@
-##gff-version 3
-NC_079272.1	sunfish	gene	46753	47805	.	-	.	ID=gene1
-NC_079272.1	sunfish	mRNA	46753	47805	.	-	.	ID=mRNA1;Parent=gene1
-NC_079272.1	sunfish	CDS	46753	47805	.	-	0	ID=cds1;Parent=mRNA1
-NC_079272.1	sunfish	gene	116989	118002	.	+	.	ID=gene2
-NC_079272.1	sunfish	mRNA	116989	118002	.	+	.	ID=mRNA2;Parent=gene2
-NC_079272.1	sunfish	CDS	116989	118002	.	+	0	ID=cds2;Parent=mRNA2
