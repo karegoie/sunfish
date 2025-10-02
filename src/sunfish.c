@@ -270,11 +270,13 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
   if (seq_len <= 0)
     return false;
 
-  double** features = (double**)malloc(g_num_wavelet_scales * sizeof(double*));
+  // Allocate features for g_num_wavelet_scales * 2 (real + imaginary parts)
+  int num_feature_rows = g_num_wavelet_scales * 2;
+  double** features = (double**)malloc(num_feature_rows * sizeof(double*));
   if (!features)
     return false;
 
-  for (int s = 0; s < g_num_wavelet_scales; s++) {
+  for (int s = 0; s < num_feature_rows; s++) {
     features[s] = (double*)malloc(seq_len * sizeof(double));
     if (!features[s]) {
       for (int j = 0; j < s; j++) {
@@ -287,7 +289,7 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
 
   if (!compute_cwt_features(sequence, seq_len, g_wavelet_scales,
                             g_num_wavelet_scales, features)) {
-    for (int s = 0; s < g_num_wavelet_scales; s++) {
+    for (int s = 0; s < num_feature_rows; s++) {
       free(features[s]);
     }
     free(features);
@@ -296,7 +298,7 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
 
   double** observations = (double**)malloc(seq_len * sizeof(double*));
   if (!observations) {
-    for (int s = 0; s < g_num_wavelet_scales; s++) {
+    for (int s = 0; s < num_feature_rows; s++) {
       free(features[s]);
     }
     free(features);
@@ -304,25 +306,25 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
   }
 
   for (int t = 0; t < seq_len; t++) {
-    observations[t] = (double*)malloc(g_num_wavelet_scales * sizeof(double));
+    observations[t] = (double*)malloc(num_feature_rows * sizeof(double));
     if (!observations[t]) {
       for (int u = 0; u < t; u++) {
         free(observations[u]);
       }
       free(observations);
-      for (int s = 0; s < g_num_wavelet_scales; s++) {
+      for (int s = 0; s < num_feature_rows; s++) {
         free(features[s]);
       }
       free(features);
       return false;
     }
 
-    for (int f = 0; f < g_num_wavelet_scales; f++) {
+    for (int f = 0; f < num_feature_rows; f++) {
       observations[t][f] = features[f][t];
     }
   }
 
-  for (int s = 0; s < g_num_wavelet_scales; s++) {
+  for (int s = 0; s < num_feature_rows; s++) {
     free(features[s]);
   }
   free(features);
@@ -1331,7 +1333,7 @@ static void handle_train(int argc, char* argv[]) {
 
   // Initialize HMM model
   HMMModel model;
-  hmm_init(&model, g_num_wavelet_scales);
+  hmm_init(&model, g_num_wavelet_scales * 2);
 
   fprintf(stderr, "Starting supervised training with two passes...\n");
 
@@ -1344,6 +1346,8 @@ static void handle_train(int argc, char* argv[]) {
   double sum_sq[MAX_NUM_WAVELETS] = {0};
   long long total_count = 0;
 
+  int num_features = g_num_wavelet_scales * 2;
+
   for (int seq_idx = 0; seq_idx < total_sequences; seq_idx++) {
     if (!observations[seq_idx] || seq_lengths[seq_idx] == 0) {
       continue;
@@ -1351,7 +1355,7 @@ static void handle_train(int argc, char* argv[]) {
 
     int seq_len = seq_lengths[seq_idx];
     for (int t = 0; t < seq_len; t++) {
-      for (int f = 0; f < g_num_wavelet_scales; f++) {
+      for (int f = 0; f < num_features; f++) {
         double val = observations[seq_idx][t][f];
         sum[f] += val;
         sum_sq[f] += val * val;
@@ -1361,7 +1365,7 @@ static void handle_train(int argc, char* argv[]) {
   }
 
   // Calculate mean and standard deviation
-  for (int f = 0; f < g_num_wavelet_scales; f++) {
+  for (int f = 0; f < num_features; f++) {
     model.global_feature_mean[f] = sum[f] / total_count;
     double variance =
         (sum_sq[f] / total_count) -
@@ -1411,6 +1415,11 @@ static void handle_train(int argc, char* argv[]) {
         seq_lengths[forward_obs_idx] > 0) {
       initialize_state_labels(state_labels, seq_len);
       label_forward_states(groups, group_count, seq_id, seq_len, state_labels);
+      printf("DEBUG FWD LABELS for %s:\n", seq_id);
+      for (int k = 0; k < seq_len; k++) {
+        printf("%d", state_labels[k]);
+      }
+      printf("\n");
       accumulate_statistics_for_sequence(
           &model, observations, seq_lengths, forward_obs_idx, seq_len,
           state_labels, transition_counts, emission_sum, emission_sum_sq,
@@ -1421,6 +1430,11 @@ static void handle_train(int argc, char* argv[]) {
         seq_lengths[reverse_obs_idx] > 0) {
       initialize_state_labels(state_labels, seq_len);
       label_reverse_states(groups, group_count, seq_id, seq_len, state_labels);
+      printf("DEBUG REV LABELS for %s:\n", seq_id);
+      for (int k = 0; k < seq_len; k++) {
+        printf("%d", state_labels[k]);
+      }
+      printf("\n");
       accumulate_statistics_for_sequence(
           &model, observations, seq_lengths, reverse_obs_idx, seq_len,
           state_labels, transition_counts, emission_sum, emission_sum_sq,
@@ -1508,7 +1522,7 @@ static void handle_train(int argc, char* argv[]) {
     fprintf(stderr, "Baum-Welch refinement failed\n");
     exit(1);
   }
-  enforce_exon_cycle_constraints(&model);
+  // enforce_exon_cycle_constraints(&model);
   fprintf(stderr, "Baum-Welch refinement complete.\n");
 
   // Save model
