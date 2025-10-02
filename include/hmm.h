@@ -27,13 +27,14 @@ typedef struct {
 typedef struct {
   // Transition probabilities: transition[i][j] = P(state_j | state_i)
   double transition[NUM_STATES][NUM_STATES];
-  
+
   // Initial state probabilities
   double initial[NUM_STATES];
-  
-  // Emission parameters for each state (multivariate Gaussian with diagonal covariance)
+
+  // Emission parameters for each state (multivariate Gaussian with diagonal
+  // covariance)
   GaussianEmission emission[NUM_STATES];
-  
+
   int num_features;
 } HMMModel;
 
@@ -58,7 +59,8 @@ double gaussian_log_pdf(const double* observation, const double* mean,
 /**
  * Train HMM using Baum-Welch algorithm.
  * @param model HMM model to train
- * @param observations Array of observation sequences (2D: [num_sequences][seq_len][num_features])
+ * @param observations Array of observation sequences (2D:
+ * [num_sequences][seq_len][num_features])
  * @param seq_lengths Length of each sequence
  * @param num_sequences Number of training sequences
  * @param max_iterations Maximum number of EM iterations
