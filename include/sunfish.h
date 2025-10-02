@@ -17,23 +17,6 @@ enum {
 
 static const double PWM_PSEUDOCOUNT = 0.1;
 
-// Learned parameter bundle (saved with the model)
-typedef struct {
-  double intron_penalty_base;
-  double intron_penalty_per_intron;
-  double intron_margin_cutoff;
-  double intron_margin_weight;
-  double intron_length_target;
-  double intron_length_weight;
-  int min_exon_nt;
-  int min_orf_nt;
-  double pstat_threshold;
-  double single_min_margin;
-  double single_max_overlap;
-  int single_window_size;
-  int single_max_per_window;
-} ModelParams;
-
 // Data Structures
 typedef struct {
   char* id;
@@ -75,23 +58,11 @@ typedef struct {
 } SplicePWM;
 
 typedef struct {
-  double coeffs[NUM_AMINO_ACIDS][NUM_AMINO_ACIDS + 1];
-  double means[NUM_AMINO_ACIDS];
-  double stds[NUM_AMINO_ACIDS];
-  int min_occ;
-  SplicePWM splice_pwm;
-  ModelParams params;
-} SunfishModel;
-
-typedef struct {
   int donor_counts[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
   int acceptor_counts[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
   int total_donor_sites;
   int total_acceptor_sites;
 } SpliceCounts;
-
-// Function declarations
-bool load_model(const char* path, SunfishModel* model);
 
 void free_fasta_data(FastaData* data);
 FastaData* parse_fasta(const char* path);
