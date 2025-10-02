@@ -2,6 +2,7 @@
 #define FFT_H
 
 #include <complex.h>
+#include <stdbool.h>
 
 // Type alias for convenience
 typedef double complex cplx;
