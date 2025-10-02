@@ -536,43 +536,52 @@ static void predict_sequence_worker(void* arg) {
   }
 
   // Handle gene extending to end of sequence
-  if (in_gene && exon_count > 0) {
-    // Get thread-safe gene counter
-    pthread_mutex_lock(&g_gene_counter_mutex);
-    gene_id = ++g_gene_counter;
-    pthread_mutex_unlock(&g_gene_counter_mutex);
-
-    // Calculate gene boundaries
-    int gene_end = temp_exons[exon_count - 1].end;
-    int output_gene_start = gene_start + 1;
-    int output_gene_end = gene_end + 1;
-    if (task->strand == '-') {
-      output_gene_start = original_length - gene_end;
-      output_gene_end = original_length - gene_start;
+  if (in_gene) {
+    // If we're still in an exon at the end, save it
+    if (in_exon && exon_count < MAX_EXONS_PER_GENE) {
+      temp_exons[exon_count].start = exon_start;
+      temp_exons[exon_count].end = seq_len - 1;
+      exon_count++;
     }
 
-    // Output gene line
-    char gff_line[1024];
-    snprintf(gff_line, sizeof(gff_line),
-             "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-             task->seq_id, output_gene_start, output_gene_end,
-             normalized_score, task->strand, gene_id);
-    output_queue_add(&g_output_queue, gff_line);
+    if (exon_count > 0) {
+      // Get thread-safe gene counter
+      pthread_mutex_lock(&g_gene_counter_mutex);
+      gene_id = ++g_gene_counter;
+      pthread_mutex_unlock(&g_gene_counter_mutex);
 
-    // Output CDS lines for each exon
-    for (int e = 0; e < exon_count; e++) {
-      int cds_start = temp_exons[e].start + 1;
-      int cds_end = temp_exons[e].end + 1;
+      // Calculate gene boundaries
+      int gene_end = temp_exons[exon_count - 1].end;
+      int output_gene_start = gene_start + 1;
+      int output_gene_end = gene_end + 1;
       if (task->strand == '-') {
-        cds_start = original_length - temp_exons[e].end;
-        cds_end = original_length - temp_exons[e].start;
+        output_gene_start = original_length - gene_end;
+        output_gene_end = original_length - gene_start;
       }
 
+      // Output gene line
+      char gff_line[1024];
       snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
-               task->seq_id, cds_start, cds_end, normalized_score,
-               task->strand, gene_id);
+               "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
+               task->seq_id, output_gene_start, output_gene_end,
+               normalized_score, task->strand, gene_id);
       output_queue_add(&g_output_queue, gff_line);
+
+      // Output CDS lines for each exon
+      for (int e = 0; e < exon_count; e++) {
+        int cds_start = temp_exons[e].start + 1;
+        int cds_end = temp_exons[e].end + 1;
+        if (task->strand == '-') {
+          cds_start = original_length - temp_exons[e].end;
+          cds_end = original_length - temp_exons[e].start;
+        }
+
+        snprintf(gff_line, sizeof(gff_line),
+                 "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t0\tParent=gene%d\n",
+                 task->seq_id, cds_start, cds_end, normalized_score,
+                 task->strand, gene_id);
+        output_queue_add(&g_output_queue, gff_line);
+      }
     }
   }
 
