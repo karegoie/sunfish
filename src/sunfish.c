@@ -29,6 +29,11 @@ static int g_kmer_feature_count = 16; // 4^2 for default k-mer size 2
 static int g_total_feature_count =
     32; // 16 wavelet + 16 k-mer features by default
 
+// Chunk-based training configuration
+static int g_chunk_size = 50000;    // Default chunk size: 50kb
+static int g_chunk_overlap = 5000;  // Default overlap: 5kb
+static bool g_use_chunking = true;  // Enable chunking by default
+
 // Thread-safe output queue
 typedef struct output_node_t {
   char* gff_line;
@@ -501,6 +506,10 @@ typedef struct {
   char* error_message;
   size_t error_message_size;
   int sequence_number;
+  // Chunk-specific fields
+  int chunk_start;  // Start position in original sequence
+  int chunk_end;    // End position in original sequence
+  bool is_chunk;    // Whether this is a chunk or full sequence
 } training_task_t;
 
 static void training_observation_worker(void* arg) {
@@ -510,8 +519,20 @@ static void training_observation_worker(void* arg) {
 
   const char* sequence = task->sequence;
   char* rc = NULL;
+  char* chunk_seq = NULL;
   double** result = NULL;
   bool success = false;
+
+  // Extract chunk if needed
+  int effective_len = task->seq_len;
+  if (task->is_chunk) {
+    effective_len = task->chunk_end - task->chunk_start;
+    chunk_seq = (char*)malloc((effective_len + 1) * sizeof(char));
+    if (!chunk_seq) goto cleanup;
+    memcpy(chunk_seq, sequence + task->chunk_start, effective_len);
+    chunk_seq[effective_len] = ' ';
+    sequence = chunk_seq;
+  }
 
   if (task->strand == '-') {
     rc = reverse_complement(sequence);
@@ -520,36 +541,76 @@ static void training_observation_worker(void* arg) {
     sequence = rc;
   }
 
-  if (!build_observation_matrix(sequence, task->seq_len, &result))
+  if (!build_observation_matrix(sequence, effective_len, &result))
     goto cleanup;
 
   task->observations_array[task->array_index] = result;
-  task->seq_lengths_array[task->array_index] = task->seq_len;
+  task->seq_lengths_array[task->array_index] = effective_len;
   success = true;
 
 cleanup:
   if (!success) {
     if (result)
-      free_observation_sequence(result, task->seq_len);
+      free_observation_sequence(result, effective_len);
 
     pthread_mutex_lock(task->error_mutex);
-    if (!*(task->error_flag)) {
+    if (!(*(task->error_flag))) {
       *(task->error_flag) = true;
-      snprintf(task->error_message, task->error_message_size,
-               "Failed to compute feature matrix for sequence %s (%c strand, "
-               "index %d)",
-               task->seq_id ? task->seq_id : "(unknown)", task->strand,
-               task->sequence_number);
+      if (task->is_chunk) {
+        snprintf(task->error_message, task->error_message_size,
+                 "Failed to compute feature matrix for chunk [%d-%d] of sequence %s (%c strand)",
+                 task->chunk_start, task->chunk_end,
+                 task->seq_id ? task->seq_id : "(unknown)", task->strand);
+      } else {
+        snprintf(task->error_message, task->error_message_size,
+                 "Failed to compute feature matrix for sequence %s (%c strand, "
+                 "index %d)",
+                 task->seq_id ? task->seq_id : "(unknown)", task->strand,
+                 task->sequence_number);
+      }
     }
     pthread_mutex_unlock(task->error_mutex);
   }
 
   if (rc)
     free(rc);
+  if (chunk_seq)
+    free(chunk_seq);
   if (!success && task->observations_array[task->array_index] == NULL)
     task->seq_lengths_array[task->array_index] = 0;
 
   free(task);
+}
+
+// Helper function to calculate number of chunks for a sequence
+static int calculate_num_chunks(int seq_len, int chunk_size, int overlap) {
+  if (!g_use_chunking || seq_len <= chunk_size) {
+    return 1; // No chunking needed
+  }
+  int step = chunk_size - overlap;
+  if (step <= 0) {
+    return 1; // Invalid configuration, treat as single chunk
+  }
+  return (seq_len - overlap + step - 1) / step;
+}
+
+// Helper function to get chunk boundaries
+static void get_chunk_bounds(int seq_len, int chunk_size, int overlap,
+                            int chunk_idx, int* start, int* end) {
+  if (!g_use_chunking || seq_len <= chunk_size) {
+    *start = 0;
+    *end = seq_len;
+    return;
+  }
+  
+  int step = chunk_size - overlap;
+  *start = chunk_idx * step;
+  *end = *start + chunk_size;
+  
+  // Adjust last chunk to include remainder
+  if (*end > seq_len) {
+    *end = seq_len;
+  }
 }
 
 typedef struct {
