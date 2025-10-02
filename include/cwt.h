@@ -42,7 +42,7 @@ void generate_morlet_wavelet(double scale, int length, cplx* output);
  */
 bool convolve_with_wavelet(const cplx* signal, int signal_len,
                            const cplx* wavelet, int wavelet_len,
-                           double* output);
+                           cplx* output);
 
 /**
  * Compute CWT features for a DNA sequence at multiple scales.
