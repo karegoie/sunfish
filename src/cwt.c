@@ -83,22 +83,10 @@ bool convolve_with_wavelet(const cplx* signal, int signal_len,
   // Inverse FFT
   ifft(signal_padded, padded_len);
 
-  // Extract magnitude and normalize
+  // Extract magnitude (raw, un-normalized)
   // The valid convolution result is in the first signal_len elements
-  double max_mag = 0.0;
   for (int i = 0; i < signal_len; i++) {
-    double mag = cabs(signal_padded[i]);
-    output[i] = mag;
-    if (mag > max_mag) {
-      max_mag = mag;
-    }
-  }
-
-  // Normalize by maximum magnitude (avoid division by zero)
-  if (max_mag > 1e-10) {
-    for (int i = 0; i < signal_len; i++) {
-      output[i] /= max_mag;
-    }
+    output[i] = cabs(signal_padded[i]);
   }
 
   free(signal_padded);

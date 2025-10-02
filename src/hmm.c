@@ -445,6 +445,19 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     fprintf(fp, "\n");
   }
 
+  // Save global feature statistics for Z-score normalization
+  fprintf(fp, "GLOBAL_STATS\n");
+  fprintf(fp, "MEAN ");
+  for (int i = 0; i < model->num_features; i++) {
+    fprintf(fp, "%.10f ", model->global_feature_mean[i]);
+  }
+  fprintf(fp, "\n");
+  fprintf(fp, "STDDEV ");
+  for (int i = 0; i < model->num_features; i++) {
+    fprintf(fp, "%.10f ", model->global_feature_stddev[i]);
+  }
+  fprintf(fp, "\n");
+
   fclose(fp);
   return true;
 }
@@ -564,6 +577,50 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
       }
 
       model->emission[i].num_features = model->num_features;
+    }
+  }
+
+  // Read global feature statistics (optional for backward compatibility)
+  if (fgets(line, sizeof(line), fp) != NULL &&
+      strncmp(line, "GLOBAL_STATS", 12) == 0) {
+    // Read MEAN line
+    if (fgets(line, sizeof(line), fp) != NULL) {
+      char* ptr = strstr(line, "MEAN");
+      if (ptr) {
+        ptr += 5;
+        for (int i = 0; i < model->num_features; i++) {
+          if (sscanf(ptr, "%lf", &model->global_feature_mean[i]) != 1)
+            break;
+          ptr = strchr(ptr, ' ');
+          if (ptr)
+            ptr++;
+          else
+            break;
+        }
+      }
+    }
+
+    // Read STDDEV line
+    if (fgets(line, sizeof(line), fp) != NULL) {
+      char* ptr = strstr(line, "STDDEV");
+      if (ptr) {
+        ptr += 7;
+        for (int i = 0; i < model->num_features; i++) {
+          if (sscanf(ptr, "%lf", &model->global_feature_stddev[i]) != 1)
+            break;
+          ptr = strchr(ptr, ' ');
+          if (ptr)
+            ptr++;
+          else
+            break;
+        }
+      }
+    }
+  } else {
+    // Initialize to default values if not present (backward compatibility)
+    for (int i = 0; i < model->num_features; i++) {
+      model->global_feature_mean[i] = 0.0;
+      model->global_feature_stddev[i] = 1.0;
     }
   }
 

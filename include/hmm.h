@@ -36,6 +36,10 @@ typedef struct {
   GaussianEmission emission[NUM_STATES];
 
   int num_features;
+
+  // Global feature statistics for Z-score normalization
+  double global_feature_mean[MAX_NUM_WAVELETS];
+  double global_feature_stddev[MAX_NUM_WAVELETS];
 } HMMModel;
 
 /**
