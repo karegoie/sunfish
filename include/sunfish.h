@@ -1,6 +1,8 @@
 #ifndef SUNFISH_H
 #define SUNFISH_H
 
+#include <stdbool.h>
+
 // Line and buffer sizes
 enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
 
