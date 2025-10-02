@@ -51,8 +51,7 @@ void generate_morlet_wavelet(double scale, int length, cplx* output) {
 }
 
 bool convolve_with_wavelet(const cplx* signal, int signal_len,
-                           const cplx* wavelet, int wavelet_len,
-                           cplx* output) {
+                           const cplx* wavelet, int wavelet_len, cplx* output) {
   // Find common padded length (power of 2)
   int max_len = signal_len + wavelet_len - 1;
   int padded_len = next_power_of_2(max_len);
@@ -109,10 +108,10 @@ bool compute_cwt_features(const char* sequence, int seq_len,
 
   // For each scale, generate wavelet and convolve
   for (int s = 0; s < num_scales; s++) {
-    // Wavelet length should be proportional to scale
-    int wavelet_len = (int)(10.0 * scales[s]);
-    if (wavelet_len < 10)
-      wavelet_len = 10;
+    // Wavelet length equals the given scale (no longer using 10*s)
+    int wavelet_len = (int)(scales[s]);
+    if (wavelet_len < 1)
+      wavelet_len = 1;
     if (wavelet_len > seq_len)
       wavelet_len = seq_len;
 
