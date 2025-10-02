@@ -7,18 +7,23 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 - 예측(predict): FASTA(타깃) + `sunfish.model` → GFF3(gene, mRNA, exon, CDS)
 - GFF3 출력은 `##gff-version 3` 헤더와 함께, 엑손 블록을 묶어 gene/mRNA/ exon/CDS를 생성하며, 좌표는 1-기반 포함 범위로 기록됩니다.
 
-## 특징 추출: DNA → 복소수 신호 → CWT
+## 특징 추출: Wavelet + k-mer
 1. 복소수 임베딩
    - A → 1 + i, T → 1 − i, G → −1 + i, C → −1 − i
    - 알려지지 않은 염기는 0 + 0i 로 취급
 2. Morlet 웨이블릿 생성
-   - 스케일 s마다 길이 ≈ 10·s의 커널을 생성하고 중앙 정렬
+   - 스케일 s마다 길이 ≈ s의 커널을 생성하고 중앙 정렬
 3. FFT 기반 컨볼루션
    - 신호와 웨이블릿을 제로패딩하여 FFT → 주파수영역 곱셈 → IFFT
    - 컨볼루션 지연은 wavelet_len/2 만큼 보정해 시점 정렬
-4. 특징 벡터 구성
-   - 각 스케일의 결과 복소 신호를 실수/허수부로 분해
-   - 최종 관측값 차원 D = 2 × (웨이블릿 스케일 수)
+4. k-mer 빈도 보강 (선택 사항)
+   - `-k/--kmer`로 지정한 k > 0이면 각 위치에서 길이 k 윈도를 슬라이딩
+   - 유효한 염기로 구성된 경우 해당 4ᵏ 슬롯에 원-핫(one-hot) 값을 1로 설정
+   - 염기 중 N 등 미지정 문자가 포함되면 해당 위치의 k-mer 특징은 0으로 유지
+5. 특징 벡터 구성
+   - 각 웨이블릿 스케일의 결과를 실수/허수부로 분해(스케일당 2차원)
+   - k-mer 원-핫 벡터를 뒤에 이어 붙여 최종 관측값을 구성
+   - 최종 관측값 차원 D = 2 × (웨이블릿 스케일 수) + 4ᵏ (k=0이면 0)
 
 기본 스케일은 3의 거듭제곱(3, 9, 27, …)이며, `-w/--wavelet`으로 다음 형태를 지원합니다.
 - 쉼표 목록: `a,b,c`
@@ -72,13 +77,13 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 
 ## 병렬화와 성능
 - 고정 크기 스레드 풀로 작업 분배
-  - 학습 시 CWT 특징 계산을 시퀀스별(+/−) 병렬화
+   - 학습 시 wavelet+k-mer 특징 계산을 시퀀스별(+/−) 병렬화
   - 예측 시 시퀀스·가닥 단위 병렬 Viterbi 수행
 - 스레드 수는 미지정 시 온라인 CPU 수 자동 감지(`-t/--threads`로 지정 가능)
 - 복잡도(대략)
-  - CWT: O(K·N log N) (K: 스케일 수, N: 길이)
+   - CWT: O(K·N log N) (K: 스케일 수, N: 길이)
   - HMM Forward/Backward/Viterbi: O(N·|S|²), |S|=5
-  - 메모리: 관측행렬 O(N·D), D=2K
+   - 메모리: 관측행렬 O(N·D), D=2K + 4ᵏ
 
 ## 수치 안정성과 예외 처리
 - Forward/Backward는 로그-합-지수(log-sum-exp) 사용
@@ -92,12 +97,12 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 - 방출 공분산은 대각 가정(특징 간 상관을 모델링하지 않음)
 
 ## 명령줄 옵션 요약
-- `train <train.fasta> <train.gff> [--wavelet|-w S1,S2,...|s:e:step] [--threads|-t N]`
-- `predict <target.fasta> [--wavelet|-w S1,S2,...|s:e:step] [--threads|-t N]`
-- 스케일 최대치는 `MAX_NUM_WAVELETS`(기본 100)로 제한되며, 특징 차원은 `2×스케일 수`
+- `train <train.fasta> <train.gff> [--wavelet|-w S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]`
+- `predict <target.fasta> [--wavelet|-w S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]`
+- 스케일 최대치는 `MAX_NUM_WAVELETS`(기본 100)로 제한되며, 특징 차원은 `2×스케일 수 + 4ᵏ` (k=0이면 k-mer 특징 없음)
 
 ## 파일 포맷: sunfish.model
-- 헤더와 메타: `#HMM_MODEL_V1`, `#num_features`, `#num_states`
+- 헤더와 메타: `#HMM_MODEL_V1`, `#num_features`, `#wavelet_features`, `#kmer_features`, `#kmer_size`, `#num_states`
 - INITIAL: 상태별 초기확률 1행
 - TRANSITION: 상태별 전이확률 5행
 - EMISSION: 상태별 MEAN/VARIANCE

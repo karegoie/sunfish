@@ -17,10 +17,13 @@ typedef enum {
 // Increased to support user-specified ranges up to 100 scales.
 #define MAX_NUM_WAVELETS 100
 
+// Maximum dimensionality of feature vectors (wavelet + k-mer)
+#define MAX_NUM_FEATURES 8192
+
 // Gaussian emission parameters for a single state
 typedef struct {
-  double mean[MAX_NUM_WAVELETS];
-  double variance[MAX_NUM_WAVELETS];
+  double mean[MAX_NUM_FEATURES];
+  double variance[MAX_NUM_FEATURES];
   int num_features;
 } GaussianEmission;
 
@@ -37,10 +40,13 @@ typedef struct {
   GaussianEmission emission[NUM_STATES];
 
   int num_features;
+  int wavelet_feature_count;
+  int kmer_feature_count;
+  int kmer_size;
 
   // Global feature statistics for Z-score normalization
-  double global_feature_mean[MAX_NUM_WAVELETS];
-  double global_feature_stddev[MAX_NUM_WAVELETS];
+  double global_feature_mean[MAX_NUM_FEATURES];
+  double global_feature_stddev[MAX_NUM_FEATURES];
 } HMMModel;
 
 /**

@@ -42,8 +42,8 @@ static double splice_signal_adjustment(const char* sequence, int seq_len,
   }
 
   // Empirically chosen log-scale bonuses and penalties
-  static const double kMatchBonus = 1.0986122886681098;       // log(3.0)
-  static const double kMismatchPenalty = -1.2039728043259361; // log(0.3)
+  static const double kMatchBonus = 1e-3;
+  static const double kMismatchPenalty = -1e-3;
 
   if (hmm_is_exon_state(prev_state) && curr_state == STATE_INTRON) {
     if (position + 1 >= seq_len) {
@@ -78,11 +78,14 @@ static double splice_signal_adjustment(const char* sequence, int seq_len,
 }
 
 void hmm_init(HMMModel* model, int num_features) {
-  if (num_features > MAX_NUM_WAVELETS) {
-    num_features = MAX_NUM_WAVELETS;
+  if (num_features > MAX_NUM_FEATURES) {
+    num_features = MAX_NUM_FEATURES;
   }
 
   model->num_features = num_features;
+  model->wavelet_feature_count = 0;
+  model->kmer_feature_count = 0;
+  model->kmer_size = 0;
 
   // Initialize uniform transition probabilities
   for (int i = 0; i < NUM_STATES; i++) {
@@ -111,6 +114,11 @@ void hmm_init(HMMModel* model, int num_features) {
       // Small variance
       model->emission[i].variance[j] = 0.1;
     }
+  }
+
+  for (int f = 0; f < num_features; f++) {
+    model->global_feature_mean[f] = 0.0;
+    model->global_feature_stddev[f] = 1.0;
   }
 }
 
@@ -242,8 +250,8 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
     // Accumulators for M-step
     double initial_acc[NUM_STATES] = {0};
     double transition_acc[NUM_STATES][NUM_STATES] = {{0}};
-    double emission_mean_acc[NUM_STATES][MAX_NUM_WAVELETS] = {{0}};
-    double emission_var_acc[NUM_STATES][MAX_NUM_WAVELETS] = {{0}};
+    double emission_mean_acc[NUM_STATES][MAX_NUM_FEATURES] = {{0}};
+    double emission_var_acc[NUM_STATES][MAX_NUM_FEATURES] = {{0}};
     double state_count[NUM_STATES] = {0};
 
     // E-step: compute forward-backward for all sequences
@@ -480,6 +488,9 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
 
   fprintf(fp, "#HMM_MODEL_V1\n");
   fprintf(fp, "#num_features %d\n", model->num_features);
+  fprintf(fp, "#wavelet_features %d\n", model->wavelet_feature_count);
+  fprintf(fp, "#kmer_features %d\n", model->kmer_feature_count);
+  fprintf(fp, "#kmer_size %d\n", model->kmer_size);
   fprintf(fp, "#num_states %d\n", NUM_STATES);
 
   // Save initial probabilities
@@ -545,16 +556,67 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
     return false;
   }
 
-  // Read num_features
-  if (fgets(line, sizeof(line), fp) != NULL) {
-    sscanf(line, "#num_features %d", &model->num_features);
+  model->num_features = 0;
+  model->wavelet_feature_count = 0;
+  model->kmer_feature_count = 0;
+  model->kmer_size = 0;
+
+  int tmp_num_states = NUM_STATES;
+
+  while (true) {
+    long pos = ftell(fp);
+    if (fgets(line, sizeof(line), fp) == NULL) {
+      fclose(fp);
+      return false;
+    }
+
+    if (line[0] != '#') {
+      // Rewind so the next read starts at this non-metadata line
+      fseek(fp, pos, SEEK_SET);
+      break;
+    }
+
+    if (sscanf(line, "#num_features %d", &model->num_features) == 1)
+      continue;
+    if (sscanf(line, "#wavelet_features %d", &model->wavelet_feature_count) ==
+        1)
+      continue;
+    if (sscanf(line, "#kmer_features %d", &model->kmer_feature_count) == 1)
+      continue;
+    if (sscanf(line, "#kmer_size %d", &model->kmer_size) == 1)
+      continue;
+    (void)sscanf(line, "#num_states %d", &tmp_num_states);
   }
 
-  // Skip num_states line
-  if (fgets(line, sizeof(line), fp) == NULL) {
-    fclose(fp);
-    return false;
+  if (model->num_features > MAX_NUM_FEATURES)
+    model->num_features = MAX_NUM_FEATURES;
+
+  if (model->wavelet_feature_count < 0)
+    model->wavelet_feature_count = 0;
+  if (model->kmer_feature_count < 0)
+    model->kmer_feature_count = 0;
+
+  if (model->wavelet_feature_count + model->kmer_feature_count == 0) {
+    model->wavelet_feature_count = model->num_features;
+  } else if (model->wavelet_feature_count == 0 &&
+             model->kmer_feature_count <= model->num_features) {
+    model->wavelet_feature_count =
+        model->num_features - model->kmer_feature_count;
   }
+
+  if (model->wavelet_feature_count > model->num_features)
+    model->wavelet_feature_count = model->num_features;
+
+  if (model->wavelet_feature_count + model->kmer_feature_count >
+      model->num_features) {
+    model->kmer_feature_count =
+        model->num_features - model->wavelet_feature_count;
+    if (model->kmer_feature_count < 0)
+      model->kmer_feature_count = 0;
+  }
+
+  if (model->kmer_size < 0)
+    model->kmer_size = 0;
 
   // Read initial probabilities
   if (fgets(line, sizeof(line), fp) != NULL &&
