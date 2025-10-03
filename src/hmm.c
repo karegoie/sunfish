@@ -60,6 +60,14 @@ static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
 // in this translation unit, so changing it ensures consistent behavior.
 static const double kVarianceFloor = 1e-2;
 
+// Small Dirichlet-style priors to prevent EM from driving rare/short states
+// (START/STOP codons) to zero probability. Keep priors small so they act as
+// smoothing rather than dominating learned counts.
+static const double kTransPriorDefault = 1e-3;
+static const double kTransPriorStartStop = 1e-1;
+static const double kInitialPriorDefault = 1e-3;
+static const double kInitialPriorStartStop = 1e-1;
+
 // Use GMM_COMPONENTS from header
 #ifndef GMM_COMPONENTS
 #define GMM_COMPONENTS 2
@@ -831,10 +839,22 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
       break;
     }
 
+    // Apply small Dirichlet priors to initial probabilities to prevent
+    // vanishing probabilities for short constrained states (START/STOP).
     double initial_sum = 0.0;
     for (int i = 0; i < NUM_STATES; i++) {
       initial_sum += initial_acc[i];
     }
+
+    // Add priors
+    for (int i = 0; i < NUM_STATES; i++) {
+      double prior = kInitialPriorDefault;
+      if (i == STATE_START_CODON || i == STATE_STOP_CODON)
+        prior = kInitialPriorStartStop;
+      initial_acc[i] += prior;
+      initial_sum += prior;
+    }
+
     if (initial_sum <= 0.0) {
       double uniform = 1.0 / NUM_STATES;
       for (int i = 0; i < NUM_STATES; i++) {
@@ -843,8 +863,8 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
     } else {
       for (int i = 0; i < NUM_STATES; i++) {
         model->initial[i] = initial_acc[i] / initial_sum;
-        if (model->initial[i] < 1e-10)
-          model->initial[i] = 1e-10;
+        if (model->initial[i] < 1e-12)
+          model->initial[i] = 1e-12;
       }
     }
 
@@ -853,14 +873,26 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
       for (int j = 0; j < NUM_STATES; j++) {
         trans_sum += transition_acc[i][j];
       }
+
+      // Add small transition priors. Use a larger prior when the target
+      // state is START or STOP to preserve transitions into these short
+      // states.
+      for (int j = 0; j < NUM_STATES; j++) {
+        double prior = kTransPriorDefault;
+        if (j == STATE_START_CODON || j == STATE_STOP_CODON)
+          prior = kTransPriorStartStop;
+        transition_acc[i][j] += prior;
+        trans_sum += prior;
+      }
+
       for (int j = 0; j < NUM_STATES; j++) {
         if (trans_sum > 0.0) {
           model->transition[i][j] = transition_acc[i][j] / trans_sum;
         } else {
           model->transition[i][j] = 1.0 / NUM_STATES;
         }
-        if (model->transition[i][j] < 1e-10)
-          model->transition[i][j] = 1e-10;
+        if (model->transition[i][j] < 1e-12)
+          model->transition[i][j] = 1e-12;
       }
     }
 
@@ -1417,11 +1449,12 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
   // Validate number of states matches current implementation
   if (tmp_num_states != NUM_STATES) {
-    fprintf(stderr, 
-            "Warning: Model file has %d states but current implementation expects %d states.\n",
+    fprintf(stderr,
+            "Warning: Model file has %d states but current implementation "
+            "expects %d states.\n",
             tmp_num_states, NUM_STATES);
-    fprintf(stderr, 
-            "Model loading may fail or produce incorrect results. Please retrain the model.\n");
+    fprintf(stderr, "Model loading may fail or produce incorrect results. "
+                    "Please retrain the model.\n");
   }
 
   if (model->num_features > MAX_NUM_FEATURES)
