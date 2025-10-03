@@ -1,6 +1,6 @@
-# Sunfish HMM - Advanced Gene Prediction with Wavelet + k-mer Features
+# Sunfish HMM - Advanced Gene Prediction with Wavelet Features
 
-This is an advanced version of the Sunfish gene annotation tool that uses a Continuous Density Hidden Markov Model (HMM) with Continuous Wavelet Transform (CWT) and k-mer frequency features for gene prediction.
+This is an advanced version of the Sunfish gene annotation tool that uses a Continuous Density Hidden Markov Model (HMM) with Continuous Wavelet Transform (CWT) features for gene prediction.
 
 ## New Features
 
@@ -16,27 +16,22 @@ This is an advanced version of the Sunfish gene annotation tool that uses a Cont
    - Morlet wavelet generation for multiple scales
    - Frequency-domain convolution using FFT
 
-3. **k-mer Feature Augmentation**: Adds discrete frequency signals alongside wavelets
-   - Configurable k-mer size via `--kmer/-k`
-   - One-hot positional encoding per valid k-mer window
-   - Seamlessly concatenated with CWT features during training and prediction
-
-4. **Continuous Emission HMM**: Models gene structures with continuous feature vectors
+3. **Continuous Emission HMM**: Models gene structures with continuous feature vectors
    - States: Exon_F0, Exon_F1, Exon_F2, Intron, Intergenic
    - Multivariate Gaussian emissions with diagonal covariance
    - Designed for future extension to Gaussian Mixture Models
 
-5. **Baum-Welch Training**: EM algorithm for parameter learning
+4. **Baum-Welch Training**: EM algorithm for parameter learning
    - Forward-backward algorithm for state probabilities
    - Iterative parameter re-estimation
    - Convergence monitoring
 
-6. **Parallel Prediction**: Multi-threaded Viterbi decoding
+5. **Parallel Prediction**: Multi-threaded Viterbi decoding
    - Pthread-based worker pool
    - Thread-safe output queue
    - Configurable number of threads
 
-7. **Bidirectional Strand Support**
+6. **Bidirectional Strand Support**
    - Reverse complement augmentation during training
    - Viterbi prediction on both + and - strands
    - Strand-aware coordinate conversion in GFF3 output
@@ -72,19 +67,18 @@ By default, both `train` and `predict` automatically use all available CPU cores
 Train the HMM using annotated sequences:
 
 ```bash
-./bin/sunfish train <train.fasta> <train.gff> [--wavelet S1,S2,...|s:e:step] [--kmer K] [--threads N]
+./bin/sunfish train <train.fasta> <train.gff> [--wavelet S1,S2,...|s:e:step] [--threads N]
 ```
 
 **Arguments:**
 - `train.fasta`: Training genome sequences in FASTA format
 - `train.gff`: Gene annotations in GFF3 format
 - `--wavelet`, `-w`: Comma-separated list or `start:end:step` range of Morlet scales (default: powers of 3 from 3.0 up to 6561.0)
-- `--kmer`, `-k`: k-mer size for additional frequency features (0 disables; typical values 3–5)
 - `--threads`: Number of worker threads to use (default: auto-detected CPU count)
 
 **Example:**
 ```bash
-./bin/sunfish train reference.fasta reference.gff --wavelet 3,9,27,81 --kmer 4 --threads 32
+./bin/sunfish train reference.fasta reference.gff --wavelet 3,9,27,81 --threads 32
 ```
 
 This creates `sunfish.model` containing the trained HMM parameters.
@@ -102,18 +96,16 @@ still adapting to unlabeled regions of the genome.
 Predict genes in unannotated sequences:
 
 ```bash
-./bin/sunfish predict <target.fasta> [--wavelet S1,S2,...|s:e:step] [--kmer K] [--threads N]
+./bin/sunfish predict <target.fasta> [--threads N]
 ```
 
 **Arguments:**
 - `target.fasta`: Target genome sequences in FASTA format
-- `--wavelet`, `-w`: Wavelet scales (must match training)
-- `--kmer`, `-k`: k-mer size (must match the trained model)
 - `--threads`: Number of parallel threads (default: auto-detected CPU count)
 
 **Example:**
 ```bash
-./bin/sunfish predict genome.fasta --wavelet 3,9,27,81 --kmer 4 --threads 8 > predictions.gff3
+./bin/sunfish predict genome.fasta --threads 8 > predictions.gff3
 ```
 
 Prediction automatically evaluates both strands and reports strand-specific
@@ -121,17 +113,16 @@ coordinates in the resulting GFF3 records.
 
 ## Algorithm Details
 
-### Feature Extraction (CWT + k-mer)
+### Feature Extraction (CWT)
 
 For each base position in the DNA sequence:
 
 1. Convert the DNA sequence to a complex signal (A→1+1i, C→-1-1i, G→-1+1i, T→1-1i).
 2. Generate Morlet wavelets for each requested scale: ψ(t) = (1/√(s·π^(1/4))) · exp(-½·(t/s)²) · exp(-j·2π·t/s).
 3. Convolve the signal with every wavelet via FFT and split the complex response into real and imaginary components (2 features per scale).
-4. Slide a k-mer window (if k>0) across the sequence; for each valid window, emit a one-hot feature in the corresponding 4ᵏ slot at the window start position.
-5. Concatenate wavelet and k-mer features, then normalize using global Z-score statistics learned during training.
+4. Normalize using global Z-score statistics learned during training.
 
-This yields a feature vector of dimension 2·(#wavelet scales) + 4ᵏ for every nucleotide.
+This yields a feature vector of dimension 2·(#wavelet scales) for every nucleotide.
 
 ### HMM Training (Baum-Welch)
 
