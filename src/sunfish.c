@@ -24,10 +24,7 @@ static double g_wavelet_scales[MAX_NUM_WAVELETS] = {
     3.0, 9.0, 27.0, 81.0, 243.0, 729.0, 2187.0, 6561.0};
 // Default: 0 means "not set"; we'll use number of online processors at runtime
 static int g_num_threads = 0;
-static int g_kmer_size = 2;
-static int g_kmer_feature_count = 16; // 4^2 for default k-mer size 2
-static int g_total_feature_count =
-    32; // 16 wavelet (8 scales * 2) + 16 k-mer features by default
+static int g_total_feature_count = 16; // 8 scales * 2 (real + imaginary)
 
 // Chunk-based prediction configuration
 static int g_chunk_size = 50000;   // Default chunk size: 50kb
@@ -138,39 +135,13 @@ static void ensure_thread_count(const char* mode, bool threads_specified) {
           source);
 }
 
-static int compute_kmer_feature_count(int k) {
-  if (k <= 0)
-    return 0;
-
-  // Limit k to avoid excessive feature dimensionality
-  if (k > 6)
-    return -1;
-
-  int count = 1;
-  for (int i = 0; i < k; i++) {
-    if (count > MAX_NUM_FEATURES / 4)
-      return -1;
-    count *= 4;
-  }
-
-  return count;
-}
-
 static bool update_feature_counts(void) {
   int wavelet_features = g_num_wavelet_scales * 2;
-  int kmer_features = 0;
 
-  if (g_kmer_size > 0) {
-    kmer_features = compute_kmer_feature_count(g_kmer_size);
-    if (kmer_features < 0)
-      return false;
-  }
-
-  if (wavelet_features + kmer_features > MAX_NUM_FEATURES)
+  if (wavelet_features > MAX_NUM_FEATURES)
     return false;
 
-  g_kmer_feature_count = kmer_features;
-  g_total_feature_count = wavelet_features + kmer_features;
+  g_total_feature_count = wavelet_features;
   if (g_total_feature_count <= 0)
     return false;
   return true;
@@ -863,16 +834,15 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
     return false;
 
   int wavelet_feature_rows = g_num_wavelet_scales * 2;
-  int kmer_feature_rows = g_kmer_feature_count;
   int num_feature_rows = g_total_feature_count;
 
-  if (wavelet_feature_rows < 0 || kmer_feature_rows < 0)
+  if (wavelet_feature_rows < 0)
     return false;
 
-  if (wavelet_feature_rows + kmer_feature_rows != num_feature_rows) {
+  if (wavelet_feature_rows != num_feature_rows) {
     // Fallback to recomputing from trusted pieces to avoid mismatches that
     // would otherwise corrupt memory when writing feature rows.
-    num_feature_rows = wavelet_feature_rows + kmer_feature_rows;
+    num_feature_rows = wavelet_feature_rows;
   }
 
   if (num_feature_rows <= 0 || num_feature_rows > MAX_NUM_FEATURES)
@@ -901,47 +871,6 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
       }
       free(features);
       return false;
-    }
-  }
-
-  if (kmer_feature_rows > 0 && g_kmer_size > 0) {
-    const int feature_offset = wavelet_feature_rows;
-
-    for (int t = 0; t <= seq_len - g_kmer_size; t++) {
-      int index = 0;
-      bool valid = true;
-
-      for (int k = 0; k < g_kmer_size; k++) {
-        char base = sequence[t + k];
-        int base_idx;
-        switch (toupper((unsigned char)base)) {
-        case 'A':
-          base_idx = 0;
-          break;
-        case 'C':
-          base_idx = 1;
-          break;
-        case 'G':
-          base_idx = 2;
-          break;
-        case 'T':
-          base_idx = 3;
-          break;
-        default:
-          valid = false;
-          base_idx = -1;
-          break;
-        }
-
-        if (!valid)
-          break;
-
-        index = (index << 2) | base_idx;
-      }
-
-      if (valid && index < kmer_feature_rows) {
-        features[feature_offset + index][t] = 1.0;
-      }
     }
   }
 
@@ -1419,17 +1348,14 @@ static void predict_sequence_worker(void* arg) {
   }
 
   // Apply Z-score normalization using global statistics from the model
-  // NOTE: do NOT normalize k-mer features. k-mer features are placed after
-  // the wavelet features in the observation vector. Only normalize the
-  // wavelet_feature_count first features and leave k-mer features unchanged.
-  int wavelet_norm_count = task->model->wavelet_feature_count;
-  if (wavelet_norm_count < 0)
-    wavelet_norm_count = 0;
-  if (wavelet_norm_count > task->model->num_features)
-    wavelet_norm_count = task->model->num_features;
+  int norm_count = task->model->num_features;
+  if (norm_count < 0)
+    norm_count = 0;
+  if (norm_count > task->model->num_features)
+    norm_count = task->model->num_features;
 
   for (int t = 0; t < seq_len; t++) {
-    for (int f = 0; f < wavelet_norm_count; f++) {
+    for (int f = 0; f < norm_count; f++) {
       double raw_val = observations[t][f];
       double stddev = task->model->global_feature_stddev[f];
       if (!isfinite(stddev) || stddev < 1e-6)
@@ -1438,7 +1364,6 @@ static void predict_sequence_worker(void* arg) {
           (raw_val - task->model->global_feature_mean[f]) / stddev;
       observations[t][f] = normalized_val;
     }
-    // k-mer features (f >= wavelet_norm_count) are intentionally left as-is
   }
 
   states = (int*)malloc(seq_len * sizeof(int));
@@ -1701,7 +1626,7 @@ static void print_help(const char* progname) {
   printf("Commands:\n");
   printf("  help                         Show this help message\n"
          "  train <train.fasta> <train.gff> [--wavelet|-w S1,S2,...|s:e:step]"
-         " [--kmer|-k K] [--threads|-t N] [--chunk-size N] [--chunk-overlap M]"
+         " [--threads|-t N] [--chunk-size N] [--chunk-overlap M]"
          "\n"
          "  predict <target.fasta> [--threads|-t N]\n\n");
   printf("Options:\n");
@@ -1709,9 +1634,6 @@ static void print_help(const char* progname) {
   printf(
       "  --wavelet, -w               Comma-separated list (a,b,c) or range "
       "s:e:step\n"
-      "  --kmer, -k K               k-mer size for feature augmentation "
-      "(default: 2; use 0 to "
-      "disable)\n"
       "  --threads, -t N             Number of worker threads (default: auto-"
       "detected)\n"
       "  --chunk-size N              Chunk size in bases for long sequences\n"
@@ -1985,20 +1907,11 @@ static void normalize_observations_in_place(double*** observations,
       if (!feature_vec)
         continue;
 
-      // Only normalize wavelet features. k-mer features follow the
-      // wavelet features in the feature vector and should be left
-      // unnormalized.
       int feature_count = model->num_features;
       if (feature_count > MAX_NUM_FEATURES)
         feature_count = MAX_NUM_FEATURES;
 
-      int wavelet_count = model->wavelet_feature_count;
-      if (wavelet_count < 0)
-        wavelet_count = 0;
-      if (wavelet_count > feature_count)
-        wavelet_count = feature_count;
-
-      for (int f = 0; f < wavelet_count; f++) {
+      for (int f = 0; f < feature_count; f++) {
         double stddev = model->global_feature_stddev[f];
         if (stddev < 1e-10)
           stddev = 1e-10;
@@ -2433,12 +2346,11 @@ static SplicePWM* train_splice_model(const FastaData* genome,
 
 static void handle_train(int argc, char* argv[]) {
   if (argc < 4) {
-    fprintf(
-        stderr,
-        "Usage: %s train <train.fasta> <train.gff> [--wavelet|-w "
-        "S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N] [--chunk-size N]"
-        " [--chunk-overlap M]\n",
-        argv[0]);
+    fprintf(stderr,
+            "Usage: %s train <train.fasta> <train.gff> [--wavelet|-w "
+            "S1,S2,...|s:e:step] [--threads|-t N] [--chunk-size N]"
+            " [--chunk-overlap M]\n",
+            argv[0]);
     exit(1);
   }
 
@@ -2447,7 +2359,6 @@ static void handle_train(int argc, char* argv[]) {
 
   // Parse optional arguments
   bool threads_specified = false;
-  bool kmer_specified = false;
   for (int i = 4; i < argc; i++) {
     if ((strcmp(argv[i], "--wavelet") == 0 || strcmp(argv[i], "-w") == 0)) {
       if (i + 1 >= argc) {
@@ -2482,36 +2393,6 @@ static void handle_train(int argc, char* argv[]) {
         g_num_wavelet_scales = 1;
         fprintf(stderr, "Using single wavelet scale %.2f\n", v);
       }
-    } else if ((strcmp(argv[i], "--kmer") == 0 || strcmp(argv[i], "-k") == 0)) {
-      if (i + 1 >= argc) {
-        fprintf(stderr, "Error: %s requires a non-negative integer\n", argv[i]);
-        exit(1);
-      }
-
-      const char* arg = argv[++i];
-      char* endptr = NULL;
-      errno = 0;
-      long parsed = strtol(arg, &endptr, 10);
-      if (errno != 0 || endptr == arg || *endptr != '\0' || parsed < 0 ||
-          parsed > INT_MAX) {
-        fprintf(stderr, "Error: Invalid k-mer size '%s'\n", arg);
-        exit(1);
-      }
-
-      int candidate = (int)parsed;
-      if (candidate > 0) {
-        int possible = compute_kmer_feature_count(candidate);
-        if (possible < 0) {
-          fprintf(stderr,
-                  "Error: k-mer size %d is too large for the maximum feature "
-                  "capacity (%d)\n",
-                  candidate, MAX_NUM_FEATURES);
-          exit(1);
-        }
-      }
-
-      g_kmer_size = candidate;
-      kmer_specified = true;
     } else if ((strcmp(argv[i], "--threads") == 0 ||
                 strcmp(argv[i], "-t") == 0)) {
       if (i + 1 >= argc) {
@@ -2557,23 +2438,13 @@ static void handle_train(int argc, char* argv[]) {
   if (!update_feature_counts()) {
     fprintf(stderr,
             "Error: Total feature dimensionality exceeds supported maximum "
-            "(%d). Adjust wavelet or k-mer settings.\n",
+            "(%d). Adjust wavelet settings.\n",
             MAX_NUM_FEATURES);
     exit(1);
   }
 
-  if (kmer_specified && g_kmer_size > 0) {
-    fprintf(stderr, "Using k-mer size %d (%d features)\n", g_kmer_size,
-            g_kmer_feature_count);
-  } else if (!kmer_specified && g_kmer_size > 0) {
-    fprintf(stderr, "k-mer size %d active (%d features)\n", g_kmer_size,
-            g_kmer_feature_count);
-  }
-
-  fprintf(stderr,
-          "Feature configuration: %d wavelet dims + %d k-mer dims = %d total\n",
-          g_num_wavelet_scales * 2, g_kmer_feature_count,
-          g_total_feature_count);
+  fprintf(stderr, "Feature configuration: %d wavelet dims = %d total\n",
+          g_num_wavelet_scales * 2, g_total_feature_count);
 
   ensure_thread_count("training", threads_specified);
 
@@ -2653,7 +2524,7 @@ static void handle_train(int argc, char* argv[]) {
           "segments)\n",
           total_segments);
   fprintf(stderr,
-          "Computing feature matrices (wavelet + k-mer) for training sequences "
+          "Computing wavelet feature matrices for training sequences "
           "using up to %d threads...\n",
           g_num_threads);
 
@@ -3040,8 +2911,8 @@ static void handle_train(int argc, char* argv[]) {
   HMMModel model;
   hmm_init(&model, g_total_feature_count);
   model.wavelet_feature_count = g_num_wavelet_scales * 2;
-  model.kmer_feature_count = g_kmer_feature_count;
-  model.kmer_size = g_kmer_size;
+  model.kmer_feature_count = 0;
+  model.kmer_size = 0;
 
   fprintf(stderr, "Starting supervised training with two passes...\n");
 
@@ -3618,17 +3489,6 @@ static void handle_predict(int argc, char* argv[]) {
   }
   fprintf(stderr, "Loaded HMM model with %d features\n", model.num_features);
 
-  if (model.kmer_size > 0) {
-    int possible = compute_kmer_feature_count(model.kmer_size);
-    if (possible < 0) {
-      fprintf(stderr,
-              "Error: Model encodes unsupported k-mer size %d for current "
-              "build (max %d). Re-train with smaller k.\n",
-              model.kmer_size, MAX_NUM_FEATURES);
-      exit(1);
-    }
-  }
-
   // Enforce training parameters from model for predict to ensure parity
   // Wavelet scales
   if (model.num_wavelet_scales > 0) {
@@ -3638,10 +3498,6 @@ static void handle_predict(int argc, char* argv[]) {
     fprintf(stderr, "Using wavelet scales from model (%d scales)\n",
             g_num_wavelet_scales);
   }
-
-  // k-mer settings
-  g_kmer_size = model.kmer_size;
-  g_kmer_feature_count = model.kmer_feature_count;
 
   // Chunking settings
   // Restore chunking parameters saved in the model. Even if the model's
@@ -3681,7 +3537,7 @@ static void handle_predict(int argc, char* argv[]) {
   if (!update_feature_counts()) {
     fprintf(stderr,
             "Error: Total feature dimensionality exceeds supported maximum "
-            "(%d). Adjust wavelet or k-mer settings.\n",
+            "(%d). Adjust wavelet settings.\n",
             MAX_NUM_FEATURES);
     exit(1);
   }
@@ -3689,23 +3545,15 @@ static void handle_predict(int argc, char* argv[]) {
   if (g_total_feature_count != model.num_features) {
     fprintf(stderr,
             "Error: Feature dimension mismatch. Model expects %d dims (wavelet "
-            "%d, k-mer %d) but current configuration yields %d dims (wavelet "
-            "%d, k-mer %d). Align --wavelet/--kmer with training.\n",
+            "%d) but current configuration yields %d dims (wavelet "
+            "%d). Align with training.\n",
             model.num_features, model.wavelet_feature_count,
-            model.kmer_feature_count, g_total_feature_count,
-            g_num_wavelet_scales * 2, g_kmer_feature_count);
+            g_total_feature_count, g_num_wavelet_scales * 2);
     exit(1);
   }
 
-  if (g_kmer_size > 0) {
-    fprintf(stderr, "Model k-mer size %d (%d features) in use\n", g_kmer_size,
-            g_kmer_feature_count);
-  }
-
-  fprintf(stderr,
-          "Feature configuration: %d wavelet dims + %d k-mer dims = %d total\n",
-          g_num_wavelet_scales * 2, g_kmer_feature_count,
-          g_total_feature_count);
+  fprintf(stderr, "Feature configuration: %d wavelet dims = %d total\n",
+          g_num_wavelet_scales * 2, g_total_feature_count);
 
   // Initialize output queue
   output_queue_init(&g_output_queue);
@@ -3928,7 +3776,7 @@ int main(int argc, char* argv[]) {
   if (!update_feature_counts()) {
     fprintf(stderr,
             "Error: Default feature configuration exceeds supported limits.\n"
-            "Adjust MAX_NUM_FEATURES or reduce wavelet/k-mer settings.\n");
+            "Adjust MAX_NUM_FEATURES or reduce wavelet settings.\n");
     return 1;
   }
 
