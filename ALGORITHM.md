@@ -7,7 +7,7 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 - 예측(predict): FASTA(타깃) + `sunfish.model` → GFF3(gene, mRNA, exon, CDS)
 - GFF3 출력은 `##gff-version 3` 헤더와 함께, 엑손 블록을 묶어 gene/mRNA/ exon/CDS를 생성하며, 좌표는 1-기반 포함 범위로 기록됩니다.
 
-## 특징 추출: Wavelet + k-mer
+## 특징 추출: Wavelet
 1. 복소수 임베딩
    - A → 1 + i, T → 1 − i, G → −1 + i, C → −1 − i
    - 알려지지 않은 염기는 0 + 0i 로 취급
@@ -16,14 +16,9 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 3. FFT 기반 컨볼루션
    - 신호와 웨이블릿을 제로패딩하여 FFT → 주파수영역 곱셈 → IFFT
    - 컨볼루션 지연은 wavelet_len/2 만큼 보정해 시점 정렬
-4. k-mer 빈도 보강 (선택 사항)
-   - `-k/--kmer`로 지정한 k > 0이면 각 위치에서 길이 k 윈도를 슬라이딩
-   - 유효한 염기로 구성된 경우 해당 4ᵏ 슬롯에 원-핫(one-hot) 값을 1로 설정
-   - 염기 중 N 등 미지정 문자가 포함되면 해당 위치의 k-mer 특징은 0으로 유지
-5. 특징 벡터 구성
+4. 특징 벡터 구성
    - 각 웨이블릿 스케일의 결과를 실수/허수부로 분해(스케일당 2차원)
-   - k-mer 원-핫 벡터를 뒤에 이어 붙여 최종 관측값을 구성
-   - 최종 관측값 차원 D = 2 × (웨이블릿 스케일 수) + 4ᵏ (k=0이면 0)
+   - 최종 관측값 차원 D = 2 × (웨이블릿 스케일 수)
 
 기본 스케일은 3의 거듭제곱(3, 9, 27, …)이며, `-w/--wavelet`으로 다음 형태를 지원합니다.
 - 쉼표 목록: `a,b,c`
@@ -77,13 +72,13 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 
 ## 병렬화와 성능
 - 고정 크기 스레드 풀로 작업 분배
-   - 학습 시 wavelet+k-mer 특징 계산을 시퀀스별(+/−) 병렬화
+   - 학습 시 wavelet 특징 계산을 시퀀스별(+/−) 병렬화
   - 예측 시 시퀀스·가닥 단위 병렬 Viterbi 수행
 - 스레드 수는 미지정 시 온라인 CPU 수 자동 감지(`-t/--threads`로 지정 가능)
 - 복잡도(대략)
    - CWT: O(K·N log N) (K: 스케일 수, N: 길이)
   - HMM Forward/Backward/Viterbi: O(N·|S|²), |S|=5
-   - 메모리: 관측행렬 O(N·D), D=2K + 4ᵏ
+   - 메모리: 관측행렬 O(N·D), D=2K
 
 ## 수치 안정성과 예외 처리
 - Forward/Backward는 로그-합-지수(log-sum-exp) 사용
@@ -97,12 +92,12 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 - 방출 공분산은 대각 가정(특징 간 상관을 모델링하지 않음)
 
 ## 명령줄 옵션 요약
-- `train <train.fasta> <train.gff> [--wavelet|-w S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]`
-- `predict <target.fasta> [--wavelet|-w S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N]`
-- 스케일 최대치는 `MAX_NUM_WAVELETS`(기본 100)로 제한되며, 특징 차원은 `2×스케일 수 + 4ᵏ` (k=0이면 k-mer 특징 없음)
+- `train <train.fasta> <train.gff> [--wavelet|-w S1,S2,...|s:e:step] [--threads|-t N]`
+- `predict <target.fasta> [--threads|-t N]`
+- 스케일 최대치는 `MAX_NUM_WAVELETS`(기본 100)로 제한되며, 특징 차원은 `2×스케일 수`
 
 ## 파일 포맷: sunfish.model
-- 헤더와 메타: `#HMM_MODEL_V1`, `#num_features`, `#wavelet_features`, `#kmer_features`, `#kmer_size`, `#num_states`
+- 헤더와 메타: `#HMM_MODEL_V1`, `#num_features`, `#wavelet_features`, `#kmer_features` (legacy), `#kmer_size` (legacy), `#num_states`
 - INITIAL: 상태별 초기확률 1행
 - TRANSITION: 상태별 전이확률 5행
 - EMISSION: 상태별 MEAN/VARIANCE
@@ -123,7 +118,6 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
    3) 시퀀스 증강(+/− strand) → 총 2×개수의 학습 시퀀스
    4) 스레드풀 → 각 시퀀스에 대해 `build_observation_matrix`
        - CWT: `compute_cwt_features`(Morlet, FFT 컨볼루션)
-       - k-mer: one-hot 인코딩
    5) Pass1 전역통계(정규화 파라미터) 계산 → Z-score로 관측값 정규화
    6) Pass2 지도 신호 생성(GFF 기반 라벨링) → 상태별 초기/전이/방출 통계 누적 → HMM 파라미터 산출 + 엑손 프레임 순환 제약
    7) 스플라이스 PWM 학습 → 모델에 저장
@@ -158,14 +152,9 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
    - 복소 결과에서 4가지 채널을 생성: 실수, 허수, 크기, 위상
 - 다중 스케일: `compute_cwt_features(seq, N, scales[], K, features)`는 스케일별 4채널을 세로로 이어붙인 2D 행렬을 채웁니다.
 
-#### 3) k-mer 원-핫 보강
-- 구현: `build_observation_matrix` in `sunfish.c`
-- 파라미터 k>0일 때, 각 위치 t에서 길이 k 윈도우를 읽어 인덱스 `index = ((...((b0<<2)|b1)<<2)|...|bk-1)`로 매핑(A=0,C=1,G=2,T=3; 기타는 무효)
-- 행렬의 `(wavelet_rows + index, t)`에 1.0을 설정합니다. 범위를 벗어나거나 무효 염기가 포함되면 0 유지.
-
-#### 4) 관측행렬 구성
+#### 3) 관측행렬 구성
 - 내부 버퍼(features[rows][N])를 채운 뒤, 시간축 우선 표현으로 전치하여 `observations[N][D]`를 생성합니다.
-- 차원 $D = 4\times K_\text{wavelet} + 4^k$ (k=0이면 k-mer 없음).
+- 차원 $D = 4\times K_\text{wavelet}$.
 
 ### Z-score 정규화(학습/예측 공통)
 - Pass1에서 전역 통계: $\mu_g[f] = \frac{1}{T}\sum x_f$, $\sigma^2_g[f] = \frac{1}{T}\sum x_f^2 - \mu_g[f]^2$; $\sigma_g<10^{-10}$이면 하한 적용.
@@ -237,7 +226,7 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
    - FASTA: 헤더의 첫 공백 전까지를 ID로 사용, 시퀀스 라인은 연결
    - GFF3: type=CDS만 사용, `Parent=`로 그룹핑, `phase` 필드 사용
 - 모델(`sunfish.model`)
-   - 헤더 메타: `#num_features`, `#wavelet_features`, `#kmer_features`, `#kmer_size`, `#num_states`
+   - 헤더 메타: `#num_features`, `#wavelet_features`, `#kmer_features` (legacy, 항상 0), `#kmer_size` (legacy, 항상 0), `#num_states`
    - 블록: `INITIAL`, `TRANSITION`, `EMISSION`(STATE별 MEAN/VARIANCE), `GLOBAL_STATS`(MEAN/STDDEV)
    - 옵션: `PWM`(WEIGHT, DONOR/ACCEPTOR, MIN_SCORE)
    - 꼬리 메타: `#chunk_size`, `#chunk_overlap`, `#use_chunking`, `#num_wavelet_scales`, `#wavelet_scales ...`
@@ -250,7 +239,7 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 ### 시간/메모리 복잡도(구체화)
 - CWT: 각 스케일당 FFT 2회 + 역FFT 1회 → $\mathcal{O}(K\cdot N\log N)$
 - HMM(Forward/Backward/Viterbi): $\mathcal{O}(N\cdot |S|^2)$, $|S|=5$
-- 메모리: 관측 $N\times D$, $D=4K+4^k$; 학습 시 (+/−) 증강 포함
+- 메모리: 관측 $N\times D$, $D=4K$; 학습 시 (+/−) 증강 포함
 
 ### 파라미터 일관성
 - 예측은 학습시 저장된 wavelet 스케일/k-mer/청킹 설정을 강제 사용합니다. `predict` 명령은 `--threads`만 허용합니다.
@@ -258,8 +247,6 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 ### 경계 사례와 주의점
 - 염기 ‘N’ 등 비표준 염기
    - CWT: 0+0i로 매핑 → 영향 최소화
-   - k-mer: 윈도우 내 1개라도 비표준이면 해당 위치의 k-mer 특징 0 유지
-- 너무 큰 k-mer는 특징 차원 상한(`MAX_NUM_FEATURES=8192`)을 넘어 실패 → 학습시 검증됨
 - 음수/0 청크 크기 또는 overlap≥size는 에러로 종료
 - 예측 청킹은 청크 경계 병합을 수행하지 않으므로, 중복 gene 출력 가능(후처리 도구 권장)
 
