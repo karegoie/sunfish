@@ -1,10 +1,13 @@
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../include/hmm.h"
+#include "../include/thread_pool.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -48,6 +51,33 @@ static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
                                              STATE_EXON_F2};
 
 static const double kVarianceFloor = 1e-3;
+
+typedef struct {
+  HMMModel* model;
+  double*** observations;
+  int* seq_lengths;
+  double* initial_acc;
+  double (*transition_acc)[NUM_STATES];
+  double (*emission_mean_acc)[MAX_NUM_FEATURES];
+  double (*emission_var_acc)[MAX_NUM_FEATURES];
+  double* state_count;
+  double* total_log_likelihood;
+  pthread_mutex_t initial_mutex;
+  pthread_mutex_t transition_mutexes[NUM_STATES];
+  pthread_mutex_t emission_mutexes[NUM_STATES];
+  pthread_mutex_t log_likelihood_mutex;
+  pthread_mutex_t error_mutex;
+  int error_flag;
+} EStepSharedData;
+
+typedef struct {
+  EStepSharedData* shared;
+  int sequence_index;
+} EStepTask;
+
+static void hmm_mark_error(EStepSharedData* shared);
+static int hmm_determine_thread_count(int num_sequences);
+static void hmm_e_step_task(void* arg);
 
 static inline int hmm_positive_mod(int value, int mod) {
   int result = value % mod;
@@ -404,137 +434,358 @@ static void backward_algorithm(const HMMModel* model, double** observations,
   }
 }
 
+static void hmm_mark_error(EStepSharedData* shared) {
+  if (shared == NULL)
+    return;
+  pthread_mutex_lock(&shared->error_mutex);
+  shared->error_flag = 1;
+  pthread_mutex_unlock(&shared->error_mutex);
+}
+
+static int hmm_determine_thread_count(int num_sequences) {
+  if (num_sequences <= 0) {
+    return 1;
+  }
+
+  long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+  int threads = (cpu_count > 0) ? (int)cpu_count : 1;
+  if (threads > num_sequences) {
+    threads = num_sequences;
+  }
+  if (threads <= 0) {
+    threads = 1;
+  }
+  return threads;
+}
+
+static void hmm_e_step_task(void* arg) {
+  EStepTask* task = (EStepTask*)arg;
+  if (task == NULL) {
+    return;
+  }
+
+  EStepSharedData* shared = task->shared;
+  double** alpha = NULL;
+  double** beta = NULL;
+  int allocated_rows = 0;
+  int seq_len = 0;
+
+  if (shared == NULL) {
+    free(task);
+    return;
+  }
+
+  pthread_mutex_lock(&shared->error_mutex);
+  int has_error = shared->error_flag;
+  pthread_mutex_unlock(&shared->error_mutex);
+
+  if (has_error || shared->model == NULL || shared->observations == NULL ||
+      shared->seq_lengths == NULL) {
+    free(task);
+    return;
+  }
+
+  seq_len = shared->seq_lengths[task->sequence_index];
+  double** sequence = shared->observations[task->sequence_index];
+
+  if (seq_len <= 0 || sequence == NULL) {
+    free(task);
+    return;
+  }
+
+  alpha = (double**)malloc(sizeof(double*) * seq_len);
+  beta = (double**)malloc(sizeof(double*) * seq_len);
+  if (alpha == NULL || beta == NULL) {
+    hmm_mark_error(shared);
+    goto cleanup;
+  }
+
+  for (int t = 0; t < seq_len; ++t) {
+    alpha[t] = (double*)malloc(sizeof(double) * NUM_STATES);
+    if (alpha[t] == NULL) {
+      hmm_mark_error(shared);
+      goto cleanup;
+    }
+    beta[t] = (double*)malloc(sizeof(double) * NUM_STATES);
+    if (beta[t] == NULL) {
+      free(alpha[t]);
+      alpha[t] = NULL;
+      hmm_mark_error(shared);
+      goto cleanup;
+    }
+    allocated_rows++;
+  }
+
+  double log_prob = forward_algorithm(shared->model, sequence, seq_len, alpha);
+  backward_algorithm(shared->model, sequence, seq_len, beta);
+
+  pthread_mutex_lock(&shared->log_likelihood_mutex);
+  *shared->total_log_likelihood += log_prob;
+  pthread_mutex_unlock(&shared->log_likelihood_mutex);
+
+  double initial_contrib[NUM_STATES] = {0.0};
+
+  for (int t = 0; t < seq_len; ++t) {
+    double gamma[NUM_STATES];
+    double gamma_norm = -INFINITY;
+
+    for (int i = 0; i < NUM_STATES; i++) {
+      gamma[i] = alpha[t][i] + beta[t][i];
+      if (gamma[i] > gamma_norm) {
+        gamma_norm = gamma[i];
+      }
+    }
+
+    double gamma_sum = 0.0;
+    for (int i = 0; i < NUM_STATES; i++) {
+      gamma[i] = exp(gamma[i] - gamma_norm);
+      gamma_sum += gamma[i];
+    }
+
+    if (gamma_sum <= 0.0) {
+      continue;
+    }
+
+    const double* observation = sequence[t];
+
+    for (int i = 0; i < NUM_STATES; i++) {
+      gamma[i] /= gamma_sum;
+
+      if (t == 0) {
+        initial_contrib[i] = gamma[i];
+      }
+
+      if (gamma[i] <= 0.0) {
+        continue;
+      }
+
+      pthread_mutex_lock(&shared->emission_mutexes[i]);
+      shared->state_count[i] += gamma[i];
+
+      if (observation != NULL) {
+        double* mean_row = shared->emission_mean_acc[i];
+        double* var_row = shared->emission_var_acc[i];
+        for (int f = 0; f < shared->model->num_features; f++) {
+          double value = observation[f];
+          double weighted = gamma[i] * value;
+          mean_row[f] += weighted;
+          var_row[f] += weighted * value;
+        }
+      }
+
+      pthread_mutex_unlock(&shared->emission_mutexes[i]);
+    }
+
+    if (t < seq_len - 1) {
+      const double* next_observation = sequence[t + 1];
+      if (next_observation == NULL) {
+        continue;
+      }
+
+      double xi[NUM_STATES][NUM_STATES];
+      double xi_norm = -INFINITY;
+
+      for (int i = 0; i < NUM_STATES; i++) {
+        for (int j = 0; j < NUM_STATES; j++) {
+          xi[i][j] = alpha[t][i] + log(shared->model->transition[i][j]) +
+                     gaussian_log_pdf(next_observation,
+                                      shared->model->emission[j].mean,
+                                      shared->model->emission[j].variance,
+                                      shared->model->num_features) +
+                     beta[t + 1][j];
+          if (xi[i][j] > xi_norm) {
+            xi_norm = xi[i][j];
+          }
+        }
+      }
+
+      double xi_sum = 0.0;
+      for (int i = 0; i < NUM_STATES; i++) {
+        for (int j = 0; j < NUM_STATES; j++) {
+          xi[i][j] = exp(xi[i][j] - xi_norm);
+          xi_sum += xi[i][j];
+        }
+      }
+
+      if (xi_sum > 0.0) {
+        for (int i = 0; i < NUM_STATES; i++) {
+          pthread_mutex_lock(&shared->transition_mutexes[i]);
+          for (int j = 0; j < NUM_STATES; j++) {
+            shared->transition_acc[i][j] += xi[i][j] / xi_sum;
+          }
+          pthread_mutex_unlock(&shared->transition_mutexes[i]);
+        }
+      }
+    }
+  }
+
+  if (seq_len > 0) {
+    pthread_mutex_lock(&shared->initial_mutex);
+    for (int i = 0; i < NUM_STATES; i++) {
+      shared->initial_acc[i] += initial_contrib[i];
+    }
+    pthread_mutex_unlock(&shared->initial_mutex);
+  }
+
+cleanup:
+  if (alpha != NULL) {
+    for (int t = 0; t < allocated_rows; ++t) {
+      free(alpha[t]);
+    }
+    free(alpha);
+  }
+  if (beta != NULL) {
+    for (int t = 0; t < allocated_rows; ++t) {
+      free(beta[t]);
+    }
+    free(beta);
+  }
+  free(task);
+}
+
 bool hmm_train_baum_welch(HMMModel* model, double*** observations,
                           int* seq_lengths, int num_sequences,
                           int max_iterations, double convergence_threshold) {
+  if (model == NULL || observations == NULL || seq_lengths == NULL ||
+      num_sequences <= 0 || max_iterations <= 0) {
+    return false;
+  }
+
+  int thread_count = hmm_determine_thread_count(num_sequences);
+  thread_pool_t* pool = thread_pool_create(thread_count);
+  if (pool == NULL) {
+    return false;
+  }
+
+  double initial_acc[NUM_STATES];
+  double transition_acc[NUM_STATES][NUM_STATES];
+  double emission_mean_acc[NUM_STATES][MAX_NUM_FEATURES];
+  double emission_var_acc[NUM_STATES][MAX_NUM_FEATURES];
+  double state_count[NUM_STATES];
+  double total_log_likelihood = 0.0;
+
+  EStepSharedData shared = {.model = model,
+                            .observations = observations,
+                            .seq_lengths = seq_lengths,
+                            .initial_acc = initial_acc,
+                            .transition_acc = transition_acc,
+                            .emission_mean_acc = emission_mean_acc,
+                            .emission_var_acc = emission_var_acc,
+                            .state_count = state_count,
+                            .total_log_likelihood = &total_log_likelihood,
+                            .error_flag = 0};
+
+  bool success = true;
+  bool initial_mutex_created = false;
+  bool log_mutex_created = false;
+  bool error_mutex_created = false;
+  int transition_init_count = 0;
+  int emission_init_count = 0;
+
+  if (pthread_mutex_init(&shared.initial_mutex, NULL) != 0) {
+    success = false;
+    goto cleanup;
+  }
+  initial_mutex_created = true;
+
+  if (pthread_mutex_init(&shared.log_likelihood_mutex, NULL) != 0) {
+    success = false;
+    goto cleanup;
+  }
+  log_mutex_created = true;
+
+  if (pthread_mutex_init(&shared.error_mutex, NULL) != 0) {
+    success = false;
+    goto cleanup;
+  }
+  error_mutex_created = true;
+
+  for (; transition_init_count < NUM_STATES; ++transition_init_count) {
+    if (pthread_mutex_init(&shared.transition_mutexes[transition_init_count],
+                           NULL) != 0) {
+      success = false;
+      goto cleanup;
+    }
+  }
+
+  for (; emission_init_count < NUM_STATES; ++emission_init_count) {
+    if (pthread_mutex_init(&shared.emission_mutexes[emission_init_count],
+                           NULL) != 0) {
+      success = false;
+      goto cleanup;
+    }
+  }
+
   double prev_log_likelihood = -INFINITY;
 
   for (int iter = 0; iter < max_iterations; iter++) {
-    double total_log_likelihood = 0.0;
+    for (int i = 0; i < NUM_STATES; i++) {
+      initial_acc[i] = 0.0;
+      state_count[i] = 0.0;
+      for (int j = 0; j < NUM_STATES; j++) {
+        transition_acc[i][j] = 0.0;
+      }
+      for (int f = 0; f < model->num_features; f++) {
+        emission_mean_acc[i][f] = 0.0;
+        emission_var_acc[i][f] = 0.0;
+      }
+    }
+    total_log_likelihood = 0.0;
 
-    // Accumulators for M-step
-    double initial_acc[NUM_STATES] = {0};
-    double transition_acc[NUM_STATES][NUM_STATES] = {{0}};
-    double emission_mean_acc[NUM_STATES][MAX_NUM_FEATURES] = {{0}};
-    double emission_var_acc[NUM_STATES][MAX_NUM_FEATURES] = {{0}};
-    double state_count[NUM_STATES] = {0};
+    pthread_mutex_lock(&shared.error_mutex);
+    shared.error_flag = 0;
+    pthread_mutex_unlock(&shared.error_mutex);
 
-    // E-step: compute forward-backward for all sequences
     for (int seq = 0; seq < num_sequences; seq++) {
-      int T = seq_lengths[seq];
-
-      // Allocate alpha and beta matrices
-      double** alpha = (double**)malloc(T * sizeof(double*));
-      double** beta = (double**)malloc(T * sizeof(double*));
-      for (int t = 0; t < T; t++) {
-        alpha[t] = (double*)malloc(NUM_STATES * sizeof(double));
-        beta[t] = (double*)malloc(NUM_STATES * sizeof(double));
+      EStepTask* task = (EStepTask*)malloc(sizeof(EStepTask));
+      if (task == NULL) {
+        hmm_mark_error(&shared);
+        break;
       }
+      task->shared = &shared;
+      task->sequence_index = seq;
 
-      // Run forward-backward
-      double log_prob = forward_algorithm(model, observations[seq], T, alpha);
-      backward_algorithm(model, observations[seq], T, beta);
-      total_log_likelihood += log_prob;
-
-      // Compute gamma and xi
-      for (int t = 0; t < T; t++) {
-        // gamma[t][i] = P(S_t = i | O, model)
-        double gamma_norm = -INFINITY;
-        double gamma[NUM_STATES];
-
-        for (int i = 0; i < NUM_STATES; i++) {
-          gamma[i] = alpha[t][i] + beta[t][i];
-          if (gamma[i] > gamma_norm) {
-            gamma_norm = gamma[i];
-          }
-        }
-
-        double gamma_sum = 0.0;
-        for (int i = 0; i < NUM_STATES; i++) {
-          gamma[i] = exp(gamma[i] - gamma_norm);
-          gamma_sum += gamma[i];
-        }
-
-        for (int i = 0; i < NUM_STATES; i++) {
-          gamma[i] /= gamma_sum;
-
-          if (t == 0) {
-            initial_acc[i] += gamma[i];
-          }
-
-          state_count[i] += gamma[i];
-
-          // Accumulate for emission parameters
-          for (int f = 0; f < model->num_features; f++) {
-            emission_mean_acc[i][f] += gamma[i] * observations[seq][t][f];
-            emission_var_acc[i][f] +=
-                gamma[i] * observations[seq][t][f] * observations[seq][t][f];
-          }
-        }
-
-        // Compute xi for transition probabilities (if not last time step)
-        if (t < T - 1) {
-          double xi[NUM_STATES][NUM_STATES];
-          double xi_norm = -INFINITY;
-
-          for (int i = 0; i < NUM_STATES; i++) {
-            for (int j = 0; j < NUM_STATES; j++) {
-              xi[i][j] = alpha[t][i] + log(model->transition[i][j]) +
-                         gaussian_log_pdf(
-                             observations[seq][t + 1], model->emission[j].mean,
-                             model->emission[j].variance, model->num_features) +
-                         beta[t + 1][j];
-              if (xi[i][j] > xi_norm) {
-                xi_norm = xi[i][j];
-              }
-            }
-          }
-
-          double xi_sum = 0.0;
-          for (int i = 0; i < NUM_STATES; i++) {
-            for (int j = 0; j < NUM_STATES; j++) {
-              xi[i][j] = exp(xi[i][j] - xi_norm);
-              xi_sum += xi[i][j];
-            }
-          }
-
-          for (int i = 0; i < NUM_STATES; i++) {
-            for (int j = 0; j < NUM_STATES; j++) {
-              transition_acc[i][j] += xi[i][j] / xi_sum;
-            }
-          }
-        }
+      if (!thread_pool_add_task(pool, hmm_e_step_task, task)) {
+        free(task);
+        hmm_mark_error(&shared);
+        break;
       }
-
-      // Free alpha and beta
-      for (int t = 0; t < T; t++) {
-        free(alpha[t]);
-        free(beta[t]);
-      }
-      free(alpha);
-      free(beta);
     }
 
-    // M-step: update parameters
-    // Update initial probabilities
+    thread_pool_wait(pool);
+
+    pthread_mutex_lock(&shared.error_mutex);
+    int has_error = shared.error_flag;
+    pthread_mutex_unlock(&shared.error_mutex);
+    if (has_error) {
+      success = false;
+      break;
+    }
+
     double initial_sum = 0.0;
     for (int i = 0; i < NUM_STATES; i++) {
       initial_sum += initial_acc[i];
     }
-    for (int i = 0; i < NUM_STATES; i++) {
-      model->initial[i] = initial_acc[i] / initial_sum;
-      if (model->initial[i] < 1e-10)
-        model->initial[i] = 1e-10;
+    if (initial_sum <= 0.0) {
+      double uniform = 1.0 / NUM_STATES;
+      for (int i = 0; i < NUM_STATES; i++) {
+        model->initial[i] = uniform;
+      }
+    } else {
+      for (int i = 0; i < NUM_STATES; i++) {
+        model->initial[i] = initial_acc[i] / initial_sum;
+        if (model->initial[i] < 1e-10)
+          model->initial[i] = 1e-10;
+      }
     }
 
-    // Update transition probabilities
     for (int i = 0; i < NUM_STATES; i++) {
       double trans_sum = 0.0;
       for (int j = 0; j < NUM_STATES; j++) {
         trans_sum += transition_acc[i][j];
       }
       for (int j = 0; j < NUM_STATES; j++) {
-        if (trans_sum > 0) {
+        if (trans_sum > 0.0) {
           model->transition[i][j] = transition_acc[i][j] / trans_sum;
         } else {
           model->transition[i][j] = 1.0 / NUM_STATES;
@@ -544,34 +795,53 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
       }
     }
 
-    // Update emission parameters
     for (int i = 0; i < NUM_STATES; i++) {
-      if (state_count[i] > 0) {
+      if (state_count[i] > 0.0) {
         for (int f = 0; f < model->num_features; f++) {
           double mean = emission_mean_acc[i][f] / state_count[i];
           double mean_sq = emission_var_acc[i][f] / state_count[i];
           double var = mean_sq - mean * mean;
-
           model->emission[i].mean[f] = mean;
           model->emission[i].variance[f] = var > 1e-6 ? var : 1e-6;
         }
       }
+      model->emission[i].num_features = model->num_features;
     }
 
-    // Check convergence
-    fprintf(stderr, "Iteration %d: Log-likelihood = %.4f\n", iter + 1,
-            total_log_likelihood);
+    double total_log_likelihood_iter = total_log_likelihood;
 
-    if (iter > 0 && fabs(total_log_likelihood - prev_log_likelihood) <
+    fprintf(stderr, "Iteration %d: Log-likelihood = %.4f\n", iter + 1,
+            total_log_likelihood_iter);
+
+    if (iter > 0 && fabs(total_log_likelihood_iter - prev_log_likelihood) <
                         convergence_threshold) {
       fprintf(stderr, "Converged after %d iterations\n", iter + 1);
       break;
     }
 
-    prev_log_likelihood = total_log_likelihood;
+    prev_log_likelihood = total_log_likelihood_iter;
   }
 
-  return true;
+cleanup:
+  for (int i = transition_init_count - 1; i >= 0; --i) {
+    pthread_mutex_destroy(&shared.transition_mutexes[i]);
+  }
+  for (int i = emission_init_count - 1; i >= 0; --i) {
+    pthread_mutex_destroy(&shared.emission_mutexes[i]);
+  }
+  if (error_mutex_created) {
+    pthread_mutex_destroy(&shared.error_mutex);
+  }
+  if (log_mutex_created) {
+    pthread_mutex_destroy(&shared.log_likelihood_mutex);
+  }
+  if (initial_mutex_created) {
+    pthread_mutex_destroy(&shared.initial_mutex);
+  }
+
+  thread_pool_destroy(pool);
+
+  return success;
 }
 
 // Helper function to compute log probability of duration d under log-normal
