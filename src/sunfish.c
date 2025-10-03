@@ -34,6 +34,8 @@ static int g_chunk_size = 50000;   // Default chunk size: 50kb
 static int g_chunk_overlap = 5000; // Default overlap: 5kb
 static bool g_use_chunking = true;
 
+static int get_env_thread_override(void);
+
 // Thread-safe output queue
 typedef struct output_node_t {
   char* gff_line;
@@ -94,16 +96,43 @@ static int detect_hardware_threads(void) {
   return (int)nprocs;
 }
 
-static void ensure_thread_count(const char* mode, bool threads_specified) {
-  bool auto_detected = false;
-  if (g_num_threads <= 0) {
-    g_num_threads = detect_hardware_threads();
-    auto_detected = true;
+static int get_env_thread_override(void) {
+  const char* env_vars[] = {"SUNFISH_THREADS", "OMP_NUM_THREADS"};
+  const size_t env_count = sizeof(env_vars) / sizeof(env_vars[0]);
+
+  for (size_t i = 0; i < env_count; i++) {
+    const char* value = getenv(env_vars[i]);
+    if (value == NULL || *value == '\0')
+      continue;
+
+    int parsed = parse_threads_value(value);
+    if (parsed > 0)
+      return parsed;
+
+    fprintf(stderr,
+            "Warning: Ignoring invalid thread count '%s' from %s. Expected a "
+            "positive integer.\n",
+            value, env_vars[i]);
   }
 
-  const char* source = auto_detected
-                           ? "auto-detected"
-                           : (threads_specified ? "user-specified" : "default");
+  return -1;
+}
+
+static void ensure_thread_count(const char* mode, bool threads_specified) {
+  const char* source = threads_specified ? "user-specified" : "default";
+
+  if (!threads_specified && g_num_threads <= 0) {
+    int env_threads = get_env_thread_override();
+    if (env_threads > 0) {
+      g_num_threads = env_threads;
+      source = "env";
+    }
+  }
+
+  if (g_num_threads <= 0) {
+    g_num_threads = detect_hardware_threads();
+    source = "auto-detected";
+  }
 
   fprintf(stderr, "Using %d threads for %s (%s)\n", g_num_threads, mode,
           source);
@@ -3392,6 +3421,8 @@ static void handle_predict(int argc, char* argv[]) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s predict <target.fasta> [--threads|-t N]\n",
             argv[0]);
+    fprintf(stderr, "       (threads auto-detected when omitted; override via "
+                    "SUNFISH_THREADS/OMP_NUM_THREADS)\n");
     exit(1);
   }
 
