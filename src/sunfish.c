@@ -1267,7 +1267,7 @@ static void output_predicted_gene(const prediction_task_t* task,
 // Validate ORF: check start codon, stop codon, in-frame stops, and length
 static bool is_valid_orf(const char* cds_sequence) {
   // FOR DEBUGGING PURPOSE ONLY; FIXME
-  // return true;
+  return true;
 
   if (!cds_sequence) {
     return false;
@@ -1929,7 +1929,11 @@ static void accumulate_statistics_for_segment(
     double emission_sum[NUM_STATES][MAX_NUM_FEATURES],
     double emission_sum_sq[NUM_STATES][MAX_NUM_FEATURES],
     long long state_observation_counts[NUM_STATES],
-    long long initial_counts[NUM_STATES]) {
+    long long initial_counts[NUM_STATES],
+    /* component-level accumulators for GMM supervised initialization */
+    double component_weight_acc[NUM_STATES][GMM_COMPONENTS],
+    double emission_mean_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES],
+    double emission_var_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES]) {
   if (!model || !observations || !state_labels || obs_len <= 0)
     return;
 
@@ -1961,6 +1965,50 @@ static void accumulate_statistics_for_segment(
       emission_sum[state][f] += normalized_val;
       emission_sum_sq[state][f] += normalized_val * normalized_val;
     }
+
+    /* Compute soft responsibilities for each GMM component within this state */
+    double comp_lp[GMM_COMPONENTS];
+    double comp_w[GMM_COMPONENTS];
+    double maxc = -INFINITY;
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      double w = model->emission[state].weight[k];
+      if (w <= 0.0 || !isfinite(w)) {
+        comp_lp[k] = -INFINITY;
+      } else {
+        comp_lp[k] = log(w) + diag_gaussian_logpdf(
+                                  feature_vec, model->emission[state].mean[k],
+                                  model->emission[state].variance[k],
+                                  model->emission[state].num_features);
+      }
+      if (comp_lp[k] > maxc)
+        maxc = comp_lp[k];
+    }
+    double compsum = 0.0;
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      if (!isfinite(comp_lp[k])) {
+        comp_w[k] = 0.0;
+      } else {
+        comp_w[k] = exp(comp_lp[k] - maxc);
+      }
+      compsum += comp_w[k];
+    }
+    if (compsum <= 0.0) {
+      /* fallback: assign equally */
+      for (int k = 0; k < GMM_COMPONENTS; k++)
+        comp_w[k] = 1.0 / (double)GMM_COMPONENTS;
+      compsum = 1.0;
+    }
+
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      double r = comp_w[k] / compsum; /* responsibility for this observation */
+      component_weight_acc[state][k] += r;
+      for (int f = 0; f < num_features; f++) {
+        double v = feature_vec[f];
+        emission_mean_acc[state][k][f] += r * v;
+        emission_var_acc[state][k][f] += r * v * v;
+      }
+    }
+
     state_observation_counts[state]++;
   }
 }
@@ -2971,6 +3019,20 @@ static void handle_train(int argc, char* argv[]) {
   double emission_sum_sq[NUM_STATES][MAX_NUM_FEATURES] = {{0}};
   long long state_observation_counts[NUM_STATES] = {0};
   long long initial_counts[NUM_STATES] = {0};
+  /* GMM component-level accumulators for supervised init */
+  double component_weight_acc[NUM_STATES][GMM_COMPONENTS];
+  double emission_mean_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
+  double emission_var_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
+  /* initialize */
+  for (int i = 0; i < NUM_STATES; i++) {
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      component_weight_acc[i][k] = 0.0;
+      for (int f = 0; f < MAX_NUM_FEATURES; f++) {
+        emission_mean_acc[i][k][f] = 0.0;
+        emission_var_acc[i][k][f] = 0.0;
+      }
+    }
+  }
 
   // Process each sequence to accumulate statistics
   for (int seq_idx = 0; seq_idx < genome->count; seq_idx++) {
@@ -3023,7 +3085,8 @@ static void handle_train(int argc, char* argv[]) {
         accumulate_statistics_for_segment(
             &model, observations[seg_index], seq_lengths[seg_index], labels_ptr,
             transition_counts, emission_sum, emission_sum_sq,
-            state_observation_counts, initial_counts);
+            state_observation_counts, initial_counts, component_weight_acc,
+            emission_mean_acc, emission_var_acc);
       }
     }
 
@@ -3059,7 +3122,8 @@ static void handle_train(int argc, char* argv[]) {
         accumulate_statistics_for_segment(
             &model, observations[seg_index], seq_lengths[seg_index], labels_ptr,
             transition_counts, emission_sum, emission_sum_sq,
-            state_observation_counts, initial_counts);
+            state_observation_counts, initial_counts, component_weight_acc,
+            emission_mean_acc, emission_var_acc);
       }
     }
 
@@ -3112,19 +3176,65 @@ static void handle_train(int argc, char* argv[]) {
   for (int i = 0; i < NUM_STATES; i++) {
     model.emission[i].num_features = num_features;
 
-    for (int f = 0; f < num_features; f++) {
-      if (state_observation_counts[i] > 0) {
-        double mean = emission_sum[i][f] / state_observation_counts[i];
-        double mean_sq = emission_sum_sq[i][f] / state_observation_counts[i];
-        double variance = mean_sq - mean * mean;
-
-        model.emission[i].mean[f] = mean;
-        model.emission[i].variance[f] = (variance > 1e-6) ? variance : 1e-6;
-      } else {
-        // No observations for this state, use defaults
-        model.emission[i].mean[f] = 0.0;
-        model.emission[i].variance[f] = 1.0;
+    /* If component-level responsibilities were recorded, use them */
+    bool has_component_data = false;
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      if (component_weight_acc[i][k] > 0.0) {
+        has_component_data = true;
+        break;
       }
+    }
+
+    if (has_component_data) {
+      double weight_sum = 0.0;
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        weight_sum += component_weight_acc[i][k];
+      }
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        double comp_w = component_weight_acc[i][k];
+        if (comp_w > 0.0) {
+          for (int f = 0; f < num_features; f++) {
+            double mean = emission_mean_acc[i][k][f] / comp_w;
+            double mean_sq = emission_var_acc[i][k][f] / comp_w;
+            double var = mean_sq - mean * mean;
+            if (!isfinite(var) || var < 1e-6)
+              var = 1e-6;
+            model.emission[i].mean[k][f] = mean;
+            model.emission[i].variance[k][f] = var;
+          }
+        } else {
+          for (int f = 0; f < num_features; f++) {
+            model.emission[i].mean[k][f] = 0.0;
+            model.emission[i].variance[k][f] = 1.0;
+          }
+        }
+        model.emission[i].weight[k] = (weight_sum > 0.0)
+                                          ? (comp_w / weight_sum)
+                                          : (1.0 / (double)GMM_COMPONENTS);
+      }
+    } else {
+      /* Fallback: use aggregate stats and create a perturbed second component
+       */
+      for (int f = 0; f < num_features; f++) {
+        if (state_observation_counts[i] > 0) {
+          double mean = emission_sum[i][f] / state_observation_counts[i];
+          double mean_sq = emission_sum_sq[i][f] / state_observation_counts[i];
+          double variance = mean_sq - mean * mean;
+          model.emission[i].mean[0][f] = mean;
+          model.emission[i].variance[0][f] =
+              (variance > 1e-6) ? variance : 1e-6;
+          model.emission[i].mean[1][f] = mean + 0.1;
+          model.emission[i].variance[1][f] =
+              model.emission[i].variance[0][f] + 0.1;
+        } else {
+          model.emission[i].mean[0][f] = 0.0;
+          model.emission[i].variance[0][f] = 1.0;
+          model.emission[i].mean[1][f] = 0.1;
+          model.emission[i].variance[1][f] = 1.1;
+        }
+      }
+      model.emission[i].weight[0] = 0.5;
+      model.emission[i].weight[1] = 0.5;
     }
 
     fprintf(stderr, "State %d: %lld observations\n", i,

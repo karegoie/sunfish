@@ -56,15 +56,23 @@ static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
 // in this translation unit, so changing it ensures consistent behavior.
 static const double kVarianceFloor = 1e-2;
 
+// Use GMM_COMPONENTS from header
+#ifndef GMM_COMPONENTS
+#define GMM_COMPONENTS 2
+#endif
+
 typedef struct {
   HMMModel* model;
   double*** observations;
   int* seq_lengths;
   double* initial_acc;
   double (*transition_acc)[NUM_STATES];
-  double (*emission_mean_acc)[MAX_NUM_FEATURES];
-  double (*emission_var_acc)[MAX_NUM_FEATURES];
-  double* state_count;
+  /* emission accumulators: [state][component][feature] */
+  double (*emission_mean_acc)[GMM_COMPONENTS][MAX_NUM_FEATURES];
+  double (*emission_var_acc)[GMM_COMPONENTS][MAX_NUM_FEATURES];
+  /* component weight accumulators per state: [state][component] */
+  double (*component_weight_acc)[GMM_COMPONENTS];
+  double* state_count; /* sum of gamma per state */
   double* total_log_likelihood;
   pthread_mutex_t initial_mutex;
   pthread_mutex_t transition_mutexes[NUM_STATES];
@@ -269,14 +277,19 @@ void hmm_init(HMMModel* model, int num_features) {
     model->initial[i] = 1.0 / NUM_STATES;
   }
 
-  // Initialize emission parameters with random values
-  for (int i = 0; i < NUM_STATES; i++) {
-    model->emission[i].num_features = num_features;
-    for (int j = 0; j < num_features; j++) {
-      // Random mean between 0 and 1
-      model->emission[i].mean[j] = (double)rand() / RAND_MAX;
-      // Small variance
-      model->emission[i].variance[j] = 0.1;
+  // Initialize emission parameters as 2-component diagonal GMMs
+  for (int s = 0; s < NUM_STATES; s++) {
+    model->emission[s].num_features = num_features;
+    // Initialize equal weights
+    for (int k = 0; k < GMM_COMPONENTS; k++)
+      model->emission[s].weight[k] = 1.0 / (double)GMM_COMPONENTS;
+
+    for (int f = 0; f < num_features; f++) {
+      // Small random means for component 0 and shifted for component 1
+      model->emission[s].mean[0][f] = (double)rand() / RAND_MAX;
+      model->emission[s].mean[1][f] = model->emission[s].mean[0][f] + 0.1;
+      model->emission[s].variance[0][f] = 0.1;
+      model->emission[s].variance[1][f] = 0.2;
     }
   }
 
@@ -319,26 +332,56 @@ void hmm_init(HMMModel* model, int num_features) {
     model->wavelet_scales[i] = 0.0;
 }
 
-double gaussian_log_pdf(const double* observation, const double* mean,
-                        const double* variance, int num_features) {
+double diag_gaussian_logpdf(const double* observation, const double* mean,
+                            const double* variance, int num_features) {
   double log_prob = 0.0;
 
-  // For diagonal covariance, we can compute the PDF as product of univariate
-  // Gaussians
   for (int i = 0; i < num_features; i++) {
     double diff = observation[i] - mean[i];
     double var = variance[i];
 
-    // Prevent numerical issues with non-finite or very small variance.
     if (!isfinite(var) || var < kVarianceFloor) {
       var = kVarianceFloor;
     }
 
-    // Log of univariate Gaussian PDF
     log_prob += -0.5 * log(2.0 * M_PI * var) - 0.5 * (diff * diff) / var;
   }
 
   return log_prob;
+}
+
+double mixture_log_pdf(const MixtureEmission* emission,
+                       const double* observation) {
+  if (emission == NULL || observation == NULL)
+    return -INFINITY;
+
+  double max_lp = -INFINITY;
+  double comp_lp[GMM_COMPONENTS];
+  for (int k = 0; k < GMM_COMPONENTS; k++) {
+    double w = emission->weight[k];
+    if (w <= 0.0 || !isfinite(w)) {
+      comp_lp[k] = -INFINITY;
+      continue;
+    }
+    comp_lp[k] = log(w) + diag_gaussian_logpdf(observation, emission->mean[k],
+                                               emission->variance[k],
+                                               emission->num_features);
+    if (comp_lp[k] > max_lp)
+      max_lp = comp_lp[k];
+  }
+
+  if (!isfinite(max_lp))
+    return -INFINITY;
+
+  double sum = 0.0;
+  for (int k = 0; k < GMM_COMPONENTS; k++) {
+    if (!isfinite(comp_lp[k]))
+      continue;
+    sum += exp(comp_lp[k] - max_lp);
+  }
+  if (sum <= 0.0)
+    return -INFINITY;
+  return max_lp + log(sum);
 }
 
 // Forward algorithm for Baum-Welch
@@ -348,10 +391,8 @@ static double forward_algorithm(const HMMModel* model, double** observations,
 
   // Initialization (t=0)
   for (int i = 0; i < NUM_STATES; i++) {
-    alpha[0][i] =
-        log(model->initial[i]) +
-        gaussian_log_pdf(observations[0], model->emission[i].mean,
-                         model->emission[i].variance, model->num_features);
+    alpha[0][i] = log(model->initial[i]) +
+                  mixture_log_pdf(&model->emission[i], observations[0]);
   }
 
   // Induction (t=1 to T-1)
@@ -373,10 +414,8 @@ static double forward_algorithm(const HMMModel* model, double** observations,
         sum += exp(val - max_val);
       }
 
-      alpha[t][j] =
-          max_val + log(sum) +
-          gaussian_log_pdf(observations[t], model->emission[j].mean,
-                           model->emission[j].variance, model->num_features);
+      alpha[t][j] = max_val + log(sum) +
+                    mixture_log_pdf(&model->emission[j], observations[t]);
     }
   }
 
@@ -414,20 +453,16 @@ static void backward_algorithm(const HMMModel* model, double** observations,
 
       // Log-sum-exp trick
       for (int j = 0; j < NUM_STATES; j++) {
-        double val =
-            log(model->transition[i][j]) + beta[t + 1][j] +
-            gaussian_log_pdf(observations[t + 1], model->emission[j].mean,
-                             model->emission[j].variance, model->num_features);
+        double val = log(model->transition[i][j]) + beta[t + 1][j] +
+                     mixture_log_pdf(&model->emission[j], observations[t + 1]);
         if (val > max_val) {
           max_val = val;
         }
       }
 
       for (int j = 0; j < NUM_STATES; j++) {
-        double val =
-            log(model->transition[i][j]) + beta[t + 1][j] +
-            gaussian_log_pdf(observations[t + 1], model->emission[j].mean,
-                             model->emission[j].variance, model->num_features);
+        double val = log(model->transition[i][j]) + beta[t + 1][j] +
+                     mixture_log_pdf(&model->emission[j], observations[t + 1]);
         sum += exp(val - max_val);
       }
 
@@ -557,24 +592,42 @@ static void hmm_e_step_task(void* arg) {
         initial_contrib[i] = gamma[i];
       }
 
-      if (gamma[i] <= 0.0) {
+      if (gamma[i] <= 0.0 || observation == NULL) {
         continue;
       }
 
+      /* For state i, compute responsibilities for each GMM component */
+      double comp_lp[GMM_COMPONENTS];
+      double comp_w[GMM_COMPONENTS];
+      double maxc = -INFINITY;
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        comp_lp[k] = log(shared->model->emission[i].weight[k]) +
+                     diag_gaussian_logpdf(
+                         observation, shared->model->emission[i].mean[k],
+                         shared->model->emission[i].variance[k],
+                         shared->model->emission[i].num_features);
+        if (comp_lp[k] > maxc)
+          maxc = comp_lp[k];
+      }
+      double compsum = 0.0;
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        comp_w[k] = exp(comp_lp[k] - maxc);
+        compsum += comp_w[k];
+      }
+      if (compsum <= 0.0)
+        continue;
+
       pthread_mutex_lock(&shared->emission_mutexes[i]);
       shared->state_count[i] += gamma[i];
-
-      if (observation != NULL) {
-        double* mean_row = shared->emission_mean_acc[i];
-        double* var_row = shared->emission_var_acc[i];
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        double r = (comp_w[k] / compsum) * gamma[i];
+        shared->component_weight_acc[i][k] += r;
         for (int f = 0; f < shared->model->num_features; f++) {
-          double value = observation[f];
-          double weighted = gamma[i] * value;
-          mean_row[f] += weighted;
-          var_row[f] += weighted * value;
+          double val = observation[f];
+          shared->emission_mean_acc[i][k][f] += r * val;
+          shared->emission_var_acc[i][k][f] += r * val * val;
         }
       }
-
       pthread_mutex_unlock(&shared->emission_mutexes[i]);
     }
 
@@ -589,12 +642,10 @@ static void hmm_e_step_task(void* arg) {
 
       for (int i = 0; i < NUM_STATES; i++) {
         for (int j = 0; j < NUM_STATES; j++) {
-          xi[i][j] = alpha[t][i] + log(shared->model->transition[i][j]) +
-                     gaussian_log_pdf(next_observation,
-                                      shared->model->emission[j].mean,
-                                      shared->model->emission[j].variance,
-                                      shared->model->num_features) +
-                     beta[t + 1][j];
+          xi[i][j] =
+              alpha[t][i] + log(shared->model->transition[i][j]) +
+              mixture_log_pdf(&shared->model->emission[j], next_observation) +
+              beta[t + 1][j];
           if (xi[i][j] > xi_norm) {
             xi_norm = xi[i][j];
           }
@@ -661,8 +712,9 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
 
   double initial_acc[NUM_STATES];
   double transition_acc[NUM_STATES][NUM_STATES];
-  double emission_mean_acc[NUM_STATES][MAX_NUM_FEATURES];
-  double emission_var_acc[NUM_STATES][MAX_NUM_FEATURES];
+  double emission_mean_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
+  double emission_var_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
+  double component_weight_acc[NUM_STATES][GMM_COMPONENTS];
   double state_count[NUM_STATES];
   double total_log_likelihood = 0.0;
 
@@ -673,6 +725,7 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
                             .transition_acc = transition_acc,
                             .emission_mean_acc = emission_mean_acc,
                             .emission_var_acc = emission_var_acc,
+                            .component_weight_acc = component_weight_acc,
                             .state_count = state_count,
                             .total_log_likelihood = &total_log_likelihood,
                             .error_flag = 0};
@@ -727,9 +780,12 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
       for (int j = 0; j < NUM_STATES; j++) {
         transition_acc[i][j] = 0.0;
       }
-      for (int f = 0; f < model->num_features; f++) {
-        emission_mean_acc[i][f] = 0.0;
-        emission_var_acc[i][f] = 0.0;
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        component_weight_acc[i][k] = 0.0;
+        for (int f = 0; f < model->num_features; f++) {
+          emission_mean_acc[i][k][f] = 0.0;
+          emission_var_acc[i][k][f] = 0.0;
+        }
       }
     }
     total_log_likelihood = 0.0;
@@ -799,12 +855,34 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
 
     for (int i = 0; i < NUM_STATES; i++) {
       if (state_count[i] > 0.0) {
-        for (int f = 0; f < model->num_features; f++) {
-          double mean = emission_mean_acc[i][f] / state_count[i];
-          double mean_sq = emission_var_acc[i][f] / state_count[i];
-          double var = mean_sq - mean * mean;
-          model->emission[i].mean[f] = mean;
-          model->emission[i].variance[f] = var > 1e-6 ? var : 1e-6;
+        double weight_sum = 0.0;
+        for (int k = 0; k < GMM_COMPONENTS; k++) {
+          weight_sum += component_weight_acc[i][k];
+        }
+        for (int k = 0; k < GMM_COMPONENTS; k++) {
+          double comp_w = component_weight_acc[i][k];
+          if (comp_w > 0.0) {
+            for (int f = 0; f < model->num_features; f++) {
+              double mean = emission_mean_acc[i][k][f] / comp_w;
+              double mean_sq = emission_var_acc[i][k][f] / comp_w;
+              double var = mean_sq - mean * mean;
+              if (!isfinite(var) || var < kVarianceFloor)
+                var = kVarianceFloor;
+              model->emission[i].mean[k][f] = mean;
+              model->emission[i].variance[k][f] = var;
+            }
+          } else {
+            /* Reinitialize tiny variance if component had no responsibility */
+            for (int f = 0; f < model->num_features; f++) {
+              model->emission[i].variance[k][f] = kVarianceFloor;
+            }
+          }
+          /* Update weight (normalize later) */
+          if (weight_sum > 0.0)
+            model->emission[i].weight[k] =
+                component_weight_acc[i][k] / weight_sum;
+          else
+            model->emission[i].weight[k] = 1.0 / (double)GMM_COMPONENTS;
         }
       }
       model->emission[i].num_features = model->num_features;
@@ -898,8 +976,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   for (int t = 0; t < seq_len; t++) {
     for (int j = 0; j < NUM_STATES; j++) {
       double emission_log =
-          gaussian_log_pdf(observations[t], model->emission[j].mean,
-                           model->emission[j].variance, model->num_features);
+          mixture_log_pdf(&model->emission[j], observations[t]);
       if (t == 0) {
         emission_log_sum[t][j] = emission_log;
       } else {
@@ -926,12 +1003,10 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   // Initialization (t=0): start with segments of length 1
   for (int j = 0; j < NUM_STATES; j++) {
     const StateDuration* duration_params = hmm_get_duration_params(model, j);
-    delta[0][j] =
-        hmm_safe_log(model->initial[j]) +
-        gaussian_log_pdf(observations[0], model->emission[j].mean,
-                         model->emission[j].variance, model->num_features) +
-        lognormal_log_pdf(1, duration_params->mean_log_duration,
-                          duration_params->stddev_log_duration);
+    delta[0][j] = hmm_safe_log(model->initial[j]) +
+                  mixture_log_pdf(&model->emission[j], observations[0]) +
+                  lognormal_log_pdf(1, duration_params->mean_log_duration,
+                                    duration_params->stddev_log_duration);
     psi[0][j] = -1; // No previous state
     duration[0][j] = 1;
   }
@@ -1138,20 +1213,23 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     fprintf(fp, "\n");
   }
 
-  // Save emission parameters
+  // Save emission parameters (per-component)
   fprintf(fp, "EMISSION\n");
   for (int i = 0; i < NUM_STATES; i++) {
     fprintf(fp, "STATE %d\n", i);
-    fprintf(fp, "MEAN ");
-    for (int j = 0; j < model->num_features; j++) {
-      fprintf(fp, "%.10f ", model->emission[i].mean[j]);
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      fprintf(fp, "WEIGHT %d %.10f\n", k, model->emission[i].weight[k]);
+      fprintf(fp, "MEAN_%d ", k);
+      for (int j = 0; j < model->num_features; j++) {
+        fprintf(fp, "%.10f ", model->emission[i].mean[k][j]);
+      }
+      fprintf(fp, "\n");
+      fprintf(fp, "VARIANCE_%d ", k);
+      for (int j = 0; j < model->num_features; j++) {
+        fprintf(fp, "%.10f ", model->emission[i].variance[k][j]);
+      }
+      fprintf(fp, "\n");
     }
-    fprintf(fp, "\n");
-    fprintf(fp, "VARIANCE ");
-    for (int j = 0; j < model->num_features; j++) {
-      fprintf(fp, "%.10f ", model->emission[i].variance[j]);
-    }
-    fprintf(fp, "\n");
   }
 
   // Save global feature statistics for Z-score normalization
@@ -1381,25 +1459,28 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
     }
   }
 
-  // Read emission parameters
+  // Read emission parameters (support new per-component format and legacy)
   if (fgets(line, sizeof(line), fp) != NULL &&
       strncmp(line, "EMISSION", 8) == 0) {
     for (int i = 0; i < NUM_STATES; i++) {
+      // Expect a "STATE <i>" line
       if (fgets(line, sizeof(line), fp) == NULL) {
         fclose(fp);
         return false;
       }
 
+      // Peek ahead to detect whether per-component blocks are present
+      long save_pos = ftell(fp);
       if (fgets(line, sizeof(line), fp) == NULL) {
         fclose(fp);
         return false;
       }
-      // MEAN
-      char* ptr = strstr(line, "MEAN");
-      if (ptr) {
-        ptr += 5;
+
+      if (strncmp(line, "MEAN", 4) == 0) {
+        // Legacy format: MEAN / VARIANCE lines
+        char* ptr = line + 5;
         for (int j = 0; j < model->num_features; j++) {
-          if (sscanf(ptr, "%lf", &model->emission[i].mean[j]) != 1)
+          if (sscanf(ptr, "%lf", &model->emission[i].mean[0][j]) != 1)
             break;
           ptr = strchr(ptr, ' ');
           if (ptr)
@@ -1407,24 +1488,84 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
           else
             break;
         }
-      }
+        if (fgets(line, sizeof(line), fp) == NULL) {
+          fclose(fp);
+          return false;
+        }
+        ptr = strstr(line, "VARIANCE");
+        if (ptr) {
+          ptr += 9;
+          for (int j = 0; j < model->num_features; j++) {
+            if (sscanf(ptr, "%lf", &model->emission[i].variance[0][j]) != 1)
+              break;
+            ptr = strchr(ptr, ' ');
+            if (ptr)
+              ptr++;
+            else
+              break;
+          }
+        }
+        // Populate other components with small perturbation
+        for (int k = 1; k < GMM_COMPONENTS; k++) {
+          for (int j = 0; j < model->num_features; j++) {
+            model->emission[i].mean[k][j] = model->emission[i].mean[0][j] + 0.1;
+            model->emission[i].variance[k][j] =
+                model->emission[i].variance[0][j] + 0.1;
+            model->emission[i].weight[k] = 1.0 / (double)GMM_COMPONENTS;
+          }
+        }
+      } else {
+        // New per-component format: rewind and parse per-component blocks
+        fseek(fp, save_pos, SEEK_SET);
+        for (int k = 0; k < GMM_COMPONENTS; k++) {
+          if (fgets(line, sizeof(line), fp) == NULL) {
+            fclose(fp);
+            return false;
+          }
+          // Expect WEIGHT <k> <value>
+          double w = 0.0;
+          sscanf(line, "WEIGHT %*d %lf", &w);
+          model->emission[i].weight[k] = w;
 
-      if (fgets(line, sizeof(line), fp) == NULL) {
-        fclose(fp);
-        return false;
-      }
-      // VARIANCE
-      ptr = strstr(line, "VARIANCE");
-      if (ptr) {
-        ptr += 9;
-        for (int j = 0; j < model->num_features; j++) {
-          if (sscanf(ptr, "%lf", &model->emission[i].variance[j]) != 1)
-            break;
-          ptr = strchr(ptr, ' ');
-          if (ptr)
-            ptr++;
-          else
-            break;
+          if (fgets(line, sizeof(line), fp) == NULL) {
+            fclose(fp);
+            return false;
+          }
+          char* ptr = strstr(line, "MEAN_");
+          if (ptr) {
+            ptr = strchr(ptr, ' ');
+            if (ptr)
+              ptr++;
+            for (int j = 0; j < model->num_features; j++) {
+              if (sscanf(ptr, "%lf", &model->emission[i].mean[k][j]) != 1)
+                break;
+              ptr = strchr(ptr, ' ');
+              if (ptr)
+                ptr++;
+              else
+                break;
+            }
+          }
+
+          if (fgets(line, sizeof(line), fp) == NULL) {
+            fclose(fp);
+            return false;
+          }
+          ptr = strstr(line, "VARIANCE_");
+          if (ptr) {
+            ptr = strchr(ptr, ' ');
+            if (ptr)
+              ptr++;
+            for (int j = 0; j < model->num_features; j++) {
+              if (sscanf(ptr, "%lf", &model->emission[i].variance[k][j]) != 1)
+                break;
+              ptr = strchr(ptr, ' ');
+              if (ptr)
+                ptr++;
+              else
+                break;
+            }
+          }
         }
       }
 
@@ -1434,10 +1575,16 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
   // Enforce variance flooring for numerical stability
   for (int i = 0; i < NUM_STATES; i++) {
-    for (int j = 0; j < model->num_features; j++) {
-      if (!isfinite(model->emission[i].variance[j]) ||
-          model->emission[i].variance[j] < kVarianceFloor) {
-        model->emission[i].variance[j] = kVarianceFloor;
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      for (int j = 0; j < model->num_features; j++) {
+        if (!isfinite(model->emission[i].variance[k][j]) ||
+            model->emission[i].variance[k][j] < kVarianceFloor) {
+          model->emission[i].variance[k][j] = kVarianceFloor;
+        }
+      }
+      if (model->emission[i].weight[k] <= 0.0 ||
+          !isfinite(model->emission[i].weight[k])) {
+        model->emission[i].weight[k] = 1.0 / (double)GMM_COMPONENTS;
       }
     }
   }

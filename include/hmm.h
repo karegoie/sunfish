@@ -20,12 +20,16 @@ typedef enum {
 // Maximum dimensionality of feature vectors (wavelet)
 #define MAX_NUM_FEATURES 8192
 
-// Gaussian emission parameters for a single state
+// Number of GMM components per state (fixed)
+#define GMM_COMPONENTS 2
+
+// Mixture-of-Gaussians emission (fixed K=2)
 typedef struct {
-  double mean[MAX_NUM_FEATURES];
-  double variance[MAX_NUM_FEATURES];
+  double weight[GMM_COMPONENTS];
+  double mean[GMM_COMPONENTS][MAX_NUM_FEATURES];
+  double variance[GMM_COMPONENTS][MAX_NUM_FEATURES];
   int num_features;
-} GaussianEmission;
+} MixtureEmission;
 
 // PWM structures for splice site scoring
 #define DONOR_MOTIF_SIZE 9
@@ -56,9 +60,8 @@ typedef struct {
   // Initial state probabilities
   double initial[NUM_STATES];
 
-  // Emission parameters for each state (multivariate Gaussian with diagonal
-  // covariance)
-  GaussianEmission emission[NUM_STATES];
+  // Emission parameters for each state (mixture of diagonal Gaussians)
+  MixtureEmission emission[NUM_STATES];
 
   int num_features;
   int wavelet_feature_count;
@@ -98,8 +101,13 @@ void hmm_init(HMMModel* model, int num_features);
  * @param num_features Dimension of vectors
  * @return Log probability
  */
-double gaussian_log_pdf(const double* observation, const double* mean,
-                        const double* variance, int num_features);
+/* Diagonal Gaussian log-PDF used internally by GMM routines */
+double diag_gaussian_logpdf(const double* observation, const double* mean,
+                            const double* variance, int num_features);
+
+/* Mixture log-PDF for emission models */
+double mixture_log_pdf(const MixtureEmission* emission,
+                       const double* observation);
 
 /**
  * Train HMM using Baum-Welch algorithm.
