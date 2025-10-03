@@ -1677,6 +1677,11 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
   hmm_sync_exon_duration(model);
 
+  // Compute num_wavelet_scales from wavelet_feature_count if not set
+  if (model->num_wavelet_scales == 0 && model->wavelet_feature_count > 0) {
+    model->num_wavelet_scales = model->wavelet_feature_count / 2;
+  }
+
   fclose(fp);
   return true;
 }
