@@ -42,6 +42,12 @@ typedef struct {
   double pwm_weight;
 } PWMModel;
 
+// Duration distribution parameters for HSMM
+typedef struct {
+  double mean_log_duration;   // mean of log(duration)
+  double stddev_log_duration; // standard deviation of log(duration)
+} StateDuration;
+
 // HMM model structure
 typedef struct {
   // Transition probabilities: transition[i][j] = P(state_j | state_i)
@@ -67,6 +73,9 @@ typedef struct {
 
   // PWM model for splice site scoring
   PWMModel pwm;
+
+  // Duration distribution parameters for HSMM (log-normal distribution)
+  StateDuration duration[NUM_STATES];
 
   // Chunking configuration stored with the model so prediction can reuse
   // the chunk size and overlap that were used during training.
