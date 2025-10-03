@@ -17,7 +17,7 @@ typedef enum {
 // Increased to support user-specified ranges up to 100 scales.
 #define MAX_NUM_WAVELETS 100
 
-// Maximum dimensionality of feature vectors (wavelet + k-mer)
+// Maximum dimensionality of feature vectors (wavelet)
 #define MAX_NUM_FEATURES 8192
 
 // Gaussian emission parameters for a single state
@@ -62,8 +62,6 @@ typedef struct {
 
   int num_features;
   int wavelet_feature_count;
-  int kmer_feature_count;
-  int kmer_size;
   int num_wavelet_scales;
   double wavelet_scales[MAX_NUM_WAVELETS];
 

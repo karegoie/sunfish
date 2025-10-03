@@ -2911,8 +2911,6 @@ static void handle_train(int argc, char* argv[]) {
   HMMModel model;
   hmm_init(&model, g_total_feature_count);
   model.wavelet_feature_count = g_num_wavelet_scales * 2;
-  model.kmer_feature_count = 0;
-  model.kmer_size = 0;
 
   fprintf(stderr, "Starting supervised training with two passes...\n");
 

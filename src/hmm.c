@@ -250,8 +250,6 @@ void hmm_init(HMMModel* model, int num_features) {
 
   model->num_features = num_features;
   model->wavelet_feature_count = 0;
-  model->kmer_feature_count = 0;
-  model->kmer_size = 0;
 
   // Initialize uniform transition probabilities
   for (int i = 0; i < NUM_STATES; i++) {
@@ -1122,8 +1120,6 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   fprintf(fp, "#HMM_MODEL_V1\n");
   fprintf(fp, "#num_features %d\n", model->num_features);
   fprintf(fp, "#wavelet_features %d\n", model->wavelet_feature_count);
-  fprintf(fp, "#kmer_features %d\n", model->kmer_feature_count);
-  fprintf(fp, "#kmer_size %d\n", model->kmer_size);
   fprintf(fp, "#num_states %d\n", NUM_STATES);
 
   // Save initial probabilities
@@ -1271,8 +1267,6 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
   model->num_features = 0;
   model->wavelet_feature_count = 0;
-  model->kmer_feature_count = 0;
-  model->kmer_size = 0;
   model->chunk_size = 0;
   model->chunk_overlap = 0;
   model->use_chunking = 0;
@@ -1300,10 +1294,7 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
     if (sscanf(line, "#wavelet_features %d", &model->wavelet_feature_count) ==
         1)
       continue;
-    if (sscanf(line, "#kmer_features %d", &model->kmer_feature_count) == 1)
-      continue;
-    if (sscanf(line, "#kmer_size %d", &model->kmer_size) == 1)
-      continue;
+    // Legacy k-mer metadata is ignored (no longer used).
     if (sscanf(line, "#chunk_size %d", &model->chunk_size) == 1)
       continue;
     if (sscanf(line, "#chunk_overlap %d", &model->chunk_overlap) == 1)
@@ -1340,30 +1331,13 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
   if (model->wavelet_feature_count < 0)
     model->wavelet_feature_count = 0;
-  if (model->kmer_feature_count < 0)
-    model->kmer_feature_count = 0;
 
-  if (model->wavelet_feature_count + model->kmer_feature_count == 0) {
+  if (model->wavelet_feature_count == 0) {
     model->wavelet_feature_count = model->num_features;
-  } else if (model->wavelet_feature_count == 0 &&
-             model->kmer_feature_count <= model->num_features) {
-    model->wavelet_feature_count =
-        model->num_features - model->kmer_feature_count;
   }
 
   if (model->wavelet_feature_count > model->num_features)
     model->wavelet_feature_count = model->num_features;
-
-  if (model->wavelet_feature_count + model->kmer_feature_count >
-      model->num_features) {
-    model->kmer_feature_count =
-        model->num_features - model->wavelet_feature_count;
-    if (model->kmer_feature_count < 0)
-      model->kmer_feature_count = 0;
-  }
-
-  if (model->kmer_size < 0)
-    model->kmer_size = 0;
 
   // Read initial probabilities
   if (fgets(line, sizeof(line), fp) != NULL &&
