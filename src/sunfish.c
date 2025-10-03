@@ -3368,7 +3368,7 @@ static void handle_train(int argc, char* argv[]) {
     fprintf(stderr, "Warning: Failed to train splice PWM model\n");
   }
 
-  const int kBaumWelchMaxIterations = 10; // FIXME
+  const int kBaumWelchMaxIterations = 100; // FIXME
   const double kBaumWelchThreshold = 10.0;
 
   fprintf(

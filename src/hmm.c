@@ -1154,15 +1154,6 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     fprintf(fp, "\n");
   }
 
-  // Save duration parameters (HSMM)
-  fprintf(fp, "DURATION\n");
-  for (int i = 0; i < NUM_STATES; i++) {
-    const StateDuration* duration_params =
-        hmm_get_duration_params(&tmp_model, i);
-    fprintf(fp, "%.10f %.10f\n", duration_params->mean_log_duration,
-            duration_params->stddev_log_duration);
-  }
-
   // Save global feature statistics for Z-score normalization
   fprintf(fp, "GLOBAL_STATS\n");
   fprintf(fp, "MEAN ");
@@ -1175,6 +1166,15 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     fprintf(fp, "%.10f ", model->global_feature_stddev[i]);
   }
   fprintf(fp, "\n");
+
+  // Save duration parameters (HSMM)
+  fprintf(fp, "DURATION\n");
+  for (int i = 0; i < NUM_STATES; i++) {
+    const StateDuration* duration_params =
+        hmm_get_duration_params(&tmp_model, i);
+    fprintf(fp, "%.10f %.10f\n", duration_params->mean_log_duration,
+            duration_params->stddev_log_duration);
+  }
 
   // Save PWM if present
   if (model->pwm.has_donor || model->pwm.has_acceptor) {
