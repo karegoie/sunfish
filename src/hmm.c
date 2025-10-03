@@ -47,6 +47,8 @@ static inline int hmm_exon_cycle_index(int state) {
 static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
                                              STATE_EXON_F2};
 
+static const double kVarianceFloor = 1e-3;
+
 static inline int hmm_positive_mod(int value, int mod) {
   int result = value % mod;
   if (result < 0)
@@ -295,9 +297,9 @@ double gaussian_log_pdf(const double* observation, const double* mean,
     double diff = observation[i] - mean[i];
     double var = variance[i];
 
-    // Prevent numerical issues with very small variance
-    if (var < 1e-6) {
-      var = 1e-6;
+    // Prevent numerical issues with non-finite or very small variance.
+    if (!isfinite(var) || var < kVarianceFloor) {
+      var = kVarianceFloor;
     }
 
     // Log of univariate Gaussian PDF

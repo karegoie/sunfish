@@ -2301,9 +2301,9 @@ static int g_total_feature_count =
     32; // 16 wavelet + 16 k-mer features by default
 
 // Chunk-based prediction configuration
-static int g_chunk_size = 50000;    // Default chunk size: 50kb
-static int g_chunk_overlap = 5000;  // Default overlap: 5kb
-static bool g_use_chunking = false; // Disabled by default; enable via CLI
+static int g_chunk_size = 50000;   // Default chunk size: 50kb
+static int g_chunk_overlap = 5000; // Default overlap: 5kb
+static bool g_use_chunking = true;
 
 // Thread-safe output queue
 typedef struct output_node_t {
@@ -2579,6 +2579,302 @@ static void output_queue_destroy(output_queue_t* queue) {
   pthread_mutex_destroy(&queue->mutex);
 }
 
+typedef struct {
+  int start;
+  int end;
+  int phase;
+} OutputExon;
+
+typedef struct {
+  char* seq_id;
+  char strand;
+  int start; // 1-based inclusive
+  int end;   // 1-based inclusive
+  double score;
+  OutputExon* exons;
+  size_t exon_count;
+} PredictedGeneRecord;
+
+typedef struct {
+  PredictedGeneRecord* genes;
+  size_t count;
+  size_t capacity;
+  pthread_mutex_t mutex;
+} predicted_gene_store_t;
+
+static predicted_gene_store_t g_predicted_gene_store;
+
+static void free_predicted_gene_record(PredictedGeneRecord* gene) {
+  if (!gene)
+    return;
+
+  free(gene->seq_id);
+  if (gene->exons) {
+    free(gene->exons);
+    gene->exons = NULL;
+  }
+  gene->exon_count = 0;
+}
+
+static void predicted_gene_store_init(predicted_gene_store_t* store) {
+  if (!store)
+    return;
+
+  store->genes = NULL;
+  store->count = 0;
+  store->capacity = 0;
+  pthread_mutex_init(&store->mutex, NULL);
+}
+
+static void predicted_gene_store_destroy(predicted_gene_store_t* store) {
+  if (!store)
+    return;
+
+  pthread_mutex_lock(&store->mutex);
+  for (size_t i = 0; i < store->count; i++) {
+    free_predicted_gene_record(&store->genes[i]);
+  }
+  free(store->genes);
+  store->genes = NULL;
+  store->count = 0;
+  store->capacity = 0;
+  pthread_mutex_unlock(&store->mutex);
+  pthread_mutex_destroy(&store->mutex);
+}
+
+static bool predicted_gene_store_reserve(predicted_gene_store_t* store,
+                                         size_t desired) {
+  if (!store)
+    return false;
+
+  if (desired <= store->capacity)
+    return true;
+
+  size_t new_capacity = store->capacity ? store->capacity * 2 : 16;
+  if (new_capacity < desired)
+    new_capacity = desired;
+
+  PredictedGeneRecord* resized = (PredictedGeneRecord*)realloc(
+      store->genes, new_capacity * sizeof(PredictedGeneRecord));
+  if (!resized)
+    return false;
+
+  store->genes = resized;
+  store->capacity = new_capacity;
+  return true;
+}
+
+static void predicted_gene_store_remove_at(predicted_gene_store_t* store,
+                                           size_t index) {
+  if (!store || index >= store->count)
+    return;
+
+  free_predicted_gene_record(&store->genes[index]);
+
+  if (index < store->count - 1) {
+    store->genes[index] = store->genes[store->count - 1];
+  }
+  store->count--;
+}
+
+static bool predicted_gene_intervals_overlap(const PredictedGeneRecord* a,
+                                             const PredictedGeneRecord* b) {
+  if (!a || !b)
+    return false;
+  if (a->strand != b->strand)
+    return false;
+  if (strcmp(a->seq_id, b->seq_id) != 0)
+    return false;
+
+  int a_start0 = a->start - 1;
+  int a_end0 = a->end - 1;
+  int b_start0 = b->start - 1;
+  int b_end0 = b->end - 1;
+
+  if (a_end0 < b_start0 || b_end0 < a_start0)
+    return false;
+  return true;
+}
+
+static int compare_gene_score(const PredictedGeneRecord* a,
+                              const PredictedGeneRecord* b) {
+  if (!a || !b)
+    return 0;
+
+  if (a->score > b->score)
+    return 1;
+  if (a->score < b->score)
+    return -1;
+
+  int a_span = a->end - a->start;
+  int b_span = b->end - b->start;
+  if (a_span > b_span)
+    return 1;
+  if (a_span < b_span)
+    return -1;
+
+  if (a->exon_count > b->exon_count)
+    return 1;
+  if (a->exon_count < b->exon_count)
+    return -1;
+
+  return 0;
+}
+
+static bool predicted_gene_store_add(predicted_gene_store_t* store,
+                                     const char* seq_id, char strand,
+                                     int gene_start, int gene_end, double score,
+                                     OutputExon* exons, size_t exon_count) {
+  if (!store || !seq_id || !exons || exon_count == 0)
+    return false;
+
+  PredictedGeneRecord candidate;
+  candidate.seq_id = strdup(seq_id);
+  if (!candidate.seq_id) {
+    free(exons);
+    return false;
+  }
+  candidate.strand = strand;
+  candidate.start = gene_start;
+  candidate.end = gene_end;
+  candidate.score = score;
+  candidate.exons = exons;
+  candidate.exon_count = exon_count;
+
+  pthread_mutex_lock(&store->mutex);
+
+  // Remove lower-scoring overlapping genes, or reject if existing is better
+  for (size_t idx = 0; idx < store->count;) {
+    PredictedGeneRecord* existing = &store->genes[idx];
+    if (!predicted_gene_intervals_overlap(existing, &candidate)) {
+      idx++;
+      continue;
+    }
+
+    int cmp = compare_gene_score(&candidate, existing);
+    if (cmp > 0) {
+      // Candidate better; remove existing and continue checking
+      predicted_gene_store_remove_at(store, idx);
+      continue;
+    } else {
+      // Existing is better or equal—discard candidate
+      pthread_mutex_unlock(&store->mutex);
+      free_predicted_gene_record(&candidate);
+      return true;
+    }
+  }
+
+  if (!predicted_gene_store_reserve(store, store->count + 1)) {
+    pthread_mutex_unlock(&store->mutex);
+    free_predicted_gene_record(&candidate);
+    return false;
+  }
+
+  store->genes[store->count++] = candidate;
+  pthread_mutex_unlock(&store->mutex);
+  return true;
+}
+
+static int compare_gene_records_for_output(const void* a, const void* b) {
+  const PredictedGeneRecord* const* ga = (const PredictedGeneRecord* const*)a;
+  const PredictedGeneRecord* const* gb = (const PredictedGeneRecord* const*)b;
+
+  int cmp = strcmp((*ga)->seq_id, (*gb)->seq_id);
+  if (cmp != 0)
+    return cmp;
+
+  if ((*ga)->start < (*gb)->start)
+    return -1;
+  if ((*ga)->start > (*gb)->start)
+    return 1;
+
+  if ((*ga)->end < (*gb)->end)
+    return -1;
+  if ((*ga)->end > (*gb)->end)
+    return 1;
+
+  if ((*ga)->score > (*gb)->score)
+    return -1;
+  if ((*ga)->score < (*gb)->score)
+    return 1;
+
+  return 0;
+}
+
+static void predicted_gene_store_emit_to_queue(predicted_gene_store_t* store) {
+  if (!store)
+    return;
+
+  pthread_mutex_lock(&store->mutex);
+  size_t count = store->count;
+  if (count == 0) {
+    pthread_mutex_unlock(&store->mutex);
+    return;
+  }
+
+  PredictedGeneRecord** order =
+      (PredictedGeneRecord**)malloc(count * sizeof(PredictedGeneRecord*));
+  if (!order) {
+    pthread_mutex_unlock(&store->mutex);
+    return;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    order[i] = &store->genes[i];
+  }
+
+  qsort(order, count, sizeof(PredictedGeneRecord*),
+        compare_gene_records_for_output);
+
+  g_gene_counter = 0;
+
+  for (size_t i = 0; i < count; i++) {
+    PredictedGeneRecord* gene = order[i];
+    if (!gene)
+      continue;
+
+    int gene_id = 0;
+    pthread_mutex_lock(&g_gene_counter_mutex);
+    gene_id = ++g_gene_counter;
+    pthread_mutex_unlock(&g_gene_counter_mutex);
+
+    char gff_line[1024];
+    snprintf(gff_line, sizeof(gff_line),
+             "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
+             gene->seq_id, gene->start, gene->end, gene->score, gene->strand,
+             gene_id);
+    output_queue_add(&g_output_queue, gff_line);
+
+    char mrna_id[64];
+    snprintf(mrna_id, sizeof(mrna_id), "mRNA-gene%d", gene_id);
+    snprintf(gff_line, sizeof(gff_line),
+             "%s\tsunfish\tmRNA\t%d\t%d\t%.2f\t%c\t.\tID=%s;Parent=gene%d\n",
+             gene->seq_id, gene->start, gene->end, gene->score, gene->strand,
+             mrna_id, gene_id);
+    output_queue_add(&g_output_queue, gff_line);
+
+    for (size_t exon_idx = 0; exon_idx < gene->exon_count; exon_idx++) {
+      const OutputExon* exon = &gene->exons[exon_idx];
+      snprintf(
+          gff_line, sizeof(gff_line),
+          "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;Parent=%s\n",
+          gene->seq_id, exon->start, exon->end, gene->score, gene->strand,
+          mrna_id, exon_idx + 1, mrna_id);
+      output_queue_add(&g_output_queue, gff_line);
+
+      snprintf(gff_line, sizeof(gff_line),
+               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
+               "gene%d\n",
+               gene->seq_id, exon->start, exon->end, gene->score, gene->strand,
+               exon->phase, gene_id, exon_idx + 1, gene_id);
+      output_queue_add(&g_output_queue, gff_line);
+    }
+  }
+
+  free(order);
+  pthread_mutex_unlock(&store->mutex);
+}
+
 // Parse command-line wavelet scales argument
 static int parse_wavelet_scales(const char* arg, double* scales,
                                 int max_scales) {
@@ -2813,6 +3109,87 @@ typedef struct {
   bool is_chunk;   // Whether this is a chunk or full sequence
 } training_task_t;
 
+typedef struct {
+  int genome_index;
+  const char* seq_id;
+  int seq_len;
+  char strand;
+  int chunk_start;
+  int chunk_end;
+  int chunk_index;
+  int chunk_count;
+  int orientation_start;
+  int effective_start;
+  int effective_length;
+  int state_offset;
+} training_segment_meta_t;
+
+typedef struct {
+  int* plus_indices;
+  int plus_count;
+  int plus_capacity;
+  int* minus_indices;
+  int minus_count;
+  int minus_capacity;
+} sequence_segment_collection_t;
+
+static training_segment_meta_t* g_training_segment_meta_for_sort = NULL;
+
+static int compare_training_segment_indices(const void* lhs, const void* rhs) {
+  const int idx_a = *(const int*)lhs;
+  const int idx_b = *(const int*)rhs;
+
+  if (!g_training_segment_meta_for_sort)
+    return 0;
+
+  const training_segment_meta_t* meta = g_training_segment_meta_for_sort;
+  int start_a = meta[idx_a].orientation_start;
+  int start_b = meta[idx_b].orientation_start;
+
+  if (start_a < start_b)
+    return -1;
+  if (start_a > start_b)
+    return 1;
+  return 0;
+}
+
+static bool append_segment_index(int** array, int* count, int* capacity,
+                                 int value) {
+  if (!array || !count || !capacity)
+    return false;
+
+  if (*count >= *capacity) {
+    int new_capacity = (*capacity == 0) ? 8 : (*capacity * 2);
+    int* resized = (int*)realloc(*array, new_capacity * sizeof(int));
+    if (!resized)
+      return false;
+    *array = resized;
+    *capacity = new_capacity;
+  }
+
+  (*array)[(*count)++] = value;
+  return true;
+}
+
+static void
+free_sequence_segment_collections(sequence_segment_collection_t* collections,
+                                  int count) {
+  if (!collections || count <= 0)
+    return;
+
+  for (int i = 0; i < count; i++) {
+    free(collections[i].plus_indices);
+    free(collections[i].minus_indices);
+    collections[i].plus_indices = NULL;
+    collections[i].minus_indices = NULL;
+    collections[i].plus_count = 0;
+    collections[i].minus_count = 0;
+    collections[i].plus_capacity = 0;
+    collections[i].minus_capacity = 0;
+  }
+  free(collections);
+}
+
 static void training_observation_worker(void* arg) {
   training_task_t* task = (training_task_t*)arg;
   if (task == NULL)
@@ -2991,12 +3368,6 @@ static void output_predicted_gene(const prediction_task_t* task,
     return;
 
   const char* seq_id = task->seq_id ? task->seq_id : "(unknown)";
-
-  int gene_id = 0;
-  pthread_mutex_lock(&g_gene_counter_mutex);
-  gene_id = ++g_gene_counter;
-  pthread_mutex_unlock(&g_gene_counter_mutex);
-
   int output_start = 0;
   int output_end = 0;
 
@@ -3018,22 +3389,10 @@ static void output_predicted_gene(const prediction_task_t* task,
   if (output_end > original_length)
     output_end = original_length;
 
-  char gff_line[1024];
-  snprintf(gff_line, sizeof(gff_line),
-           "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n", seq_id,
-           output_start, output_end, score, task->strand, gene_id);
-  output_queue_add(&g_output_queue, gff_line);
-
-  /* Also emit an mRNA feature corresponding to this gene so downstream
-    tools (like gffcompare) that expect transcript/mRNA entries can compute
-    exon-level statistics. We treat the gene as the parent (gene -> mRNA). */
-  char mrna_id[64];
-  snprintf(mrna_id, sizeof(mrna_id), "mRNA-gene%d", gene_id);
-  snprintf(gff_line, sizeof(gff_line),
-           "%s\tsunfish\tmRNA\t%d\t%d\t%.2f\t%c\t.\tID=%s;Parent=gene%d\n",
-           seq_id, output_start, output_end, score, task->strand, mrna_id,
-           gene_id);
-  output_queue_add(&g_output_queue, gff_line);
+  OutputExon* final_exons =
+      (OutputExon*)malloc(exon_count * sizeof(OutputExon));
+  if (!final_exons)
+    return;
 
   if (task->strand == '+') {
     for (size_t idx = 0; idx < exon_count; idx++) {
@@ -3044,23 +3403,18 @@ static void output_predicted_gene(const prediction_task_t* task,
         cds_start = 1;
       if (cds_end > original_length)
         cds_end = original_length;
+      if (cds_end < cds_start) {
+        int tmp = cds_start;
+        cds_start = cds_end;
+        cds_end = tmp;
+      }
 
-      /* Emit exon feature corresponding to this CDS (Parent = mRNA) */
-      snprintf(
-          gff_line, sizeof(gff_line),
-          "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;Parent=%s\n",
-          seq_id, cds_start, cds_end, score, task->strand, mrna_id, idx + 1,
-          mrna_id);
-      output_queue_add(&g_output_queue, gff_line);
-
-      snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
-               "gene%d\n",
-               seq_id, cds_start, cds_end, score, task->strand, exon->phase,
-               gene_id, idx + 1, gene_id);
-      output_queue_add(&g_output_queue, gff_line);
+      final_exons[idx].start = cds_start;
+      final_exons[idx].end = cds_end;
+      final_exons[idx].phase = exons[idx].phase;
     }
   } else {
+    size_t out_idx = 0;
     for (size_t reverse_idx = exon_count; reverse_idx-- > 0;) {
       const PredictedExon* exon = &exons[reverse_idx];
       int cds_start = original_length - exon->end;
@@ -3069,29 +3423,29 @@ static void output_predicted_gene(const prediction_task_t* task,
         cds_start = 1;
       if (cds_end > original_length)
         cds_end = original_length;
-
-      /* Emit exon feature corresponding to this CDS (Parent = mRNA) */
-      snprintf(
-          gff_line, sizeof(gff_line),
-          "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;Parent=%s\n",
-          seq_id, cds_start, cds_end, score, task->strand, mrna_id,
-          exon_count - reverse_idx, mrna_id);
-      output_queue_add(&g_output_queue, gff_line);
-
-      snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
-               "gene%d\n",
-               seq_id, cds_start, cds_end, score, task->strand, exon->phase,
-               gene_id, exon_count - reverse_idx, gene_id);
-      output_queue_add(&g_output_queue, gff_line);
+      if (cds_end < cds_start) {
+        int tmp = cds_start;
+        cds_start = cds_end;
+        cds_end = tmp;
+      }
+      final_exons[out_idx].start = cds_start;
+      final_exons[out_idx].end = cds_end;
+      final_exons[out_idx].phase = exon->phase;
+      out_idx++;
     }
+  }
+
+  if (!predicted_gene_store_add(&g_predicted_gene_store, seq_id, task->strand,
+                                output_start, output_end, score, final_exons,
+                                exon_count)) {
+    free(final_exons);
   }
 }
 
 // Validate ORF: check start codon, stop codon, in-frame stops, and length
 static bool is_valid_orf(const char* cds_sequence) {
   // FOR DEBUGGING PURPOSE ONLY; FIXME
-  return true;
+  // return true;
 
   if (!cds_sequence) {
     return false;
@@ -3442,7 +3796,7 @@ static void print_help(const char* progname) {
   printf("  help                         Show this help message\n"
          "  train <train.fasta> <train.gff> [--wavelet|-w S1,S2,...|s:e:step]"
          " [--kmer|-k K] [--threads|-t N] [--chunk-size N] [--chunk-overlap M]"
-         " [--chunk|--no-chunk]\n"
+         "\n"
          "  predict <target.fasta> [--threads|-t N]\n\n");
   printf("Options:\n");
   printf("  -h, --help                   Show this help message\n");
@@ -3455,9 +3809,7 @@ static void print_help(const char* progname) {
       "  --threads, -t N             Number of worker threads (default: auto-"
       "detected)\n"
       "  --chunk-size N              Chunk size in bases for long sequences\n"
-      "  --chunk-overlap M           Overlap size in bases between chunks\n"
-      "  --chunk                     Enable chunked processing (default: off)\n"
-      "  --no-chunk                  Disable chunked processing\n\n");
+      "  --chunk-overlap M           Overlap size in bases between chunks\n\n");
   printf("Examples:\n");
   printf("  %s train data.fa data.gff --wavelet 3,9,81\n", progname);
   printf("  %s predict genome.fa --threads 8 > predictions.gff3\n\n", progname);
@@ -3742,39 +4094,22 @@ static void normalize_observations_in_place(double*** observations,
   }
 }
 
-static void accumulate_statistics_for_sequence(
-    const HMMModel* model, double*** observations, int* seq_lengths,
-    int obs_idx, int seq_len, const int* state_labels,
+static void accumulate_statistics_for_segment(
+    const HMMModel* model, double** observations, int obs_len,
+    const int* state_labels,
     long long transition_counts[NUM_STATES][NUM_STATES],
     double emission_sum[NUM_STATES][MAX_NUM_FEATURES],
     double emission_sum_sq[NUM_STATES][MAX_NUM_FEATURES],
     long long state_observation_counts[NUM_STATES],
     long long initial_counts[NUM_STATES]) {
-  if (!model || !observations || !state_labels || !transition_counts ||
-      !emission_sum || !emission_sum_sq || !state_observation_counts ||
-      !initial_counts)
-    return;
-
-  if (obs_idx < 0)
-    return;
-
-  double** obs = observations[obs_idx];
-  if (!obs)
-    return;
-
-  int obs_len = seq_lengths ? seq_lengths[obs_idx] : seq_len;
-  if (seq_len <= 0 || obs_len <= 0)
-    return;
-
-  int effective_len = (seq_len < obs_len) ? seq_len : obs_len;
-  if (effective_len <= 0)
+  if (!model || !observations || !state_labels || obs_len <= 0)
     return;
 
   int num_features = model->num_features;
   if (num_features > MAX_NUM_FEATURES)
     num_features = MAX_NUM_FEATURES;
 
-  for (int t = 0; t < effective_len; t++) {
+  for (int t = 0; t < obs_len; t++) {
     int state = state_labels[t];
     if (state < 0 || state >= NUM_STATES)
       state = STATE_INTERGENIC;
@@ -3782,15 +4117,19 @@ static void accumulate_statistics_for_sequence(
     if (t == 0)
       initial_counts[state]++;
 
-    if (t < effective_len - 1) {
+    if (t < obs_len - 1) {
       int next_state = state_labels[t + 1];
       if (next_state < 0 || next_state >= NUM_STATES)
         next_state = STATE_INTERGENIC;
       transition_counts[state][next_state]++;
     }
 
+    double* feature_vec = observations[t];
+    if (!feature_vec)
+      continue;
+
     for (int f = 0; f < num_features; f++) {
-      double normalized_val = obs[t][f];
+      double normalized_val = feature_vec[f];
       emission_sum[state][f] += normalized_val;
       emission_sum_sq[state][f] += normalized_val * normalized_val;
     }
@@ -4183,7 +4522,7 @@ static void handle_train(int argc, char* argv[]) {
         stderr,
         "Usage: %s train <train.fasta> <train.gff> [--wavelet|-w "
         "S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N] [--chunk-size N]"
-        " [--chunk-overlap M] [--chunk|--no-chunk]\n",
+        " [--chunk-overlap M]\n",
         argv[0]);
     exit(1);
   }
@@ -4295,10 +4634,6 @@ static void handle_train(int argc, char* argv[]) {
       }
       g_chunk_overlap = value;
       g_use_chunking = true;
-    } else if (strcmp(argv[i], "--chunk") == 0) {
-      g_use_chunking = true;
-    } else if (strcmp(argv[i], "--no-chunk") == 0) {
-      g_use_chunking = false;
     }
   }
 
@@ -4348,32 +4683,60 @@ static void handle_train(int argc, char* argv[]) {
     sort_group_exons(&groups[i]);
   }
 
-  // Extract observation sequences from CDS regions
-  // For simplicity, we'll compute feature matrices for all sequences in
-  // parallel
-  int total_sequences = genome->count * 2;
-  double*** observations =
-      (double***)malloc(total_sequences * sizeof(double**));
-  int* seq_lengths = (int*)malloc(total_sequences * sizeof(int));
+  // Extract observation sequences from CDS regions using chunked processing
+  int total_segments = 0;
+  for (int i = 0; i < genome->count; i++) {
+    const char* seq = genome->records[i].sequence;
+    if (!seq)
+      continue;
+    int seq_len = strlen(seq);
+    if (seq_len <= 0)
+      continue;
 
-  if (!observations || !seq_lengths) {
-    fprintf(stderr, "Failed to allocate buffers for training observations\n");
-    free(observations);
-    free(seq_lengths);
+    int chunk_count =
+        calculate_num_chunks(seq_len, g_chunk_size, g_chunk_overlap);
+    if (chunk_count < 1)
+      chunk_count = 1;
+    total_segments += chunk_count * 2;
+  }
+
+  if (total_segments <= 0) {
+    fprintf(stderr,
+            "No valid sequences found for training after chunk partitioning\n");
     free_cds_groups(groups, group_count);
     free_fasta_data(genome);
     exit(1);
   }
 
-  for (int i = 0; i < total_sequences; i++) {
+  double*** observations = (double***)malloc(total_segments * sizeof(double**));
+  int* seq_lengths = (int*)malloc(total_segments * sizeof(int));
+  training_segment_meta_t* segment_meta = (training_segment_meta_t*)calloc(
+      total_segments, sizeof(training_segment_meta_t));
+  sequence_segment_collection_t* segment_collections =
+      (sequence_segment_collection_t*)calloc(
+          genome->count, sizeof(sequence_segment_collection_t));
+
+  if (!observations || !seq_lengths || !segment_meta || !segment_collections) {
+    fprintf(stderr, "Failed to allocate buffers for training observations\n");
+    free(observations);
+    free(seq_lengths);
+    free(segment_meta);
+    if (segment_collections)
+      free_sequence_segment_collections(segment_collections, genome->count);
+    free_cds_groups(groups, group_count);
+    free_fasta_data(genome);
+    exit(1);
+  }
+
+  for (int i = 0; i < total_segments; i++) {
     observations[i] = NULL;
     seq_lengths[i] = 0;
   }
 
   fprintf(stderr,
           "Augmenting training data with reverse complements (%d total "
-          "sequences)\n",
-          total_sequences);
+          "segments)\n",
+          total_segments);
   fprintf(stderr,
           "Computing feature matrices (wavelet + k-mer) for training sequences "
           "using up to %d threads...\n",
@@ -4384,6 +4747,8 @@ static void handle_train(int argc, char* argv[]) {
     fprintf(stderr, "Failed to create thread pool for training\n");
     free(observations);
     free(seq_lengths);
+    free(segment_meta);
+    free_sequence_segment_collections(segment_collections, genome->count);
     free_cds_groups(groups, group_count);
     free_fasta_data(genome);
     exit(1);
@@ -4395,6 +4760,8 @@ static void handle_train(int argc, char* argv[]) {
     thread_pool_destroy(pool);
     free(observations);
     free(seq_lengths);
+    free(segment_meta);
+    free_sequence_segment_collections(segment_collections, genome->count);
     free_cds_groups(groups, group_count);
     free_fasta_data(genome);
     exit(1);
@@ -4403,106 +4770,201 @@ static void handle_train(int argc, char* argv[]) {
   bool worker_error = false;
   char error_message[256] = {0};
   bool scheduling_failed = false;
+  int segment_idx = 0;
 
   for (int i = 0; i < genome->count && !scheduling_failed; i++) {
     const char* seq = genome->records[i].sequence;
     const char* seq_id = genome->records[i].id;
+    if (!seq)
+      continue;
     int seq_len = strlen(seq);
-    int forward_idx = i * 2;
-    int reverse_idx = forward_idx + 1;
+    if (seq_len <= 0)
+      continue;
 
-    training_task_t* forward_task =
-        (training_task_t*)malloc(sizeof(training_task_t));
-    if (!forward_task) {
-      pthread_mutex_lock(&error_mutex);
-      if (!worker_error) {
-        worker_error = true;
+    int chunk_count =
+        calculate_num_chunks(seq_len, g_chunk_size, g_chunk_overlap);
+    if (chunk_count < 1)
+      chunk_count = 1;
+
+    for (int chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
+      int chunk_start = 0;
+      int chunk_end = 0;
+      get_chunk_bounds(seq_len, g_chunk_size, g_chunk_overlap, chunk_idx,
+                       &chunk_start, &chunk_end);
+      if (chunk_end <= chunk_start)
+        continue;
+      int chunk_len = chunk_end - chunk_start;
+
+      if (segment_idx + 2 > total_segments) {
+        scheduling_failed = true;
         snprintf(error_message, sizeof(error_message),
-                 "Failed to allocate training task for %s (+ strand)",
-                 seq_id ? seq_id : "(unknown)");
+                 "Internal error: segment index overflow during scheduling");
+        break;
       }
-      pthread_mutex_unlock(&error_mutex);
-      scheduling_failed = true;
-      break;
-    }
 
-    memset(forward_task, 0, sizeof(training_task_t));
-    forward_task->sequence = seq;
-    forward_task->seq_id = seq_id;
-    forward_task->seq_len = seq_len;
-    forward_task->array_index = forward_idx;
-    forward_task->strand = '+';
-    forward_task->observations_array = observations;
-    forward_task->seq_lengths_array = seq_lengths;
-    forward_task->error_mutex = &error_mutex;
-    forward_task->error_flag = &worker_error;
-    forward_task->error_message = error_message;
-    forward_task->error_message_size = sizeof(error_message);
-    forward_task->sequence_number = i + 1;
-    forward_task->chunk_start = 0;
-    forward_task->chunk_end = seq_len;
-    forward_task->is_chunk = false;
+      training_segment_meta_t* forward_meta = &segment_meta[segment_idx];
+      forward_meta->genome_index = i;
+      forward_meta->seq_id = seq_id;
+      forward_meta->seq_len = seq_len;
+      forward_meta->strand = '+';
+      forward_meta->chunk_start = chunk_start;
+      forward_meta->chunk_end = chunk_end;
+      forward_meta->chunk_index = chunk_idx;
+      forward_meta->chunk_count = chunk_count;
+      forward_meta->orientation_start = chunk_start;
+      forward_meta->effective_start = chunk_start;
+      forward_meta->effective_length = chunk_len;
+      forward_meta->state_offset = chunk_start;
 
-    if (!thread_pool_add_task(pool, training_observation_worker,
-                              forward_task)) {
-      pthread_mutex_lock(&error_mutex);
-      if (!worker_error) {
-        worker_error = true;
-        snprintf(error_message, sizeof(error_message),
-                 "Failed to enqueue training task for %s (+ strand)",
-                 seq_id ? seq_id : "(unknown)");
+      if (!append_segment_index(&segment_collections[i].plus_indices,
+                                &segment_collections[i].plus_count,
+                                &segment_collections[i].plus_capacity,
+                                segment_idx)) {
+        pthread_mutex_lock(&error_mutex);
+        if (!worker_error) {
+          worker_error = true;
+          snprintf(
+              error_message, sizeof(error_message),
+              "Failed to track training segment metadata for %s (+ strand)",
+              seq_id ? seq_id : "(unknown)");
+        }
+        pthread_mutex_unlock(&error_mutex);
+        scheduling_failed = true;
+        break;
       }
-      pthread_mutex_unlock(&error_mutex);
-      free(forward_task);
-      scheduling_failed = true;
-      break;
-    }
 
-    training_task_t* reverse_task =
-        (training_task_t*)malloc(sizeof(training_task_t));
-    if (!reverse_task) {
-      pthread_mutex_lock(&error_mutex);
-      if (!worker_error) {
-        worker_error = true;
-        snprintf(error_message, sizeof(error_message),
-                 "Failed to allocate training task for %s (- strand)",
-                 seq_id ? seq_id : "(unknown)");
+      training_task_t* forward_task =
+          (training_task_t*)malloc(sizeof(training_task_t));
+      if (!forward_task) {
+        pthread_mutex_lock(&error_mutex);
+        if (!worker_error) {
+          worker_error = true;
+          snprintf(
+              error_message, sizeof(error_message),
+              "Failed to allocate training task for %s (+ strand chunk %d)",
+              seq_id ? seq_id : "(unknown)", chunk_idx + 1);
+        }
+        pthread_mutex_unlock(&error_mutex);
+        scheduling_failed = true;
+        break;
       }
-      pthread_mutex_unlock(&error_mutex);
-      scheduling_failed = true;
-      break;
-    }
 
-    memset(reverse_task, 0, sizeof(training_task_t));
-    reverse_task->sequence = seq;
-    reverse_task->seq_id = seq_id;
-    reverse_task->seq_len = seq_len;
-    reverse_task->array_index = reverse_idx;
-    reverse_task->strand = '-';
-    reverse_task->observations_array = observations;
-    reverse_task->seq_lengths_array = seq_lengths;
-    reverse_task->error_mutex = &error_mutex;
-    reverse_task->error_flag = &worker_error;
-    reverse_task->error_message = error_message;
-    reverse_task->error_message_size = sizeof(error_message);
-    reverse_task->sequence_number = i + 1;
-    reverse_task->chunk_start = 0;
-    reverse_task->chunk_end = seq_len;
-    reverse_task->is_chunk = false;
+      memset(forward_task, 0, sizeof(training_task_t));
+      forward_task->sequence = seq;
+      forward_task->seq_id = seq_id;
+      forward_task->seq_len = seq_len;
+      forward_task->array_index = segment_idx;
+      forward_task->strand = '+';
+      forward_task->observations_array = observations;
+      forward_task->seq_lengths_array = seq_lengths;
+      forward_task->error_mutex = &error_mutex;
+      forward_task->error_flag = &worker_error;
+      forward_task->error_message = error_message;
+      forward_task->error_message_size = sizeof(error_message);
+      forward_task->sequence_number = i + 1;
+      forward_task->chunk_start = chunk_start;
+      forward_task->chunk_end = chunk_end;
+      forward_task->is_chunk = (chunk_count > 1);
 
-    if (!thread_pool_add_task(pool, training_observation_worker,
-                              reverse_task)) {
-      pthread_mutex_lock(&error_mutex);
-      if (!worker_error) {
-        worker_error = true;
-        snprintf(error_message, sizeof(error_message),
-                 "Failed to enqueue training task for %s (- strand)",
-                 seq_id ? seq_id : "(unknown)");
+      if (!thread_pool_add_task(pool, training_observation_worker,
+                                forward_task)) {
+        pthread_mutex_lock(&error_mutex);
+        if (!worker_error) {
+          worker_error = true;
+          snprintf(error_message, sizeof(error_message),
+                   "Failed to enqueue training task for %s (+ strand chunk %d)",
+                   seq_id ? seq_id : "(unknown)", chunk_idx + 1);
+        }
+        pthread_mutex_unlock(&error_mutex);
+        free(forward_task);
+        scheduling_failed = true;
+        break;
       }
-      pthread_mutex_unlock(&error_mutex);
-      free(reverse_task);
-      scheduling_failed = true;
-      break;
+
+      segment_idx++;
+
+      training_segment_meta_t* reverse_meta = &segment_meta[segment_idx];
+      reverse_meta->genome_index = i;
+      reverse_meta->seq_id = seq_id;
+      reverse_meta->seq_len = seq_len;
+      reverse_meta->strand = '-';
+      reverse_meta->chunk_start = chunk_start;
+      reverse_meta->chunk_end = chunk_end;
+      reverse_meta->chunk_index = chunk_idx;
+      reverse_meta->chunk_count = chunk_count;
+      reverse_meta->orientation_start = seq_len - chunk_end;
+      if (reverse_meta->orientation_start < 0)
+        reverse_meta->orientation_start = 0;
+      reverse_meta->effective_start = reverse_meta->orientation_start;
+      reverse_meta->effective_length = chunk_len;
+      reverse_meta->state_offset = reverse_meta->orientation_start;
+
+      if (!append_segment_index(&segment_collections[i].minus_indices,
+                                &segment_collections[i].minus_count,
+                                &segment_collections[i].minus_capacity,
+                                segment_idx)) {
+        pthread_mutex_lock(&error_mutex);
+        if (!worker_error) {
+          worker_error = true;
+          snprintf(
+              error_message, sizeof(error_message),
+              "Failed to track training segment metadata for %s (- strand)",
+              seq_id ? seq_id : "(unknown)");
+        }
+        pthread_mutex_unlock(&error_mutex);
+        scheduling_failed = true;
+        break;
+      }
+
+      training_task_t* reverse_task =
+          (training_task_t*)malloc(sizeof(training_task_t));
+      if (!reverse_task) {
+        pthread_mutex_lock(&error_mutex);
+        if (!worker_error) {
+          worker_error = true;
+          snprintf(
+              error_message, sizeof(error_message),
+              "Failed to allocate training task for %s (- strand chunk %d)",
+              seq_id ? seq_id : "(unknown)", chunk_idx + 1);
+        }
+        pthread_mutex_unlock(&error_mutex);
+        scheduling_failed = true;
+        break;
+      }
+
+      memset(reverse_task, 0, sizeof(training_task_t));
+      reverse_task->sequence = seq;
+      reverse_task->seq_id = seq_id;
+      reverse_task->seq_len = seq_len;
+      reverse_task->array_index = segment_idx;
+      reverse_task->strand = '-';
+      reverse_task->observations_array = observations;
+      reverse_task->seq_lengths_array = seq_lengths;
+      reverse_task->error_mutex = &error_mutex;
+      reverse_task->error_flag = &worker_error;
+      reverse_task->error_message = error_message;
+      reverse_task->error_message_size = sizeof(error_message);
+      reverse_task->sequence_number = i + 1;
+      reverse_task->chunk_start = chunk_start;
+      reverse_task->chunk_end = chunk_end;
+      reverse_task->is_chunk = (chunk_count > 1);
+
+      if (!thread_pool_add_task(pool, training_observation_worker,
+                                reverse_task)) {
+        pthread_mutex_lock(&error_mutex);
+        if (!worker_error) {
+          worker_error = true;
+          snprintf(error_message, sizeof(error_message),
+                   "Failed to enqueue training task for %s (- strand chunk %d)",
+                   seq_id ? seq_id : "(unknown)", chunk_idx + 1);
+        }
+        pthread_mutex_unlock(&error_mutex);
+        free(reverse_task);
+        scheduling_failed = true;
+        break;
+      }
+
+      segment_idx++;
     }
   }
 
@@ -4510,25 +4972,154 @@ static void handle_train(int argc, char* argv[]) {
   thread_pool_destroy(pool);
   pthread_mutex_destroy(&error_mutex);
 
+  if (segment_idx < total_segments)
+    total_segments = segment_idx;
+
   if (worker_error || scheduling_failed) {
     fprintf(stderr, "%s\n",
             error_message[0] ? error_message
                              : "Failed to prepare training observations");
-    for (int i = 0; i < total_sequences; i++) {
+    for (int i = 0; i < total_segments; i++) {
       if (observations[i]) {
         free_observation_sequence(observations[i], seq_lengths[i]);
       }
     }
     free(observations);
     free(seq_lengths);
+    free(segment_meta);
+    free_sequence_segment_collections(segment_collections, genome->count);
     free_cds_groups(groups, group_count);
     free_fasta_data(genome);
     exit(1);
   }
 
+  for (int seq_idx = 0; seq_idx < genome->count; seq_idx++) {
+    const char* seq = genome->records[seq_idx].sequence;
+    if (!seq)
+      continue;
+    int seq_len = strlen(seq);
+    if (seq_len <= 0)
+      continue;
+
+    sequence_segment_collection_t* coll = &segment_collections[seq_idx];
+
+    if (coll->plus_count > 1) {
+      g_training_segment_meta_for_sort = segment_meta;
+      qsort(coll->plus_indices, coll->plus_count, sizeof(int),
+            compare_training_segment_indices);
+    }
+    for (int idx = 0; idx < coll->plus_count; idx++) {
+      int seg_index = coll->plus_indices[idx];
+      training_segment_meta_t* meta = &segment_meta[seg_index];
+      int start = meta->orientation_start;
+      int len = seq_lengths[seg_index];
+      int next_start =
+          (idx + 1 < coll->plus_count)
+              ? segment_meta[coll->plus_indices[idx + 1]].orientation_start
+              : seq_len;
+      if (next_start > start + len)
+        next_start = start + len;
+      if (next_start < start)
+        next_start = start;
+      meta->effective_start = start;
+      meta->effective_length = next_start - start;
+      meta->state_offset = start;
+    }
+
+    if (coll->minus_count > 1) {
+      g_training_segment_meta_for_sort = segment_meta;
+      qsort(coll->minus_indices, coll->minus_count, sizeof(int),
+            compare_training_segment_indices);
+    }
+    for (int idx = 0; idx < coll->minus_count; idx++) {
+      int seg_index = coll->minus_indices[idx];
+      training_segment_meta_t* meta = &segment_meta[seg_index];
+      int start = meta->orientation_start;
+      int len = seq_lengths[seg_index];
+      int next_start =
+          (idx + 1 < coll->minus_count)
+              ? segment_meta[coll->minus_indices[idx + 1]].orientation_start
+              : seq_len;
+      if (next_start > start + len)
+        next_start = start + len;
+      if (next_start < start)
+        next_start = start;
+      meta->effective_start = start;
+      meta->effective_length = next_start - start;
+      meta->state_offset = start;
+    }
+  }
+
+  for (int idx = 0; idx < total_segments; idx++) {
+    training_segment_meta_t* meta = &segment_meta[idx];
+    double** chunk_obs = observations[idx];
+    int chunk_len = seq_lengths[idx];
+
+    if (!chunk_obs || chunk_len <= 0) {
+      seq_lengths[idx] = 0;
+      continue;
+    }
+
+    int orientation_start = meta->orientation_start;
+    int start_offset = meta->effective_start - orientation_start;
+    if (start_offset < 0)
+      start_offset = 0;
+
+    int effective_len = meta->effective_length;
+    if (start_offset >= chunk_len)
+      effective_len = 0;
+    if (start_offset + effective_len > chunk_len)
+      effective_len = chunk_len - start_offset;
+    if (effective_len <= 0) {
+      for (int t = 0; t < chunk_len; t++) {
+        free(chunk_obs[t]);
+      }
+      free(chunk_obs);
+      observations[idx] = NULL;
+      seq_lengths[idx] = 0;
+      continue;
+    }
+
+    if (start_offset == 0 && effective_len == chunk_len) {
+      seq_lengths[idx] = effective_len;
+      continue;
+    }
+
+    double** trimmed = (double**)malloc(effective_len * sizeof(double*));
+    if (!trimmed) {
+      fprintf(stderr,
+              "Warning: Failed to trim chunked observations for segment %d; "
+              "using full chunk\n",
+              idx);
+      seq_lengths[idx] = chunk_len;
+      continue;
+    }
+
+    for (int t = 0; t < effective_len; t++) {
+      trimmed[t] = chunk_obs[start_offset + t];
+    }
+
+    for (int t = 0; t < start_offset; t++) {
+      free(chunk_obs[t]);
+    }
+    for (int t = start_offset + effective_len; t < chunk_len; t++) {
+      free(chunk_obs[t]);
+    }
+    free(chunk_obs);
+
+    observations[idx] = trimmed;
+    seq_lengths[idx] = effective_len;
+  }
+
+  int usable_segments = 0;
+  for (int i = 0; i < total_segments; i++) {
+    if (observations[i] && seq_lengths[i] > 0)
+      usable_segments++;
+  }
+
   fprintf(stderr,
-          "Computed feature matrices (%d dims) for %d training sequences\n",
-          g_total_feature_count, total_sequences);
+          "Computed feature matrices (%d dims) for %d training segments\n",
+          g_total_feature_count, usable_segments);
 
   // Initialize HMM model
   HMMModel model;
@@ -4552,15 +5143,15 @@ static void handle_train(int argc, char* argv[]) {
   if (global_num_features > MAX_NUM_FEATURES)
     global_num_features = MAX_NUM_FEATURES;
 
-  for (int seq_idx = 0; seq_idx < total_sequences; seq_idx++) {
-    if (!observations[seq_idx] || seq_lengths[seq_idx] == 0) {
+  for (int seg_idx = 0; seg_idx < total_segments; seg_idx++) {
+    if (!observations[seg_idx] || seq_lengths[seg_idx] == 0) {
       continue;
     }
 
-    int seq_len = seq_lengths[seq_idx];
+    int seq_len = seq_lengths[seg_idx];
     for (int t = 0; t < seq_len; t++) {
       for (int f = 0; f < global_num_features; f++) {
-        double val = observations[seq_idx][t][f];
+        double val = observations[seg_idx][t][f];
         sum[f] += val;
         sum_sq[f] += val * val;
       }
@@ -4582,7 +5173,7 @@ static void handle_train(int argc, char* argv[]) {
 
   fprintf(stderr,
           "Applying Z-score normalization to training observations...\n");
-  normalize_observations_in_place(observations, seq_lengths, total_sequences,
+  normalize_observations_in_place(observations, seq_lengths, total_segments,
                                   &model);
 
   // =========================================================================
@@ -4600,13 +5191,12 @@ static void handle_train(int argc, char* argv[]) {
   // Process each sequence to accumulate statistics
   for (int seq_idx = 0; seq_idx < genome->count; seq_idx++) {
     const char* seq_id = genome->records[seq_idx].id;
-    int seq_len = strlen(genome->records[seq_idx].sequence);
-
+    const char* seq = genome->records[seq_idx].sequence;
+    if (!seq)
+      continue;
+    int seq_len = strlen(seq);
     if (seq_len <= 0)
       continue;
-
-    int forward_obs_idx = seq_idx * 2;
-    int reverse_obs_idx = forward_obs_idx + 1;
 
     int* state_labels = (int*)malloc(seq_len * sizeof(int));
     if (!state_labels) {
@@ -4615,34 +5205,78 @@ static void handle_train(int argc, char* argv[]) {
       continue;
     }
 
-    if (forward_obs_idx < total_sequences && observations[forward_obs_idx] &&
-        seq_lengths[forward_obs_idx] > 0) {
-      initialize_state_labels(state_labels, seq_len);
-      label_forward_states(groups, group_count, seq_id, seq_len, state_labels);
-      // printf("DEBUG FWD LABELS for %s:\n", seq_id);
-      // for (int k = 0; k < seq_len; k++) {
-      //   printf("%d", state_labels[k]);
-      // }
-      printf("\n");
-      accumulate_statistics_for_sequence(
-          &model, observations, seq_lengths, forward_obs_idx, seq_len,
-          state_labels, transition_counts, emission_sum, emission_sum_sq,
-          state_observation_counts, initial_counts);
+    sequence_segment_collection_t* coll = &segment_collections[seq_idx];
+
+    bool has_forward_segments = false;
+    for (int idx = 0; idx < coll->plus_count; idx++) {
+      int seg_index = coll->plus_indices[idx];
+      if (seg_index >= total_segments)
+        continue;
+      if (observations[seg_index] && seq_lengths[seg_index] > 0) {
+        has_forward_segments = true;
+        break;
+      }
     }
 
-    if (reverse_obs_idx < total_sequences && observations[reverse_obs_idx] &&
-        seq_lengths[reverse_obs_idx] > 0) {
+    if (has_forward_segments) {
+      initialize_state_labels(state_labels, seq_len);
+      label_forward_states(groups, group_count, seq_id, seq_len, state_labels);
+
+      for (int idx = 0; idx < coll->plus_count; idx++) {
+        int seg_index = coll->plus_indices[idx];
+        if (seg_index >= total_segments)
+          continue;
+        if (!observations[seg_index] || seq_lengths[seg_index] <= 0)
+          continue;
+
+        int offset = segment_meta[seg_index].state_offset;
+        if (offset < 0 || offset >= seq_len)
+          continue;
+        if (offset + seq_lengths[seg_index] > seq_len)
+          continue;
+
+        const int* labels_ptr = state_labels + offset;
+        accumulate_statistics_for_segment(
+            &model, observations[seg_index], seq_lengths[seg_index], labels_ptr,
+            transition_counts, emission_sum, emission_sum_sq,
+            state_observation_counts, initial_counts);
+      }
+    }
+
+    bool has_reverse_segments = false;
+    for (int idx = 0; idx < coll->minus_count; idx++) {
+      int seg_index = coll->minus_indices[idx];
+      if (seg_index >= total_segments)
+        continue;
+      if (observations[seg_index] && seq_lengths[seg_index] > 0) {
+        has_reverse_segments = true;
+        break;
+      }
+    }
+
+    if (has_reverse_segments) {
       initialize_state_labels(state_labels, seq_len);
       label_reverse_states(groups, group_count, seq_id, seq_len, state_labels);
-      // printf("DEBUG REV LABELS for %s:\n", seq_id);
-      // for (int k = 0; k < seq_len; k++) {
-      //   printf("%d", state_labels[k]);
-      // }
-      printf("\n");
-      accumulate_statistics_for_sequence(
-          &model, observations, seq_lengths, reverse_obs_idx, seq_len,
-          state_labels, transition_counts, emission_sum, emission_sum_sq,
-          state_observation_counts, initial_counts);
+
+      for (int idx = 0; idx < coll->minus_count; idx++) {
+        int seg_index = coll->minus_indices[idx];
+        if (seg_index >= total_segments)
+          continue;
+        if (!observations[seg_index] || seq_lengths[seg_index] <= 0)
+          continue;
+
+        int offset = segment_meta[seg_index].state_offset;
+        if (offset < 0 || offset >= seq_len)
+          continue;
+        if (offset + seq_lengths[seg_index] > seq_len)
+          continue;
+
+        const int* labels_ptr = state_labels + offset;
+        accumulate_statistics_for_segment(
+            &model, observations[seg_index], seq_lengths[seg_index], labels_ptr,
+            transition_counts, emission_sum, emission_sum_sq,
+            state_observation_counts, initial_counts);
+      }
     }
 
     free(state_labels);
@@ -4729,13 +5363,12 @@ static void handle_train(int argc, char* argv[]) {
   // Collect duration statistics from all sequences
   for (int seq_idx = 0; seq_idx < genome->count; seq_idx++) {
     const char* seq_id = genome->records[seq_idx].id;
-    int seq_len = strlen(genome->records[seq_idx].sequence);
-
+    const char* seq = genome->records[seq_idx].sequence;
+    if (!seq)
+      continue;
+    int seq_len = strlen(seq);
     if (seq_len <= 0)
       continue;
-
-    int forward_obs_idx = seq_idx * 2;
-    int reverse_obs_idx = forward_obs_idx + 1;
 
     int* state_labels = (int*)malloc(seq_len * sizeof(int));
     if (!state_labels) {
@@ -4744,17 +5377,37 @@ static void handle_train(int argc, char* argv[]) {
       continue;
     }
 
-    // Process forward strand
-    if (forward_obs_idx < total_sequences && observations[forward_obs_idx] &&
-        seq_lengths[forward_obs_idx] > 0) {
+    sequence_segment_collection_t* coll = &segment_collections[seq_idx];
+
+    bool forward_available = false;
+    for (int idx = 0; idx < coll->plus_count; idx++) {
+      int seg_index = coll->plus_indices[idx];
+      if (seg_index >= total_segments)
+        continue;
+      if (observations[seg_index] && seq_lengths[seg_index] > 0) {
+        forward_available = true;
+        break;
+      }
+    }
+
+    if (forward_available) {
       initialize_state_labels(state_labels, seq_len);
       label_forward_states(groups, group_count, seq_id, seq_len, state_labels);
       accumulate_duration_statistics(seq_len, state_labels, duration_stats);
     }
 
-    // Process reverse strand
-    if (reverse_obs_idx < total_sequences && observations[reverse_obs_idx] &&
-        seq_lengths[reverse_obs_idx] > 0) {
+    bool reverse_available = false;
+    for (int idx = 0; idx < coll->minus_count; idx++) {
+      int seg_index = coll->minus_indices[idx];
+      if (seg_index >= total_segments)
+        continue;
+      if (observations[seg_index] && seq_lengths[seg_index] > 0) {
+        reverse_available = true;
+        break;
+      }
+    }
+
+    if (reverse_available) {
       initialize_state_labels(state_labels, seq_len);
       label_reverse_states(groups, group_count, seq_id, seq_len, state_labels);
       accumulate_duration_statistics(seq_len, state_labels, duration_stats);
@@ -4962,9 +5615,9 @@ static void handle_train(int argc, char* argv[]) {
 
   fprintf(
       stderr,
-      "Starting Baum-Welch refinement on %d sequences (semi-supervised)...\n",
-      total_sequences);
-  if (!hmm_train_baum_welch(&model, observations, seq_lengths, total_sequences,
+      "Starting Baum-Welch refinement on %d segments (semi-supervised)...\n",
+      total_segments);
+  if (!hmm_train_baum_welch(&model, observations, seq_lengths, total_segments,
                             kBaumWelchMaxIterations, kBaumWelchThreshold)) {
     fprintf(stderr, "Baum-Welch refinement failed\n");
     exit(1);
@@ -4991,13 +5644,15 @@ static void handle_train(int argc, char* argv[]) {
   fprintf(stderr, "Model saved to sunfish.model\n");
 
   // Cleanup
-  for (int i = 0; i < total_sequences; i++) {
+  for (int i = 0; i < total_segments; i++) {
     if (observations[i]) {
       free_observation_sequence(observations[i], seq_lengths[i]);
     }
   }
   free(observations);
   free(seq_lengths);
+  free(segment_meta);
+  free_sequence_segment_collections(segment_collections, genome->count);
 
   free_cds_groups(groups, group_count);
   free_fasta_data(genome);
@@ -5006,12 +5661,8 @@ static void handle_train(int argc, char* argv[]) {
 // Prediction mode: Parallel Viterbi prediction
 static void handle_predict(int argc, char* argv[]) {
   if (argc < 3) {
-    fprintf(
-        stderr,
-        "Usage: %s predict <target.fasta> [--wavelet|-w "
-        "S1,S2,...|s:e:step] [--kmer|-k K] [--threads|-t N] [--chunk-size N]"
-        " [--chunk-overlap M] [--chunk|--no-chunk]\n",
-        argv[0]);
+    fprintf(stderr, "Usage: %s predict <target.fasta> [--threads|-t N]\n",
+            argv[0]);
     exit(1);
   }
 
@@ -5038,16 +5689,6 @@ static void handle_predict(int argc, char* argv[]) {
               argv[i]);
       exit(1);
     }
-  }
-
-  validate_chunk_configuration_or_exit("predict");
-
-  if (!update_feature_counts()) {
-    fprintf(stderr,
-            "Error: Total feature dimensionality exceeds supported maximum "
-            "(%d). Adjust wavelet or k-mer settings.\n",
-            MAX_NUM_FEATURES);
-    exit(1);
   }
 
   ensure_thread_count("prediction", threads_specified);
@@ -5097,6 +5738,8 @@ static void handle_predict(int argc, char* argv[]) {
     fprintf(stderr, "Chunking disabled by model settings\n");
   }
 
+  validate_chunk_configuration_or_exit("predict");
+
   if (!update_feature_counts()) {
     fprintf(stderr,
             "Error: Total feature dimensionality exceeds supported maximum "
@@ -5129,6 +5772,8 @@ static void handle_predict(int argc, char* argv[]) {
   // Initialize output queue
   output_queue_init(&g_output_queue);
   g_gene_counter = 0;
+
+  predicted_gene_store_init(&g_predicted_gene_store);
 
   // Create thread pool
   thread_pool_t* pool = thread_pool_create(g_num_threads);
@@ -5322,12 +5967,16 @@ static void handle_predict(int argc, char* argv[]) {
   // Wait for all tasks to complete
   thread_pool_wait(pool);
 
+  // Aggregate and emit deduplicated gene predictions
+  predicted_gene_store_emit_to_queue(&g_predicted_gene_store);
+
   // Flush output
   output_queue_flush(&g_output_queue);
 
   fprintf(stderr, "Prediction complete. Found %d genes.\n", g_gene_counter);
 
   // Cleanup
+  predicted_gene_store_destroy(&g_predicted_gene_store);
   thread_pool_destroy(pool);
   output_queue_destroy(&g_output_queue);
   free_fasta_data(genome);
