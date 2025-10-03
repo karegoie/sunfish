@@ -19,7 +19,11 @@ static inline bool hmm_is_exon_state(int state) {
 }
 
 static inline int hmm_duration_state_index(int state) {
-  return hmm_is_exon_state(state) ? STATE_EXON_F0 : state;
+  // Exon frame states share duration parameters
+  if (hmm_is_exon_state(state))
+    return STATE_EXON_F0;
+  // Start and stop codons have their own duration parameters
+  return state;
 }
 
 static inline const StateDuration*
@@ -325,6 +329,13 @@ void hmm_init(HMMModel* model, int num_features) {
   }
 
   hmm_sync_exon_duration(model);
+
+  // Initialize start and stop codon durations (3 bp = 1 codon)
+  // log(3) ≈ 1.099
+  model->duration[STATE_START_CODON].mean_log_duration = 1.099;
+  model->duration[STATE_START_CODON].stddev_log_duration = 0.1;
+  model->duration[STATE_STOP_CODON].mean_log_duration = 1.099;
+  model->duration[STATE_STOP_CODON].stddev_log_duration = 0.1;
 
   // Initialize wavelet scales metadata
   model->num_wavelet_scales = 0;
@@ -1402,6 +1413,15 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
       continue;
     }
     (void)sscanf(line, "#num_states %d", &tmp_num_states);
+  }
+
+  // Validate number of states matches current implementation
+  if (tmp_num_states != NUM_STATES) {
+    fprintf(stderr, 
+            "Warning: Model file has %d states but current implementation expects %d states.\n",
+            tmp_num_states, NUM_STATES);
+    fprintf(stderr, 
+            "Model loading may fail or produce incorrect results. Please retrain the model.\n");
   }
 
   if (model->num_features > MAX_NUM_FEATURES)

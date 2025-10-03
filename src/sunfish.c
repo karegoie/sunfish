@@ -1414,9 +1414,11 @@ static void predict_sequence_worker(void* arg) {
     int state = states[i];
     bool exon_state = is_exon_state(state);
     bool intron_state = (state == STATE_INTRON);
+    bool start_codon_state = (state == STATE_START_CODON);
+    bool stop_codon_state = (state == STATE_STOP_CODON);
 
     if (!gene_active) {
-      if (exon_state) {
+      if (exon_state || start_codon_state) {
         gene_active = true;
         gene_seq_start = i;
         gene_seq_end = i;
@@ -1426,10 +1428,102 @@ static void predict_sequence_worker(void* arg) {
       continue;
     }
 
-    if (exon_state) {
+    if (exon_state || start_codon_state || stop_codon_state) {
       if (current_exon_start == -1)
         current_exon_start = i;
       gene_seq_end = i;
+      
+      // If we hit a stop codon, this should end the gene
+      if (stop_codon_state) {
+        // Close current exon including the stop codon
+        if (current_exon_start != -1) {
+          int exon_end = i;
+          
+          if (exon_count >= exon_capacity) {
+            size_t new_capacity = exon_capacity * 2;
+            PredictedExon* tmp = (PredictedExon*)realloc(
+                exon_buffer, new_capacity * sizeof(PredictedExon));
+            if (!tmp) {
+              fprintf(stderr,
+                      "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                      seq_id, task->strand);
+              goto cleanup;
+            }
+            exon_buffer = tmp;
+            exon_capacity = new_capacity;
+          }
+
+          exon_buffer[exon_count].start = current_exon_start;
+          exon_buffer[exon_count].end = exon_end;
+          exon_buffer[exon_count].phase =
+              exon_state_to_phase(states[current_exon_start]);
+          exon_count++;
+          current_exon_start = -1;
+        }
+        
+        // Output the gene
+        if (exon_count > 0 && gene_seq_start >= 0 &&
+            gene_seq_end >= gene_seq_start) {
+          // Assemble CDS sequence from exons for validation
+          size_t cds_len = 0;
+          for (size_t e = 0; e < exon_count; e++) {
+            cds_len += (exon_buffer[e].end - exon_buffer[e].start + 1);
+          }
+
+          char* cds_seq = (char*)malloc(cds_len + 1);
+          if (cds_seq) {
+            size_t pos = 0;
+            for (size_t e = 0; e < exon_count; e++) {
+              int exon_len = exon_buffer[e].end - exon_buffer[e].start + 1;
+              memcpy(cds_seq + pos, task->sequence + exon_buffer[e].start,
+                     exon_len);
+              pos += exon_len;
+            }
+            cds_seq[cds_len] = '\0';
+
+            // Validate ORF before outputting
+            int global_gene_start = gene_seq_start + chunk_offset;
+            int global_gene_end = gene_seq_end + chunk_offset;
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start += chunk_offset;
+              exon_buffer[e].end += chunk_offset;
+            }
+
+            if (is_valid_orf(cds_seq)) {
+              output_predicted_gene(task, exon_buffer, exon_count,
+                                    global_gene_start, global_gene_end,
+                                    prediction_score, original_length);
+            }
+
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start -= chunk_offset;
+              exon_buffer[e].end -= chunk_offset;
+            }
+            free(cds_seq);
+          } else {
+            // Memory allocation failed, output without validation
+            int global_gene_start = gene_seq_start + chunk_offset;
+            int global_gene_end = gene_seq_end + chunk_offset;
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start += chunk_offset;
+              exon_buffer[e].end += chunk_offset;
+            }
+            output_predicted_gene(task, exon_buffer, exon_count,
+                                  global_gene_start, global_gene_end,
+                                  prediction_score, original_length);
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start -= chunk_offset;
+              exon_buffer[e].end -= chunk_offset;
+            }
+          }
+        }
+        
+        // Reset for next gene
+        gene_active = false;
+        exon_count = 0;
+        gene_seq_start = -1;
+        gene_seq_end = -1;
+      }
       continue;
     }
 
@@ -1763,7 +1857,28 @@ static void label_forward_states(const CdsGroup* groups, int group_count,
 
       int phase = normalize_phase(exon->phase);
 
-      for (int pos = start; pos < end_exclusive; pos++) {
+      // Mark the first 3 bases as START_CODON if this is the first exon
+      int label_start = start;
+      if (e == 0 && (end_exclusive - start) >= 3) {
+        // First exon: mark first 3 bp as start codon
+        for (int pos = start; pos < start + 3 && pos < end_exclusive; pos++) {
+          state_labels[pos] = STATE_START_CODON;
+        }
+        label_start = start + 3;
+      }
+
+      // Mark the last 3 bases as STOP_CODON if this is the last exon
+      int label_end = end_exclusive;
+      if (e == group->exon_count - 1 && (end_exclusive - start) >= 3) {
+        // Last exon: mark last 3 bp as stop codon
+        label_end = end_exclusive - 3;
+        for (int pos = label_end; pos < end_exclusive; pos++) {
+          state_labels[pos] = STATE_STOP_CODON;
+        }
+      }
+
+      // Label the remaining positions with frame states
+      for (int pos = label_start; pos < label_end; pos++) {
         int offset = pos - start;
         HMMState state = frame_to_state(phase + offset);
         state_labels[pos] = state;
@@ -1856,7 +1971,32 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
 
     for (int e = 0; e < valid_count; e++) {
       RcExon* rc = &rc_exons[e];
-      for (int pos = rc->start; pos <= rc->end && pos < seq_len; pos++) {
+      
+      // Mark the first 3 bases as START_CODON if this is the first rc exon
+      int label_start = rc->start;
+      int label_end = rc->end + 1; // +1 because the loop uses <=
+      
+      if (e == 0 && (rc->end - rc->start + 1) >= 3) {
+        // First exon in RC: mark first 3 bp as start codon
+        for (int pos = rc->start; pos < rc->start + 3 && pos <= rc->end && pos < seq_len; pos++) {
+          if (pos >= 0)
+            state_labels[pos] = STATE_START_CODON;
+        }
+        label_start = rc->start + 3;
+      }
+      
+      // Mark the last 3 bases as STOP_CODON if this is the last rc exon
+      if (e == valid_count - 1 && (rc->end - rc->start + 1) >= 3) {
+        // Last exon in RC: mark last 3 bp as stop codon
+        label_end = rc->end - 2; // -2 to leave 3 bp for stop codon
+        for (int pos = rc->end - 2; pos <= rc->end && pos < seq_len; pos++) {
+          if (pos >= 0)
+            state_labels[pos] = STATE_STOP_CODON;
+        }
+      }
+      
+      // Label the remaining positions with frame states
+      for (int pos = label_start; pos < label_end && pos < seq_len; pos++) {
         if (pos < 0)
           continue;
         int offset = rc->end - pos;

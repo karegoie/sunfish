@@ -10,7 +10,9 @@ typedef enum {
   STATE_EXON_F2 = 2,
   STATE_INTRON = 3,
   STATE_INTERGENIC = 4,
-  NUM_STATES = 5
+  STATE_START_CODON = 5,
+  STATE_STOP_CODON = 6,
+  NUM_STATES = 7
 } HMMState;
 
 // Maximum number of wavelet scales (features)
