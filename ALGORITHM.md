@@ -26,9 +26,11 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 - 단일 값: `s`
 
 ## HMM 구조
-- 상태 집합 S = {EXON_F0, EXON_F1, EXON_F2, INTRON, INTERGENIC} (총 5개)
+- 상태 집합 S = {EXON_F0, EXON_F1, EXON_F2, INTRON, INTERGENIC, START_CODON, STOP_CODON} (총 7개)
   - EXON_Fk는 코돈 프레임(k=0,1,2)을 구분
-- 초기확률 π, 전이확률 A(5×5)
+  - START_CODON: 시작 코돈(ATG) 위치 (3 bp)
+  - STOP_CODON: 종료 코돈(TAA/TAG/TGA) 위치 (3 bp)
+- 초기확률 π, 전이확률 A(7×7)
 - 방출분포: 대각 공분산 가우시안 N(μ_s, diag(σ²_s))
 - 전역 정규화 통계: 각 특징 f의 전체 평균/표준편차(μ_g[f], σ_g[f])를 모델에 저장하여 예측 시 Z-score 정규화에 사용
 
@@ -43,11 +45,13 @@ Sunfish는 DNA 서열로부터 유전자 영역을 예측하는 경량 HMM(은�
 3) Pass 2: 지도(supervised) 추정
 - GFF3의 CDS를 Parent 단위로 그룹화하여 엑손 목록 정렬
 - 상태 라벨링 규칙
-  - 정방향(+): 각 엑손의 시작을 phase로 맞추고 거리 오프셋에 따라 EXON_F(phase+offset mod 3)로 라벨링
+  - 정방향(+): 각 엑손의 시작 3bp는 START_CODON, 끝 3bp는 STOP_CODON으로 라벨링 (첫/마지막 엑손)
+  - 엑손 내부: phase로 맞추고 거리 오프셋에 따라 EXON_F(phase+offset mod 3)로 라벨링
   - 역상보(−): 좌표를 역상보 프레임으로 변환해 동일한 방식 적용
   - 연속 엑손 사이 구간은 INTRON, 나머지는 INTERGENIC
 - 라벨에 기반해 초기/전이 카운트와 상태별 방출 평균/분산 누적 후 확률화
 - 엑손 프레임 순환 제약 적용: F0→F1, F1→F2, F2→F0 전이질량을 강제하고 비정상 전이는 ε(1e−10)로 억제한 뒤 행 정규화
+- START/STOP 코돈 전이 제약: START_CODON → EXON_F0, EXON_F* → STOP_CODON → INTERGENIC/INTRON
 
 4) Baum–Welch(EM) 보정(반지도)
 - Forward–Backward를 로그-합-지수 안정화로 수행하여 매 반복 누적치 갱신
