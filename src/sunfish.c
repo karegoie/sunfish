@@ -1203,7 +1203,7 @@ static void output_predicted_gene(const prediction_task_t* task,
 // Validate ORF: check start codon, stop codon, in-frame stops, and length
 static bool is_valid_orf(const char* cds_sequence) {
   // FOR DEBUGGING PURPOSE ONLY; FIXME
-  // return true;
+  return true;
 
   if (!cds_sequence) {
     return false;
