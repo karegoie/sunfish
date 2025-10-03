@@ -15,6 +15,63 @@ static inline bool hmm_is_exon_state(int state) {
          state == STATE_EXON_F2;
 }
 
+static inline int hmm_duration_state_index(int state) {
+  return hmm_is_exon_state(state) ? STATE_EXON_F0 : state;
+}
+
+static inline const StateDuration*
+hmm_get_duration_params(const HMMModel* model, int state) {
+  return &model->duration[hmm_duration_state_index(state)];
+}
+
+static void hmm_sync_exon_duration(HMMModel* model) {
+  const StateDuration* exon_duration =
+      hmm_get_duration_params(model, STATE_EXON_F0);
+  model->duration[STATE_EXON_F1] = *exon_duration;
+  model->duration[STATE_EXON_F2] = *exon_duration;
+}
+
+static inline int hmm_exon_cycle_index(int state) {
+  switch (state) {
+  case STATE_EXON_F0:
+    return 0;
+  case STATE_EXON_F1:
+    return 1;
+  case STATE_EXON_F2:
+    return 2;
+  default:
+    return -1;
+  }
+}
+
+static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
+                                             STATE_EXON_F2};
+
+static inline int hmm_positive_mod(int value, int mod) {
+  int result = value % mod;
+  if (result < 0)
+    result += mod;
+  return result;
+}
+
+static inline int hmm_exon_entry_index(int end_index, int duration) {
+  if (duration <= 0)
+    return end_index;
+  int offset = (duration - 1) % 3;
+  return hmm_positive_mod(end_index - offset, 3);
+}
+
+static inline int hmm_exon_next_index(int current_index) {
+  return (current_index + 1) % 3;
+}
+
+static inline double hmm_safe_log(double value) {
+  const double kMinProb = 1e-300;
+  if (value < kMinProb)
+    value = kMinProb;
+  return log(value);
+}
+
 static inline char normalize_base(char base) {
   if (base >= 'a' && base <= 'z') {
     return (char)(base - ('a' - 'A'));
@@ -216,9 +273,11 @@ void hmm_init(HMMModel* model, int num_features) {
 
   // Initialize duration parameters with defaults
   for (int i = 0; i < NUM_STATES; i++) {
-    model->duration[i].mean_log_duration = 0.0;    // log(1) = 0
-    model->duration[i].stddev_log_duration = 1.0;  // default stddev
+    model->duration[i].mean_log_duration = 0.0;   // log(1) = 0
+    model->duration[i].stddev_log_duration = 1.0; // default stddev
   }
+
+  hmm_sync_exon_duration(model);
 
   // Initialize wavelet scales metadata
   model->num_wavelet_scales = 0;
@@ -513,21 +572,22 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
   return true;
 }
 
-// Helper function to compute log probability of duration d under log-normal distribution
-static double lognormal_log_pdf(int duration, double mean_log_duration, 
+// Helper function to compute log probability of duration d under log-normal
+// distribution
+static double lognormal_log_pdf(int duration, double mean_log_duration,
                                 double stddev_log_duration) {
   if (duration <= 0) {
     return -INFINITY;
   }
-  
+
   if (stddev_log_duration < 1e-6) {
-    stddev_log_duration = 1e-6;  // Prevent numerical issues
+    stddev_log_duration = 1e-6; // Prevent numerical issues
   }
-  
+
   double log_d = log((double)duration);
   double diff = log_d - mean_log_duration;
   double var = stddev_log_duration * stddev_log_duration;
-  
+
   // Log-PDF of log-normal distribution:
   // -log(d) - 0.5*log(2*pi*var) - (log(d) - mu)^2 / (2*var)
   return -log_d - 0.5 * log(2.0 * M_PI * var) - (diff * diff) / (2.0 * var);
@@ -536,8 +596,8 @@ static double lognormal_log_pdf(int duration, double mean_log_duration,
 double hmm_viterbi(const HMMModel* model, double** observations,
                    const char* sequence, int seq_len, int* states) {
   // HSMM Viterbi with segment-based processing
-  const int MAX_DURATION = 2000;  // Maximum segment duration to consider
-  
+  const int MAX_DURATION = 2000; // Maximum segment duration to consider
+
   // Allocate Viterbi matrices
   // delta[t][j] = max log-probability of path ending at position t in state j
   double** delta = (double**)malloc(seq_len * sizeof(double*));
@@ -545,12 +605,15 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   int** psi = (int**)malloc(seq_len * sizeof(int*));
   // duration[t][j] stores the optimal duration of state j ending at position t
   int** duration = (int**)malloc(seq_len * sizeof(int*));
+  // emission_log_sum[t][j] stores cumulative emission log-probability up to t
+  double** emission_log_sum = (double**)malloc(seq_len * sizeof(double*));
 
   for (int t = 0; t < seq_len; t++) {
     delta[t] = (double*)malloc(NUM_STATES * sizeof(double));
     psi[t] = (int*)malloc(NUM_STATES * sizeof(int));
     duration[t] = (int*)malloc(NUM_STATES * sizeof(int));
-    
+    emission_log_sum[t] = (double*)malloc(NUM_STATES * sizeof(double));
+
     for (int j = 0; j < NUM_STATES; j++) {
       delta[t][j] = -INFINITY;
       psi[t][j] = 0;
@@ -558,46 +621,97 @@ double hmm_viterbi(const HMMModel* model, double** observations,
     }
   }
 
+  for (int t = 0; t < seq_len; t++) {
+    for (int j = 0; j < NUM_STATES; j++) {
+      double emission_log =
+          gaussian_log_pdf(observations[t], model->emission[j].mean,
+                           model->emission[j].variance, model->num_features);
+      if (t == 0) {
+        emission_log_sum[t][j] = emission_log;
+      } else {
+        emission_log_sum[t][j] = emission_log_sum[t - 1][j] + emission_log;
+      }
+    }
+  }
+
   // Initialization (t=0): start with segments of length 1
   for (int j = 0; j < NUM_STATES; j++) {
+    const StateDuration* duration_params = hmm_get_duration_params(model, j);
     delta[0][j] =
-        log(model->initial[j]) +
+        hmm_safe_log(model->initial[j]) +
         gaussian_log_pdf(observations[0], model->emission[j].mean,
                          model->emission[j].variance, model->num_features) +
-        lognormal_log_pdf(1, model->duration[j].mean_log_duration,
-                         model->duration[j].stddev_log_duration);
-    psi[0][j] = -1;  // No previous state
+        lognormal_log_pdf(1, duration_params->mean_log_duration,
+                          duration_params->stddev_log_duration);
+    psi[0][j] = -1; // No previous state
     duration[0][j] = 1;
   }
 
   // Recursion: for each position t and state j, consider all possible durations
   for (int t = 1; t < seq_len; t++) {
     for (int j = 0; j < NUM_STATES; j++) {
+      const StateDuration* duration_params = hmm_get_duration_params(model, j);
       double best_score = -INFINITY;
       int best_prev_state = 0;
       int best_duration = 1;
-      
+
+      bool j_is_exon = hmm_is_exon_state(j);
+      int j_end_index = hmm_exon_cycle_index(j);
+
       // Try different segment durations d
       int max_d = (t + 1 < MAX_DURATION) ? (t + 1) : MAX_DURATION;
-      
+
       for (int d = 1; d <= max_d && d <= t + 1; d++) {
-        // Compute emission probability for segment [t-d+1, t]
-        double segment_emission = 0.0;
-        for (int pos = t - d + 1; pos <= t; pos++) {
-          segment_emission += gaussian_log_pdf(observations[pos],
-                                              model->emission[j].mean,
-                                              model->emission[j].variance,
-                                              model->num_features);
+        // Determine entry state for this segment
+        HMMState segment_entry_state = j;
+        int entry_index = j_end_index;
+        if (j_is_exon) {
+          entry_index = hmm_exon_entry_index(j_end_index, d);
+          segment_entry_state = kExonCycleStates[entry_index];
         }
-        
+
+        // Compute log probability (emission + internal transitions) for
+        // segment [t-d+1, t]
+        double segment_log_prob = 0.0;
+        if (j_is_exon) {
+          int current_index = entry_index;
+          HMMState current_state = segment_entry_state;
+          for (int pos = t - d + 1; pos <= t; pos++) {
+            segment_log_prob += gaussian_log_pdf(
+                observations[pos], model->emission[current_state].mean,
+                model->emission[current_state].variance, model->num_features);
+
+            if (pos < t) {
+              int next_index = hmm_exon_next_index(current_index);
+              HMMState next_state = kExonCycleStates[next_index];
+              segment_log_prob +=
+                  hmm_safe_log(model->transition[current_state][next_state]);
+              current_index = next_index;
+              current_state = next_state;
+            }
+          }
+        } else {
+          int start_pos = t - d + 1;
+          double segment_emission;
+          if (start_pos == 0) {
+            segment_emission = emission_log_sum[t][j];
+          } else {
+            segment_emission =
+                emission_log_sum[t][j] - emission_log_sum[start_pos - 1][j];
+          }
+          segment_log_prob += segment_emission;
+        }
+
         // Compute duration probability
-        double duration_prob = lognormal_log_pdf(d, model->duration[j].mean_log_duration,
-                                                model->duration[j].stddev_log_duration);
-        
+        double duration_prob =
+            lognormal_log_pdf(d, duration_params->mean_log_duration,
+                              duration_params->stddev_log_duration);
+
         // Consider transitions from all previous states
         if (d == t + 1) {
           // Segment starts from position 0 (initial state)
-          double score = log(model->initial[j]) + segment_emission + duration_prob;
+          double score = hmm_safe_log(model->initial[segment_entry_state]) +
+                         segment_log_prob + duration_prob;
           if (score > best_score) {
             best_score = score;
             best_prev_state = -1;
@@ -607,14 +721,19 @@ double hmm_viterbi(const HMMModel* model, double** observations,
           // Segment starts after position t-d
           int prev_pos = t - d;
           for (int i = 0; i < NUM_STATES; i++) {
-            double transition_log = log(model->transition[i][j]);
+            if (delta[prev_pos][i] <= -INFINITY)
+              continue;
+
+            double transition_log =
+                hmm_safe_log(model->transition[i][segment_entry_state]);
             // Add splice signal adjustment at the transition point (t-d+1)
-            transition_log += splice_signal_adjustment(sequence, seq_len, i, j, 
-                                                      t - d + 1, &model->pwm);
-            
-            double score = delta[prev_pos][i] + transition_log + 
-                          segment_emission + duration_prob;
-            
+            transition_log += splice_signal_adjustment(sequence, seq_len, i,
+                                                       segment_entry_state,
+                                                       t - d + 1, &model->pwm);
+
+            double score = delta[prev_pos][i] + transition_log +
+                           segment_log_prob + duration_prob;
+
             if (score > best_score) {
               best_score = score;
               best_prev_state = i;
@@ -623,7 +742,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
           }
         }
       }
-      
+
       delta[t][j] = best_score;
       psi[t][j] = best_prev_state;
       duration[t][j] = best_duration;
@@ -643,20 +762,44 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   // Backtrack using segment information
   int t = seq_len - 1;
   int current_state = best_state;
-  
+
   while (t >= 0) {
     int d = duration[t][current_state];
     int prev_state = psi[t][current_state];
-    
+
     // Fill in the states for the segment
-    for (int pos = t - d + 1; pos <= t && pos >= 0; pos++) {
-      states[pos] = current_state;
+    if (d <= 0)
+      d = 1;
+
+    int start_pos = t - d + 1;
+    if (start_pos < 0)
+      start_pos = 0;
+
+    if (hmm_is_exon_state(current_state)) {
+      int end_index = hmm_exon_cycle_index(current_state);
+      int entry_index = hmm_exon_entry_index(end_index, d);
+      int current_index = entry_index;
+      HMMState state_for_pos = kExonCycleStates[current_index];
+
+      for (int pos = start_pos; pos <= t && pos < seq_len; pos++) {
+        states[pos] = state_for_pos;
+        if (pos < t) {
+          current_index = hmm_exon_next_index(current_index);
+          state_for_pos = kExonCycleStates[current_index];
+        }
+      }
+    } else {
+      for (int pos = start_pos; pos <= t && pos < seq_len; pos++) {
+        states[pos] = current_state;
+      }
     }
-    
+
     // Move to previous segment
-    t = t - d;
+    t = start_pos - 1;
     if (prev_state >= 0) {
       current_state = prev_state;
+    } else {
+      break;
     }
   }
 
@@ -665,10 +808,12 @@ double hmm_viterbi(const HMMModel* model, double** observations,
     free(delta[t]);
     free(psi[t]);
     free(duration[t]);
+    free(emission_log_sum[t]);
   }
   free(delta);
   free(psi);
   free(duration);
+  free(emission_log_sum);
 
   return max_prob;
 }
@@ -678,6 +823,10 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   if (fp == NULL) {
     return false;
   }
+
+  // Ensure exon frames share the same duration parameters when persisting.
+  HMMModel tmp_model = *model;
+  hmm_sync_exon_duration(&tmp_model);
 
   fprintf(fp, "#HMM_MODEL_V1\n");
   fprintf(fp, "#num_features %d\n", model->num_features);
@@ -721,9 +870,10 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   // Save duration parameters (HSMM)
   fprintf(fp, "DURATION\n");
   for (int i = 0; i < NUM_STATES; i++) {
-    fprintf(fp, "%.10f %.10f\n", 
-            model->duration[i].mean_log_duration,
-            model->duration[i].stddev_log_duration);
+    const StateDuration* duration_params =
+        hmm_get_duration_params(&tmp_model, i);
+    fprintf(fp, "%.10f %.10f\n", duration_params->mean_log_duration,
+            duration_params->stddev_log_duration);
   }
 
   // Save global feature statistics for Z-score normalization
@@ -1224,13 +1374,12 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
   }
 
   // Read DURATION block if present (optional for backward compatibility)
-  if (fgets(line, sizeof(line), fp) != NULL && 
+  if (fgets(line, sizeof(line), fp) != NULL &&
       strncmp(line, "DURATION", 8) == 0) {
     for (int i = 0; i < NUM_STATES; i++) {
       if (fgets(line, sizeof(line), fp) != NULL) {
-        if (sscanf(line, "%lf %lf", 
-                  &model->duration[i].mean_log_duration,
-                  &model->duration[i].stddev_log_duration) != 2) {
+        if (sscanf(line, "%lf %lf", &model->duration[i].mean_log_duration,
+                   &model->duration[i].stddev_log_duration) != 2) {
           // If parsing fails, keep defaults
           model->duration[i].mean_log_duration = 0.0;
           model->duration[i].stddev_log_duration = 1.0;
@@ -1238,6 +1387,8 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
       }
     }
   }
+
+  hmm_sync_exon_duration(model);
 
   fclose(fp);
   return true;
