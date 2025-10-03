@@ -1455,8 +1455,15 @@ static void predict_sequence_worker(void* arg) {
 
           exon_buffer[exon_count].start = current_exon_start;
           exon_buffer[exon_count].end = exon_end;
-          exon_buffer[exon_count].phase =
-              exon_state_to_phase(states[current_exon_start]);
+          // Find the first exon frame state for phase calculation
+          int phase = 0;
+          for (int p = current_exon_start; p <= exon_end; p++) {
+            if (is_exon_state(states[p])) {
+              phase = exon_state_to_phase(states[p]);
+              break;
+            }
+          }
+          exon_buffer[exon_count].phase = phase;
           exon_count++;
           current_exon_start = -1;
         }
@@ -1548,8 +1555,15 @@ static void predict_sequence_worker(void* arg) {
 
       exon_buffer[exon_count].start = current_exon_start;
       exon_buffer[exon_count].end = exon_end;
-      exon_buffer[exon_count].phase =
-          exon_state_to_phase(states[current_exon_start]);
+      // Find the first exon frame state for phase calculation
+      int phase = 0;
+      for (int p = current_exon_start; p <= exon_end && p < seq_len; p++) {
+        if (is_exon_state(states[p])) {
+          phase = exon_state_to_phase(states[p]);
+          break;
+        }
+      }
+      exon_buffer[exon_count].phase = phase;
       exon_count++;
 
       current_exon_start = -1;
@@ -1639,8 +1653,15 @@ static void predict_sequence_worker(void* arg) {
 
     exon_buffer[exon_count].start = current_exon_start;
     exon_buffer[exon_count].end = exon_end;
-    exon_buffer[exon_count].phase =
-        exon_state_to_phase(states[current_exon_start]);
+    // Find the first exon frame state for phase calculation
+    int phase = 0;
+    for (int p = current_exon_start; p <= exon_end && p < seq_len; p++) {
+      if (is_exon_state(states[p])) {
+        phase = exon_state_to_phase(states[p]);
+        break;
+      }
+    }
+    exon_buffer[exon_count].phase = phase;
     exon_count++;
     gene_seq_end = exon_end;
     current_exon_start = -1;
@@ -2225,6 +2246,7 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
   const HMMState exon_cycle[] = {STATE_EXON_F0, STATE_EXON_F1, STATE_EXON_F2};
   const size_t exon_cycle_len = sizeof(exon_cycle) / sizeof(exon_cycle[0]);
 
+  // Enforce cyclic transitions within exon frame states
   for (size_t idx = 0; idx < exon_cycle_len; idx++) {
     HMMState state = exon_cycle[idx];
     HMMState expected_next = exon_cycle[(idx + 1) % exon_cycle_len];
@@ -2268,6 +2290,61 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
 
     for (int col = 0; col < NUM_STATES; col++) {
       model->transition[row][col] /= row_sum;
+    }
+  }
+  
+  // Enforce constraints for START_CODON state
+  // START_CODON should primarily transition to EXON_F0 (after 3 bp of start codon)
+  int start_row = STATE_START_CODON;
+  double start_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    start_sum += model->transition[start_row][col];
+  }
+  if (start_sum < 1e-10) {
+    // If no transitions, set default: mostly to EXON_F0
+    model->transition[start_row][STATE_EXON_F0] = 0.9;
+    model->transition[start_row][STATE_START_CODON] = 0.09; // self-loop for 3bp
+    for (int col = 0; col < NUM_STATES; col++) {
+      if (col != STATE_EXON_F0 && col != STATE_START_CODON)
+        model->transition[start_row][col] = 0.01 / (NUM_STATES - 2);
+    }
+  }
+  // Normalize START_CODON transitions
+  start_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    start_sum += model->transition[start_row][col];
+  }
+  if (start_sum > 0.0) {
+    for (int col = 0; col < NUM_STATES; col++) {
+      model->transition[start_row][col] /= start_sum;
+    }
+  }
+  
+  // Enforce constraints for STOP_CODON state
+  // STOP_CODON should primarily transition to INTERGENIC or INTRON
+  int stop_row = STATE_STOP_CODON;
+  double stop_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    stop_sum += model->transition[stop_row][col];
+  }
+  if (stop_sum < 1e-10) {
+    // If no transitions, set default: mostly to INTERGENIC
+    model->transition[stop_row][STATE_INTERGENIC] = 0.8;
+    model->transition[stop_row][STATE_INTRON] = 0.1;
+    model->transition[stop_row][STATE_STOP_CODON] = 0.09; // self-loop for 3bp
+    for (int col = 0; col < NUM_STATES; col++) {
+      if (col != STATE_INTERGENIC && col != STATE_INTRON && col != STATE_STOP_CODON)
+        model->transition[stop_row][col] = 0.01 / (NUM_STATES - 3);
+    }
+  }
+  // Normalize STOP_CODON transitions
+  stop_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    stop_sum += model->transition[stop_row][col];
+  }
+  if (stop_sum > 0.0) {
+    for (int col = 0; col < NUM_STATES; col++) {
+      model->transition[stop_row][col] /= stop_sum;
     }
   }
 }
