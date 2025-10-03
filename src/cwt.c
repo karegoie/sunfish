@@ -139,16 +139,12 @@ bool compute_cwt_features(const char* sequence, int seq_len,
       return false;
     }
 
-    // Store real, imaginary, magnitude, and phase
-    // features[s * 4] = real part
-    // features[s * 4 + 1] = imaginary part
-    // features[s * 4 + 2] = magnitude
-    // features[s * 4 + 3] = phase
+    // Store real and imaginary parts only
+    // features[s * 2] = real part
+    // features[s * 2 + 1] = imaginary part
     for (int i = 0; i < seq_len; i++) {
-      features[s * 4][i] = creal(cwt_result[i]);
-      features[s * 4 + 1][i] = cimag(cwt_result[i]);
-      features[s * 4 + 2][i] = cabs(cwt_result[i]);
-      features[s * 4 + 3][i] = carg(cwt_result[i]);
+      features[s * 2][i] = creal(cwt_result[i]);
+      features[s * 2 + 1][i] = cimag(cwt_result[i]);
     }
 
     free(cwt_result);
