@@ -50,7 +50,11 @@ static inline int hmm_exon_cycle_index(int state) {
 static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
                                              STATE_EXON_F2};
 
-static const double kVarianceFloor = 1e-3;
+// Variance flooring used throughout emission probability calculations and
+// training. Keep this small but non-zero to avoid numerical issues when
+// computing Gaussian log-PDFs. This value is referenced in multiple places
+// in this translation unit, so changing it ensures consistent behavior.
+static const double kVarianceFloor = 1e-2;
 
 typedef struct {
   HMMModel* model;
@@ -1454,6 +1458,16 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
     }
   }
 
+  // Enforce variance flooring for numerical stability
+  for (int i = 0; i < NUM_STATES; i++) {
+    for (int j = 0; j < model->num_features; j++) {
+      if (!isfinite(model->emission[i].variance[j]) ||
+          model->emission[i].variance[j] < kVarianceFloor) {
+        model->emission[i].variance[j] = kVarianceFloor;
+      }
+    }
+  }
+
   // Read global feature statistics (optional for backward compatibility)
   if (fgets(line, sizeof(line), fp) != NULL &&
       strncmp(line, "GLOBAL_STATS", 12) == 0) {
@@ -1678,6 +1692,55 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
   hmm_sync_exon_duration(model);
 
   // Compute num_wavelet_scales from wavelet_feature_count if not set
+  // Some model metadata (chunk_size, chunk_overlap, use_chunking,
+  // wavelet_scales) may be written at the end of the file by
+  // hmm_save_model. The initial metadata pass only handled leading
+  // '#' lines; ensure we also scan the entire file to pick up trailing
+  // metadata so prediction can faithfully reproduce training settings.
+  if (fseek(fp, 0, SEEK_SET) == 0) {
+    while (fgets(line, sizeof(line), fp) != NULL) {
+      if (line[0] != '#')
+        continue;
+      int tmp_int = 0;
+      if (sscanf(line, "#chunk_size %d", &tmp_int) == 1) {
+        model->chunk_size = tmp_int;
+        continue;
+      }
+      if (sscanf(line, "#chunk_overlap %d", &tmp_int) == 1) {
+        model->chunk_overlap = tmp_int;
+        continue;
+      }
+      if (sscanf(line, "#use_chunking %d", &tmp_int) == 1) {
+        model->use_chunking = tmp_int;
+        continue;
+      }
+      if (sscanf(line, "#num_wavelet_scales %d", &tmp_int) == 1) {
+        model->num_wavelet_scales = tmp_int;
+        continue;
+      }
+      if (strncmp(line, "#wavelet_scales", 15) == 0) {
+        // parse space separated doubles after tag
+        char* ptr = line + 15;
+        int idx = 0;
+        while (ptr && *ptr != '\0' && idx < MAX_NUM_WAVELETS) {
+          double v = 0.0;
+          if (sscanf(ptr, "%lf", &v) != 1)
+            break;
+          model->wavelet_scales[idx++] = v;
+          char* next = strchr(ptr, ' ');
+          if (!next)
+            break;
+          ptr = next + 1;
+        }
+        if (model->num_wavelet_scales == 0)
+          model->num_wavelet_scales = idx;
+        continue;
+      }
+    }
+    // rewind to original file end for subsequent reads/close
+    fseek(fp, 0, SEEK_END);
+  }
+
   if (model->num_wavelet_scales == 0 && model->wavelet_feature_count > 0) {
     model->num_wavelet_scales = model->wavelet_feature_count / 2;
   }

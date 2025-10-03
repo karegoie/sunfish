@@ -422,62 +422,12 @@ static bool predicted_gene_store_reserve(predicted_gene_store_t* store,
   return true;
 }
 
-static void predicted_gene_store_remove_at(predicted_gene_store_t* store,
-                                           size_t index) {
-  if (!store || index >= store->count)
-    return;
-
-  free_predicted_gene_record(&store->genes[index]);
-
-  if (index < store->count - 1) {
-    store->genes[index] = store->genes[store->count - 1];
-  }
-  store->count--;
-}
-
-static bool predicted_gene_intervals_overlap(const PredictedGeneRecord* a,
-                                             const PredictedGeneRecord* b) {
-  if (!a || !b)
-    return false;
-  if (a->strand != b->strand)
-    return false;
-  if (strcmp(a->seq_id, b->seq_id) != 0)
-    return false;
-
-  int a_start0 = a->start - 1;
-  int a_end0 = a->end - 1;
-  int b_start0 = b->start - 1;
-  int b_end0 = b->end - 1;
-
-  if (a_end0 < b_start0 || b_end0 < a_start0)
-    return false;
-  return true;
-}
-
-static int compare_gene_score(const PredictedGeneRecord* a,
-                              const PredictedGeneRecord* b) {
-  if (!a || !b)
-    return 0;
-
-  if (a->score > b->score)
-    return 1;
-  if (a->score < b->score)
-    return -1;
-
-  int a_span = a->end - a->start;
-  int b_span = b->end - b->start;
-  if (a_span > b_span)
-    return 1;
-  if (a_span < b_span)
-    return -1;
-
-  if (a->exon_count > b->exon_count)
-    return 1;
-  if (a->exon_count < b->exon_count)
-    return -1;
-
-  return 0;
-}
+/* Removed unused helper functions (predicted_gene_store_remove_at,
+   predicted_gene_intervals_overlap, compare_gene_score) which were
+   formerly used by a simpler merge strategy. The current implementation
+   collects all candidates and applies weighted interval scheduling when
+   emitting, so these helpers are unnecessary and caused unused-function
+   compiler warnings. */
 
 static bool predicted_gene_store_add(predicted_gene_store_t* store,
                                      const char* seq_id, char strand,
@@ -486,49 +436,28 @@ static bool predicted_gene_store_add(predicted_gene_store_t* store,
   if (!store || !seq_id || !exons || exon_count == 0)
     return false;
 
-  PredictedGeneRecord candidate;
-  candidate.seq_id = strdup(seq_id);
-  if (!candidate.seq_id) {
+  // Create record and append it to the store without removing existing
+  PredictedGeneRecord record;
+  record.seq_id = strdup(seq_id);
+  if (!record.seq_id) {
     free(exons);
     return false;
   }
-  candidate.strand = strand;
-  candidate.start = gene_start;
-  candidate.end = gene_end;
-  candidate.score = score;
-  candidate.exons = exons;
-  candidate.exon_count = exon_count;
+  record.strand = strand;
+  record.start = gene_start;
+  record.end = gene_end;
+  record.score = score;
+  record.exons = exons;
+  record.exon_count = exon_count;
 
   pthread_mutex_lock(&store->mutex);
-
-  // Remove lower-scoring overlapping genes, or reject if existing is better
-  for (size_t idx = 0; idx < store->count;) {
-    PredictedGeneRecord* existing = &store->genes[idx];
-    if (!predicted_gene_intervals_overlap(existing, &candidate)) {
-      idx++;
-      continue;
-    }
-
-    int cmp = compare_gene_score(&candidate, existing);
-    if (cmp > 0) {
-      // Candidate better; remove existing and continue checking
-      predicted_gene_store_remove_at(store, idx);
-      continue;
-    } else {
-      // Existing is better or equal—discard candidate
-      pthread_mutex_unlock(&store->mutex);
-      free_predicted_gene_record(&candidate);
-      return true;
-    }
-  }
-
   if (!predicted_gene_store_reserve(store, store->count + 1)) {
     pthread_mutex_unlock(&store->mutex);
-    free_predicted_gene_record(&candidate);
+    free_predicted_gene_record(&record);
     return false;
   }
 
-  store->genes[store->count++] = candidate;
+  store->genes[store->count++] = record;
   pthread_mutex_unlock(&store->mutex);
   return true;
 }
@@ -583,50 +512,256 @@ static void predicted_gene_store_emit_to_queue(predicted_gene_store_t* store) {
 
   qsort(order, count, sizeof(PredictedGeneRecord*),
         compare_gene_records_for_output);
-
+  // Perform weighted interval scheduling per (seq_id, strand)
   g_gene_counter = 0;
 
-  for (size_t i = 0; i < count; i++) {
-    PredictedGeneRecord* gene = order[i];
-    if (!gene)
+  // Group contiguous records by seq_id+strand considering order is sorted by
+  // seq_id then start
+  size_t idx = 0;
+  while (idx < count) {
+    PredictedGeneRecord* base = order[idx];
+    if (!base) {
+      idx++;
       continue;
-
-    int gene_id = 0;
-    pthread_mutex_lock(&g_gene_counter_mutex);
-    gene_id = ++g_gene_counter;
-    pthread_mutex_unlock(&g_gene_counter_mutex);
-
-    char gff_line[1024];
-    snprintf(gff_line, sizeof(gff_line),
-             "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
-             gene->seq_id, gene->start, gene->end, gene->score, gene->strand,
-             gene_id);
-    output_queue_add(&g_output_queue, gff_line);
-
-    char mrna_id[64];
-    snprintf(mrna_id, sizeof(mrna_id), "mRNA-gene%d", gene_id);
-    snprintf(gff_line, sizeof(gff_line),
-             "%s\tsunfish\tmRNA\t%d\t%d\t%.2f\t%c\t.\tID=%s;Parent=gene%d\n",
-             gene->seq_id, gene->start, gene->end, gene->score, gene->strand,
-             mrna_id, gene_id);
-    output_queue_add(&g_output_queue, gff_line);
-
-    for (size_t exon_idx = 0; exon_idx < gene->exon_count; exon_idx++) {
-      const OutputExon* exon = &gene->exons[exon_idx];
-      snprintf(
-          gff_line, sizeof(gff_line),
-          "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;Parent=%s\n",
-          gene->seq_id, exon->start, exon->end, gene->score, gene->strand,
-          mrna_id, exon_idx + 1, mrna_id);
-      output_queue_add(&g_output_queue, gff_line);
-
-      snprintf(gff_line, sizeof(gff_line),
-               "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
-               "gene%d\n",
-               gene->seq_id, exon->start, exon->end, gene->score, gene->strand,
-               exon->phase, gene_id, exon_idx + 1, gene_id);
-      output_queue_add(&g_output_queue, gff_line);
     }
+
+    const char* cur_seq = base->seq_id;
+    char cur_strand = base->strand;
+
+    // Collect group indices
+    size_t group_start = idx;
+    size_t group_end = idx + 1;
+    while (group_end < count) {
+      PredictedGeneRecord* r = order[group_end];
+      if (!r)
+        break;
+      if (strcmp(r->seq_id, cur_seq) != 0 || r->strand != cur_strand)
+        break;
+      group_end++;
+    }
+
+    size_t group_count = group_end - group_start;
+    if (group_count == 0) {
+      idx = group_end;
+      continue;
+    }
+
+    // Build arrays for weighted interval scheduling
+    // intervals: [start,end] inclusive as stored
+    int* starts = (int*)malloc(group_count * sizeof(int));
+    int* ends = (int*)malloc(group_count * sizeof(int));
+    double* weights = (double*)malloc(group_count * sizeof(double));
+    PredictedGeneRecord** items = (PredictedGeneRecord**)malloc(
+        group_count * sizeof(PredictedGeneRecord*));
+
+    if (!starts || !ends || !weights || !items) {
+      free(starts);
+      free(ends);
+      free(weights);
+      free(items);
+      // fallback: emit sequentially
+      for (size_t j = group_start; j < group_end; j++) {
+        PredictedGeneRecord* gene = order[j];
+        if (!gene)
+          continue;
+        int gene_id = 0;
+        pthread_mutex_lock(&g_gene_counter_mutex);
+        gene_id = ++g_gene_counter;
+        pthread_mutex_unlock(&g_gene_counter_mutex);
+
+        char gff_line[1024];
+        snprintf(gff_line, sizeof(gff_line),
+                 "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
+                 gene->seq_id, gene->start, gene->end, gene->score,
+                 gene->strand, gene_id);
+        output_queue_add(&g_output_queue, gff_line);
+        char mrna_id[64];
+        snprintf(mrna_id, sizeof(mrna_id), "mRNA-gene%d", gene_id);
+        snprintf(
+            gff_line, sizeof(gff_line),
+            "%s\tsunfish\tmRNA\t%d\t%d\t%.2f\t%c\t.\tID=%s;Parent=gene%d\n",
+            gene->seq_id, gene->start, gene->end, gene->score, gene->strand,
+            mrna_id, gene_id);
+        output_queue_add(&g_output_queue, gff_line);
+        for (size_t exon_idx = 0; exon_idx < gene->exon_count; exon_idx++) {
+          const OutputExon* exon = &gene->exons[exon_idx];
+          snprintf(gff_line, sizeof(gff_line),
+                   "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;"
+                   "Parent=%s\n",
+                   gene->seq_id, exon->start, exon->end, gene->score,
+                   gene->strand, mrna_id, exon_idx + 1, mrna_id);
+          output_queue_add(&g_output_queue, gff_line);
+          snprintf(gff_line, sizeof(gff_line),
+                   "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;"
+                   "Parent=gene%d\n",
+                   gene->seq_id, exon->start, exon->end, gene->score,
+                   gene->strand, exon->phase, gene_id, exon_idx + 1, gene_id);
+          output_queue_add(&g_output_queue, gff_line);
+        }
+      }
+      idx = group_end;
+      continue;
+    }
+
+    // Fill arrays
+    for (size_t j = 0; j < group_count; j++) {
+      PredictedGeneRecord* g = order[group_start + j];
+      items[j] = g;
+      starts[j] = g->start;
+      ends[j] = g->end;
+      // Weight: combine score and span to prefer confident longer models
+      int span = g->end - g->start + 1;
+      weights[j] = g->score * (double)span;
+      if (weights[j] < 0.0)
+        weights[j] = 0.0;
+    }
+
+    // For scheduling we need intervals sorted by end; they already are sorted
+    // by start then end; create index array and sort by end
+    int* order_by_end = (int*)malloc(group_count * sizeof(int));
+    for (size_t j = 0; j < group_count; j++)
+      order_by_end[j] = (int)j;
+
+    // simple insertion sort for small groups
+    for (size_t a = 1; a < group_count; a++) {
+      int key = order_by_end[a];
+      size_t b = a;
+      while (b > 0 && ends[order_by_end[b - 1]] > ends[key]) {
+        order_by_end[b] = order_by_end[b - 1];
+        b--;
+      }
+      order_by_end[b] = key;
+    }
+
+    // Compute p[j] (the last index before j that doesn't overlap)
+    int* p = (int*)malloc(group_count * sizeof(int));
+    for (size_t jj = 0; jj < group_count; jj++) {
+      int jidx = order_by_end[jj];
+      p[jj] = -1;
+      for (int kk = (int)jj - 1; kk >= 0; kk--) {
+        int kidx = order_by_end[kk];
+        if (ends[kidx] < starts[jidx]) { // non-overlapping (exclusive)
+          p[jj] = kk;
+          break;
+        }
+      }
+    }
+
+    // DP array
+    double* M = (double*)calloc(group_count, sizeof(double));
+    if (!M) {
+      free(starts);
+      free(ends);
+      free(weights);
+      free(items);
+      free(order_by_end);
+      free(p);
+      idx = group_end;
+      continue;
+    }
+
+    for (size_t jj = 0; jj < group_count; jj++) {
+      int jidx = order_by_end[jj];
+      double incl = weights[jidx];
+      if (p[jj] != -1)
+        incl += M[p[jj]];
+      double excl = (jj == 0) ? 0.0 : M[jj - 1];
+      M[jj] = (incl > excl) ? incl : excl;
+    }
+
+    // Reconstruct solution
+    bool* take = (bool*)calloc(group_count, sizeof(bool));
+    int jj = (int)group_count - 1;
+    while (jj >= 0) {
+      int jidx = order_by_end[jj];
+      double incl = weights[jidx];
+      if (p[jj] != -1)
+        incl += M[p[jj]];
+      double excl = (jj == 0) ? 0.0 : M[jj - 1];
+      if (incl > excl) {
+        take[jj] = true;
+        jj = (p[jj] == -1) ? -1 : p[jj];
+      } else {
+        take[jj] = false;
+        jj--;
+      }
+    }
+
+    // Emit selected items in genomic order (sort selected by start)
+    // Collect selected pointers
+    PredictedGeneRecord** selected = (PredictedGeneRecord**)malloc(
+        group_count * sizeof(PredictedGeneRecord*));
+    size_t sel_count = 0;
+    for (size_t jj2 = 0; jj2 < group_count; jj2++) {
+      if (take[jj2]) {
+        selected[sel_count++] = items[order_by_end[jj2]];
+      }
+    }
+
+    // sort selected by start (simple insertion since usually small)
+    for (size_t a = 1; a < sel_count; a++) {
+      PredictedGeneRecord* key = selected[a];
+      size_t b = a;
+      while (b > 0 && selected[b - 1]->start > key->start) {
+        selected[b] = selected[b - 1];
+        b--;
+      }
+      selected[b] = key;
+    }
+
+    for (size_t sidx = 0; sidx < sel_count; sidx++) {
+      PredictedGeneRecord* gene = selected[sidx];
+      if (!gene)
+        continue;
+      int gene_id = 0;
+      pthread_mutex_lock(&g_gene_counter_mutex);
+      gene_id = ++g_gene_counter;
+      pthread_mutex_unlock(&g_gene_counter_mutex);
+
+      char gff_line[1024];
+      snprintf(gff_line, sizeof(gff_line),
+               "%s\tsunfish\tgene\t%d\t%d\t%.2f\t%c\t.\tID=gene%d\n",
+               gene->seq_id, gene->start, gene->end, gene->score, gene->strand,
+               gene_id);
+      output_queue_add(&g_output_queue, gff_line);
+
+      char mrna_id[64];
+      snprintf(mrna_id, sizeof(mrna_id), "mRNA-gene%d", gene_id);
+      snprintf(gff_line, sizeof(gff_line),
+               "%s\tsunfish\tmRNA\t%d\t%d\t%.2f\t%c\t.\tID=%s;Parent=gene%d\n",
+               gene->seq_id, gene->start, gene->end, gene->score, gene->strand,
+               mrna_id, gene_id);
+      output_queue_add(&g_output_queue, gff_line);
+
+      for (size_t exon_idx = 0; exon_idx < gene->exon_count; exon_idx++) {
+        const OutputExon* exon = &gene->exons[exon_idx];
+        snprintf(gff_line, sizeof(gff_line),
+                 "%s\tsunfish\texon\t%d\t%d\t%.2f\t%c\t.\tID=exon-%s-%zu;"
+                 "Parent=%s\n",
+                 gene->seq_id, exon->start, exon->end, gene->score,
+                 gene->strand, mrna_id, exon_idx + 1, mrna_id);
+        output_queue_add(&g_output_queue, gff_line);
+
+        snprintf(gff_line, sizeof(gff_line),
+                 "%s\tsunfish\tCDS\t%d\t%d\t%.2f\t%c\t%d\tID=cds%d.%zu;Parent="
+                 "gene%d\n",
+                 gene->seq_id, exon->start, exon->end, gene->score,
+                 gene->strand, exon->phase, gene_id, exon_idx + 1, gene_id);
+        output_queue_add(&g_output_queue, gff_line);
+      }
+    }
+
+    free(selected);
+    free(starts);
+    free(ends);
+    free(weights);
+    free(items);
+    free(order_by_end);
+    free(p);
+    free(M);
+    free(take);
+
+    idx = group_end;
   }
 
   free(order);
@@ -1203,7 +1338,7 @@ static void output_predicted_gene(const prediction_task_t* task,
 // Validate ORF: check start codon, stop codon, in-frame stops, and length
 static bool is_valid_orf(const char* cds_sequence) {
   // FOR DEBUGGING PURPOSE ONLY; FIXME
-  return true;
+  // return true;
 
   if (!cds_sequence) {
     return false;
@@ -1284,13 +1419,26 @@ static void predict_sequence_worker(void* arg) {
   }
 
   // Apply Z-score normalization using global statistics from the model
+  // NOTE: do NOT normalize k-mer features. k-mer features are placed after
+  // the wavelet features in the observation vector. Only normalize the
+  // wavelet_feature_count first features and leave k-mer features unchanged.
+  int wavelet_norm_count = task->model->wavelet_feature_count;
+  if (wavelet_norm_count < 0)
+    wavelet_norm_count = 0;
+  if (wavelet_norm_count > task->model->num_features)
+    wavelet_norm_count = task->model->num_features;
+
   for (int t = 0; t < seq_len; t++) {
-    for (int f = 0; f < task->model->num_features; f++) {
+    for (int f = 0; f < wavelet_norm_count; f++) {
       double raw_val = observations[t][f];
-      double normalized_val = (raw_val - task->model->global_feature_mean[f]) /
-                              task->model->global_feature_stddev[f];
+      double stddev = task->model->global_feature_stddev[f];
+      if (!isfinite(stddev) || stddev < 1e-6)
+        stddev = 1e-6; // floor to avoid divide-by-zero or extreme scaling
+      double normalized_val =
+          (raw_val - task->model->global_feature_mean[f]) / stddev;
       observations[t][f] = normalized_val;
     }
+    // k-mer features (f >= wavelet_norm_count) are intentionally left as-is
   }
 
   states = (int*)malloc(seq_len * sizeof(int));
@@ -1837,11 +1985,20 @@ static void normalize_observations_in_place(double*** observations,
       if (!feature_vec)
         continue;
 
+      // Only normalize wavelet features. k-mer features follow the
+      // wavelet features in the feature vector and should be left
+      // unnormalized.
       int feature_count = model->num_features;
       if (feature_count > MAX_NUM_FEATURES)
         feature_count = MAX_NUM_FEATURES;
 
-      for (int f = 0; f < feature_count; f++) {
+      int wavelet_count = model->wavelet_feature_count;
+      if (wavelet_count < 0)
+        wavelet_count = 0;
+      if (wavelet_count > feature_count)
+        wavelet_count = feature_count;
+
+      for (int f = 0; f < wavelet_count; f++) {
         double stddev = model->global_feature_stddev[f];
         if (stddev < 1e-10)
           stddev = 1e-10;
@@ -3368,7 +3525,7 @@ static void handle_train(int argc, char* argv[]) {
     fprintf(stderr, "Warning: Failed to train splice PWM model\n");
   }
 
-  const int kBaumWelchMaxIterations = 100; // FIXME
+  const int kBaumWelchMaxIterations = 50; // FIXME
   const double kBaumWelchThreshold = 10.0;
 
   fprintf(
@@ -3487,15 +3644,36 @@ static void handle_predict(int argc, char* argv[]) {
   g_kmer_feature_count = model.kmer_feature_count;
 
   // Chunking settings
-  g_chunk_size = model.chunk_size > 0 ? model.chunk_size : g_chunk_size;
-  g_chunk_overlap =
-      model.chunk_overlap >= 0 ? model.chunk_overlap : g_chunk_overlap;
-  g_use_chunking = model.use_chunking ? true : false;
-  if (g_use_chunking) {
-    fprintf(stderr, "Using chunking from model: size=%d overlap=%d\n",
-            g_chunk_size, g_chunk_overlap);
+  // Restore chunking parameters saved in the model. Even if the model's
+  // `use_chunking` flag is 0, prefer to honor an explicit chunk_size saved
+  // during training: use it to split long sequences for parallel
+  // prediction and subsequent merge. This helps reproduce training-time
+  // segmentation behavior and avoids memory blowups on very long contigs.
+  if (model.chunk_size > 0) {
+    g_chunk_size = model.chunk_size;
+    g_chunk_overlap =
+        (model.chunk_overlap >= 0) ? model.chunk_overlap : g_chunk_overlap;
+    g_use_chunking = true;
+    if (model.use_chunking)
+      fprintf(stderr, "Using chunking from model: size=%d overlap=%d\n",
+              g_chunk_size, g_chunk_overlap);
+    else
+      fprintf(stderr,
+              "Model contains chunking metadata (size=%d overlap=%d); forcing "
+              "chunked prediction to match training\n",
+              g_chunk_size, g_chunk_overlap);
   } else {
-    fprintf(stderr, "Chunking disabled by model settings\n");
+    // No explicit chunk size in model: fall back to model's use_chunking flag
+    g_chunk_size = model.chunk_size > 0 ? model.chunk_size : g_chunk_size;
+    g_chunk_overlap =
+        model.chunk_overlap >= 0 ? model.chunk_overlap : g_chunk_overlap;
+    g_use_chunking = model.use_chunking ? true : false;
+    if (g_use_chunking) {
+      fprintf(stderr, "Using chunking from model: size=%d overlap=%d\n",
+              g_chunk_size, g_chunk_overlap);
+    } else {
+      fprintf(stderr, "Chunking disabled by model settings\n");
+    }
   }
 
   validate_chunk_configuration_or_exit("predict");
