@@ -1524,6 +1524,64 @@ static void accumulate_statistics_for_sequence(
   }
 }
 
+// Helper structure for collecting duration statistics
+typedef struct {
+  double* log_durations;  // Array of log(duration) values
+  int count;             // Number of observations
+  int capacity;          // Allocated capacity
+} DurationStats;
+
+static void accumulate_duration_statistics(
+    int seq_len, const int* state_labels,
+    DurationStats duration_stats[NUM_STATES]) {
+  if (!state_labels || !duration_stats || seq_len <= 0)
+    return;
+
+  int current_state = state_labels[0];
+  int segment_start = 0;
+
+  for (int t = 1; t <= seq_len; t++) {
+    int next_state = (t < seq_len) ? state_labels[t] : -1;
+    
+    // Check if we've reached the end of a segment
+    if (t == seq_len || next_state != current_state) {
+      int duration = t - segment_start;
+      
+      if (current_state >= 0 && current_state < NUM_STATES && duration > 0) {
+        // Expand array if needed
+        if (duration_stats[current_state].count >= 
+            duration_stats[current_state].capacity) {
+          int new_capacity = duration_stats[current_state].capacity * 2;
+          if (new_capacity < 16) new_capacity = 16;
+          
+          double* new_array = (double*)realloc(
+              duration_stats[current_state].log_durations,
+              new_capacity * sizeof(double));
+          
+          if (new_array) {
+            duration_stats[current_state].log_durations = new_array;
+            duration_stats[current_state].capacity = new_capacity;
+          }
+        }
+        
+        // Add log(duration) to the array
+        if (duration_stats[current_state].count < 
+            duration_stats[current_state].capacity) {
+          duration_stats[current_state].log_durations[
+              duration_stats[current_state].count] = log((double)duration);
+          duration_stats[current_state].count++;
+        }
+      }
+      
+      // Start new segment
+      if (t < seq_len) {
+        current_state = next_state;
+        segment_start = t;
+      }
+    }
+  }
+}
+
 static void enforce_exon_cycle_constraints(HMMModel* model) {
   if (!model)
     return;
@@ -2372,6 +2430,96 @@ static void handle_train(int argc, char* argv[]) {
 
     fprintf(stderr, "State %d: %lld observations\n", i,
             state_observation_counts[i]);
+  }
+
+  // =========================================================================
+  // Calculate duration statistics for HSMM
+  // =========================================================================
+  fprintf(stderr, "Calculating duration statistics for HSMM...\n");
+  
+  // Initialize duration statistics collectors
+  DurationStats duration_stats[NUM_STATES];
+  for (int i = 0; i < NUM_STATES; i++) {
+    duration_stats[i].log_durations = NULL;
+    duration_stats[i].count = 0;
+    duration_stats[i].capacity = 0;
+  }
+  
+  // Collect duration statistics from all sequences
+  for (int seq_idx = 0; seq_idx < genome->count; seq_idx++) {
+    const char* seq_id = genome->records[seq_idx].id;
+    int seq_len = strlen(genome->records[seq_idx].sequence);
+    
+    if (seq_len <= 0)
+      continue;
+    
+    int forward_obs_idx = seq_idx * 2;
+    int reverse_obs_idx = forward_obs_idx + 1;
+    
+    int* state_labels = (int*)malloc(seq_len * sizeof(int));
+    if (!state_labels) {
+      fprintf(stderr, "Warning: Failed to allocate state labels for duration stats\n");
+      continue;
+    }
+    
+    // Process forward strand
+    if (forward_obs_idx < total_sequences && observations[forward_obs_idx] &&
+        seq_lengths[forward_obs_idx] > 0) {
+      initialize_state_labels(state_labels, seq_len);
+      label_forward_states(groups, group_count, seq_id, seq_len, state_labels);
+      accumulate_duration_statistics(seq_len, state_labels, duration_stats);
+    }
+    
+    // Process reverse strand
+    if (reverse_obs_idx < total_sequences && observations[reverse_obs_idx] &&
+        seq_lengths[reverse_obs_idx] > 0) {
+      initialize_state_labels(state_labels, seq_len);
+      label_reverse_states(groups, group_count, seq_id, seq_len, state_labels);
+      accumulate_duration_statistics(seq_len, state_labels, duration_stats);
+    }
+    
+    free(state_labels);
+  }
+  
+  // Compute mean and stddev of log-durations for each state
+  for (int i = 0; i < NUM_STATES; i++) {
+    if (duration_stats[i].count > 0) {
+      // Calculate mean
+      double sum = 0.0;
+      for (int j = 0; j < duration_stats[i].count; j++) {
+        sum += duration_stats[i].log_durations[j];
+      }
+      double mean = sum / duration_stats[i].count;
+      
+      // Calculate standard deviation
+      double sum_sq = 0.0;
+      for (int j = 0; j < duration_stats[i].count; j++) {
+        double diff = duration_stats[i].log_durations[j] - mean;
+        sum_sq += diff * diff;
+      }
+      
+      double stddev = 1.0;  // default
+      if (duration_stats[i].count > 1) {
+        double variance = sum_sq / (duration_stats[i].count - 1);
+        stddev = sqrt(variance > 1e-6 ? variance : 1e-6);
+      }
+      
+      model.duration[i].mean_log_duration = mean;
+      model.duration[i].stddev_log_duration = stddev;
+      
+      fprintf(stderr, "State %d: %d duration segments, mean_log=%.4f, stddev_log=%.4f\n",
+              i, duration_stats[i].count, mean, stddev);
+    } else {
+      // No segments observed, use defaults
+      model.duration[i].mean_log_duration = 0.0;
+      model.duration[i].stddev_log_duration = 1.0;
+      fprintf(stderr, "State %d: No duration segments observed, using defaults\n", i);
+    }
+    
+    // Free duration statistics
+    if (duration_stats[i].log_durations) {
+      free(duration_stats[i].log_durations);
+    }
   }
 
   enforce_exon_cycle_constraints(&model);

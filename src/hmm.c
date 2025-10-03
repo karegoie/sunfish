@@ -214,6 +214,12 @@ void hmm_init(HMMModel* model, int num_features) {
   model->chunk_overlap = 0;
   model->use_chunking = 0;
 
+  // Initialize duration parameters with defaults
+  for (int i = 0; i < NUM_STATES; i++) {
+    model->duration[i].mean_log_duration = 0.0;    // log(1) = 0
+    model->duration[i].stddev_log_duration = 1.0;  // default stddev
+  }
+
   // Initialize wavelet scales metadata
   model->num_wavelet_scales = 0;
   for (int i = 0; i < MAX_NUM_WAVELETS; i++)
@@ -507,48 +513,120 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
   return true;
 }
 
+// Helper function to compute log probability of duration d under log-normal distribution
+static double lognormal_log_pdf(int duration, double mean_log_duration, 
+                                double stddev_log_duration) {
+  if (duration <= 0) {
+    return -INFINITY;
+  }
+  
+  if (stddev_log_duration < 1e-6) {
+    stddev_log_duration = 1e-6;  // Prevent numerical issues
+  }
+  
+  double log_d = log((double)duration);
+  double diff = log_d - mean_log_duration;
+  double var = stddev_log_duration * stddev_log_duration;
+  
+  // Log-PDF of log-normal distribution:
+  // -log(d) - 0.5*log(2*pi*var) - (log(d) - mu)^2 / (2*var)
+  return -log_d - 0.5 * log(2.0 * M_PI * var) - (diff * diff) / (2.0 * var);
+}
+
 double hmm_viterbi(const HMMModel* model, double** observations,
                    const char* sequence, int seq_len, int* states) {
+  // HSMM Viterbi with segment-based processing
+  const int MAX_DURATION = 2000;  // Maximum segment duration to consider
+  
   // Allocate Viterbi matrices
+  // delta[t][j] = max log-probability of path ending at position t in state j
   double** delta = (double**)malloc(seq_len * sizeof(double*));
+  // psi[t][j] stores the best previous state for ending at t in state j
   int** psi = (int**)malloc(seq_len * sizeof(int*));
+  // duration[t][j] stores the optimal duration of state j ending at position t
+  int** duration = (int**)malloc(seq_len * sizeof(int*));
 
   for (int t = 0; t < seq_len; t++) {
     delta[t] = (double*)malloc(NUM_STATES * sizeof(double));
     psi[t] = (int*)malloc(NUM_STATES * sizeof(int));
+    duration[t] = (int*)malloc(NUM_STATES * sizeof(int));
+    
+    for (int j = 0; j < NUM_STATES; j++) {
+      delta[t][j] = -INFINITY;
+      psi[t][j] = 0;
+      duration[t][j] = 1;
+    }
   }
 
-  // Initialization (t=0)
-  for (int i = 0; i < NUM_STATES; i++) {
-    delta[0][i] =
-        log(model->initial[i]) +
-        gaussian_log_pdf(observations[0], model->emission[i].mean,
-                         model->emission[i].variance, model->num_features);
-    psi[0][i] = 0;
+  // Initialization (t=0): start with segments of length 1
+  for (int j = 0; j < NUM_STATES; j++) {
+    delta[0][j] =
+        log(model->initial[j]) +
+        gaussian_log_pdf(observations[0], model->emission[j].mean,
+                         model->emission[j].variance, model->num_features) +
+        lognormal_log_pdf(1, model->duration[j].mean_log_duration,
+                         model->duration[j].stddev_log_duration);
+    psi[0][j] = -1;  // No previous state
+    duration[0][j] = 1;
   }
 
-  // Recursion (t=1 to T-1)
+  // Recursion: for each position t and state j, consider all possible durations
   for (int t = 1; t < seq_len; t++) {
     for (int j = 0; j < NUM_STATES; j++) {
-      double max_val = -INFINITY;
-      int max_state = 0;
-
-      for (int i = 0; i < NUM_STATES; i++) {
-        double transition_log = log(model->transition[i][j]);
-        transition_log +=
-            splice_signal_adjustment(sequence, seq_len, i, j, t, &model->pwm);
-        double val = delta[t - 1][i] + transition_log;
-        if (val > max_val) {
-          max_val = val;
-          max_state = i;
+      double best_score = -INFINITY;
+      int best_prev_state = 0;
+      int best_duration = 1;
+      
+      // Try different segment durations d
+      int max_d = (t + 1 < MAX_DURATION) ? (t + 1) : MAX_DURATION;
+      
+      for (int d = 1; d <= max_d && d <= t + 1; d++) {
+        // Compute emission probability for segment [t-d+1, t]
+        double segment_emission = 0.0;
+        for (int pos = t - d + 1; pos <= t; pos++) {
+          segment_emission += gaussian_log_pdf(observations[pos],
+                                              model->emission[j].mean,
+                                              model->emission[j].variance,
+                                              model->num_features);
+        }
+        
+        // Compute duration probability
+        double duration_prob = lognormal_log_pdf(d, model->duration[j].mean_log_duration,
+                                                model->duration[j].stddev_log_duration);
+        
+        // Consider transitions from all previous states
+        if (d == t + 1) {
+          // Segment starts from position 0 (initial state)
+          double score = log(model->initial[j]) + segment_emission + duration_prob;
+          if (score > best_score) {
+            best_score = score;
+            best_prev_state = -1;
+            best_duration = d;
+          }
+        } else {
+          // Segment starts after position t-d
+          int prev_pos = t - d;
+          for (int i = 0; i < NUM_STATES; i++) {
+            double transition_log = log(model->transition[i][j]);
+            // Add splice signal adjustment at the transition point (t-d+1)
+            transition_log += splice_signal_adjustment(sequence, seq_len, i, j, 
+                                                      t - d + 1, &model->pwm);
+            
+            double score = delta[prev_pos][i] + transition_log + 
+                          segment_emission + duration_prob;
+            
+            if (score > best_score) {
+              best_score = score;
+              best_prev_state = i;
+              best_duration = d;
+            }
+          }
         }
       }
-
-      delta[t][j] =
-          max_val + gaussian_log_pdf(observations[t], model->emission[j].mean,
-                                     model->emission[j].variance,
-                                     model->num_features);
-      psi[t][j] = max_state;
+      
+      delta[t][j] = best_score;
+      psi[t][j] = best_prev_state;
+      duration[t][j] = best_duration;
     }
   }
 
@@ -562,19 +640,35 @@ double hmm_viterbi(const HMMModel* model, double** observations,
     }
   }
 
-  // Backtrack
-  states[seq_len - 1] = best_state;
-  for (int t = seq_len - 2; t >= 0; t--) {
-    states[t] = psi[t + 1][states[t + 1]];
+  // Backtrack using segment information
+  int t = seq_len - 1;
+  int current_state = best_state;
+  
+  while (t >= 0) {
+    int d = duration[t][current_state];
+    int prev_state = psi[t][current_state];
+    
+    // Fill in the states for the segment
+    for (int pos = t - d + 1; pos <= t && pos >= 0; pos++) {
+      states[pos] = current_state;
+    }
+    
+    // Move to previous segment
+    t = t - d;
+    if (prev_state >= 0) {
+      current_state = prev_state;
+    }
   }
 
   // Free matrices
   for (int t = 0; t < seq_len; t++) {
     free(delta[t]);
     free(psi[t]);
+    free(duration[t]);
   }
   free(delta);
   free(psi);
+  free(duration);
 
   return max_prob;
 }
@@ -622,6 +716,14 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
       fprintf(fp, "%.10f ", model->emission[i].variance[j]);
     }
     fprintf(fp, "\n");
+  }
+
+  // Save duration parameters (HSMM)
+  fprintf(fp, "DURATION\n");
+  for (int i = 0; i < NUM_STATES; i++) {
+    fprintf(fp, "%.10f %.10f\n", 
+            model->duration[i].mean_log_duration,
+            model->duration[i].stddev_log_duration);
   }
 
   // Save global feature statistics for Z-score normalization
@@ -1110,6 +1212,28 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
           if (fgets(line, sizeof(line), fp) != NULL) {
             sscanf(line, "MIN_SCORE %lf", &model->pwm.min_acceptor_score);
           }
+        }
+      }
+    }
+  }
+
+  // Initialize duration parameters with defaults (for backward compatibility)
+  for (int i = 0; i < NUM_STATES; i++) {
+    model->duration[i].mean_log_duration = 0.0;
+    model->duration[i].stddev_log_duration = 1.0;
+  }
+
+  // Read DURATION block if present (optional for backward compatibility)
+  if (fgets(line, sizeof(line), fp) != NULL && 
+      strncmp(line, "DURATION", 8) == 0) {
+    for (int i = 0; i < NUM_STATES; i++) {
+      if (fgets(line, sizeof(line), fp) != NULL) {
+        if (sscanf(line, "%lf %lf", 
+                  &model->duration[i].mean_log_duration,
+                  &model->duration[i].stddev_log_duration) != 2) {
+          // If parsing fails, keep defaults
+          model->duration[i].mean_log_duration = 0.0;
+          model->duration[i].stddev_log_duration = 1.0;
         }
       }
     }
