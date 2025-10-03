@@ -27,7 +27,7 @@ static int g_num_threads = 0;
 static int g_kmer_size = 2;
 static int g_kmer_feature_count = 16; // 4^2 for default k-mer size 2
 static int g_total_feature_count =
-    32; // 16 wavelet + 16 k-mer features by default
+    32; // 16 wavelet (8 scales * 2) + 16 k-mer features by default
 
 // Chunk-based prediction configuration
 static int g_chunk_size = 50000;   // Default chunk size: 50kb
@@ -157,7 +157,7 @@ static int compute_kmer_feature_count(int k) {
 }
 
 static bool update_feature_counts(void) {
-  int wavelet_features = g_num_wavelet_scales * 4;
+  int wavelet_features = g_num_wavelet_scales * 2;
   int kmer_features = 0;
 
   if (g_kmer_size > 0) {
@@ -727,7 +727,7 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
   if (seq_len <= 0)
     return false;
 
-  int wavelet_feature_rows = g_num_wavelet_scales * 4;
+  int wavelet_feature_rows = g_num_wavelet_scales * 2;
   int kmer_feature_rows = g_kmer_feature_count;
   int num_feature_rows = g_total_feature_count;
 
@@ -2415,7 +2415,7 @@ static void handle_train(int argc, char* argv[]) {
 
   fprintf(stderr,
           "Feature configuration: %d wavelet dims + %d k-mer dims = %d total\n",
-          g_num_wavelet_scales * 4, g_kmer_feature_count,
+          g_num_wavelet_scales * 2, g_kmer_feature_count,
           g_total_feature_count);
 
   ensure_thread_count("training", threads_specified);
@@ -2882,7 +2882,7 @@ static void handle_train(int argc, char* argv[]) {
   // Initialize HMM model
   HMMModel model;
   hmm_init(&model, g_total_feature_count);
-  model.wavelet_feature_count = g_num_wavelet_scales * 4;
+  model.wavelet_feature_count = g_num_wavelet_scales * 2;
   model.kmer_feature_count = g_kmer_feature_count;
   model.kmer_size = g_kmer_size;
 
@@ -3515,7 +3515,7 @@ static void handle_predict(int argc, char* argv[]) {
             "%d, k-mer %d). Align --wavelet/--kmer with training.\n",
             model.num_features, model.wavelet_feature_count,
             model.kmer_feature_count, g_total_feature_count,
-            g_num_wavelet_scales * 4, g_kmer_feature_count);
+            g_num_wavelet_scales * 2, g_kmer_feature_count);
     exit(1);
   }
 
@@ -3526,7 +3526,7 @@ static void handle_predict(int argc, char* argv[]) {
 
   fprintf(stderr,
           "Feature configuration: %d wavelet dims + %d k-mer dims = %d total\n",
-          g_num_wavelet_scales * 4, g_kmer_feature_count,
+          g_num_wavelet_scales * 2, g_kmer_feature_count,
           g_total_feature_count);
 
   // Initialize output queue
