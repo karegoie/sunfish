@@ -634,6 +634,21 @@ double hmm_viterbi(const HMMModel* model, double** observations,
     }
   }
 
+  double* exon_internal_transition_log_sum =
+      (double*)calloc(seq_len, sizeof(double));
+  if (exon_internal_transition_log_sum != NULL) {
+    for (int t = 1; t < seq_len; t++) {
+      int prev_frame_idx = (t - 1) % 3;
+      int curr_frame_idx = t % 3;
+      HMMState prev_state = kExonCycleStates[prev_frame_idx];
+      HMMState curr_state = kExonCycleStates[curr_frame_idx];
+
+      exon_internal_transition_log_sum[t] =
+          exon_internal_transition_log_sum[t - 1] +
+          hmm_safe_log(model->transition[prev_state][curr_state]);
+    }
+  }
+
   // Initialization (t=0): start with segments of length 1
   for (int j = 0; j < NUM_STATES; j++) {
     const StateDuration* duration_params = hmm_get_duration_params(model, j);
@@ -673,25 +688,24 @@ double hmm_viterbi(const HMMModel* model, double** observations,
         // Compute log probability (emission + internal transitions) for
         // segment [t-d+1, t]
         double segment_log_prob = 0.0;
+        int start_pos = t - d + 1;
         if (j_is_exon) {
-          int current_index = entry_index;
-          HMMState current_state = segment_entry_state;
-          for (int pos = t - d + 1; pos <= t; pos++) {
-            segment_log_prob += gaussian_log_pdf(
-                observations[pos], model->emission[current_state].mean,
-                model->emission[current_state].variance, model->num_features);
-
-            if (pos < t) {
-              int next_index = hmm_exon_next_index(current_index);
-              HMMState next_state = kExonCycleStates[next_index];
-              segment_log_prob +=
-                  hmm_safe_log(model->transition[current_state][next_state]);
-              current_index = next_index;
-              current_state = next_state;
+          double exon_emission_sum = 0.0;
+          for (int frame = 0; frame < 3; ++frame) {
+            HMMState frame_state = kExonCycleStates[frame];
+            double frame_sum = emission_log_sum[t][frame_state];
+            if (start_pos > 0) {
+              frame_sum -= emission_log_sum[start_pos - 1][frame_state];
             }
+            exon_emission_sum += frame_sum;
+          }
+          segment_log_prob = exon_emission_sum / 3.0;
+
+          if (d > 1 && exon_internal_transition_log_sum != NULL) {
+            segment_log_prob += exon_internal_transition_log_sum[t] -
+                                exon_internal_transition_log_sum[start_pos];
           }
         } else {
-          int start_pos = t - d + 1;
           double segment_emission;
           if (start_pos == 0) {
             segment_emission = emission_log_sum[t][j];
@@ -814,6 +828,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   free(psi);
   free(duration);
   free(emission_log_sum);
+  free(exon_internal_transition_log_sum);
 
   return max_prob;
 }

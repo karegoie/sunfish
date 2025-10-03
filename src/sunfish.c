@@ -30,9 +30,9 @@ static int g_total_feature_count =
     32; // 16 wavelet + 16 k-mer features by default
 
 // Chunk-based prediction configuration
-static int g_chunk_size = 50000;    // Default chunk size: 50kb
-static int g_chunk_overlap = 5000;  // Default overlap: 5kb
-static bool g_use_chunking = false; // Disabled by default; enable via CLI
+static int g_chunk_size = 50000;   // Default chunk size: 50kb
+static int g_chunk_overlap = 5000; // Default overlap: 5kb
+static bool g_use_chunking = true;
 
 // Thread-safe output queue
 typedef struct output_node_t {
@@ -292,6 +292,9 @@ static void output_queue_flush(output_queue_t* queue) {
 
     for (int i = 0; i < count; i++) {
       printf("%s", lines[i]);
+      /* Ensure output is flushed immediately so redirected output (e.g., to a
+         file or a pipe) receives records in real time. */
+      fflush(stdout);
       free(lines[i]);
     }
 
@@ -817,7 +820,7 @@ static void output_predicted_gene(const prediction_task_t* task,
 // Validate ORF: check start codon, stop codon, in-frame stops, and length
 static bool is_valid_orf(const char* cds_sequence) {
   // FOR DEBUGGING PURPOSE ONLY; FIXME
-  return true;
+  // return true;
 
   if (!cds_sequence) {
     return false;
