@@ -52,7 +52,7 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
     char seqid[256], source[256], type[256], strand_char, phase_char;
     int start, end;
     char score[256], attrs[MAX_LINE_LEN];
-    int n = sscanf(line, "%255s\t%255s\t%255s\t%d\t%d\t%255s\t%c\t%c\t%[^\n]",
+    int n = sscanf(line, "%255s\t%255s\t%255s\t%d\t%d\t%255s\t%c\t%c\t%49999[^\n]",
                    seqid, source, type, &start, &end, score, &strand_char,
                    &phase_char, attrs);
     if (n < 9 || strcmp(type, "CDS") != 0)
@@ -88,7 +88,12 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
     tmp[temp_cnt].start = start;
     tmp[temp_cnt].end = end;
     tmp[temp_cnt].strand = strand_char;
-    tmp[temp_cnt].phase = phase_char - '0';
+    // Handle phase field: '.' means unspecified, treat as 0
+    if (phase_char >= '0' && phase_char <= '2') {
+      tmp[temp_cnt].phase = phase_char - '0';
+    } else {
+      tmp[temp_cnt].phase = 0; // default for '.' or invalid values
+    }
     temp_cnt++;
   }
   fclose(fp);

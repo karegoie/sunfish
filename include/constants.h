@@ -34,7 +34,8 @@
 #define kVarianceFloor 1e-5
 
 // Maximum segment duration to consider in HSMM Viterbi
-#define MAX_DURATION 10000
+// Increased to handle long introns (some can exceed 10kb in eukaryotes)
+#define MAX_DURATION 50000
 
 // Default chunking configuration for long sequences
 #define DEFAULT_CHUNK_SIZE 50000
