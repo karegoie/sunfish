@@ -142,9 +142,15 @@ bool compute_cwt_features(const char* sequence, int seq_len,
     // Store real and imaginary parts only
     // features[s * 2] = real part
     // features[s * 2 + 1] = imaginary part
+    // Use indices directly to improve cache locality
+    int real_idx = s * 2;
+    int imag_idx = s * 2 + 1;
+    double* real_features = features[real_idx];
+    double* imag_features = features[imag_idx];
+    
     for (int i = 0; i < seq_len; i++) {
-      features[s * 2][i] = creal(cwt_result[i]);
-      features[s * 2 + 1][i] = cimag(cwt_result[i]);
+      real_features[i] = creal(cwt_result[i]);
+      imag_features[i] = cimag(cwt_result[i]);
     }
 
     free(cwt_result);

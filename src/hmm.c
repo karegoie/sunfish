@@ -352,6 +352,8 @@ void hmm_init(HMMModel* model, int num_features) {
 
 double diag_gaussian_logpdf(const double* observation, const double* mean,
                             const double* variance, int num_features) {
+  // Precompute constant factor for efficiency
+  static const double LOG_2PI = log(2.0 * M_PI);
   double log_prob = 0.0;
 
   for (int i = 0; i < num_features; i++) {
@@ -362,7 +364,8 @@ double diag_gaussian_logpdf(const double* observation, const double* mean,
       var = kVarianceFloor;
     }
 
-    log_prob += -0.5 * log(2.0 * M_PI * var) - 0.5 * (diff * diff) / var;
+    // Optimized: use precomputed LOG_2PI
+    log_prob += -0.5 * (LOG_2PI + log(var) + (diff * diff) / var);
   }
 
   return log_prob;
@@ -999,8 +1002,9 @@ double hmm_viterbi(const HMMModel* model, double** observations,
                    const char* sequence, int seq_len, int* states) {
   // HSMM Viterbi with segment-based processing
   // Maximum segment duration to consider (defined in constants.h)
-  // const int MAX_DURATION = 10000; 
-
+  // Use a more reasonable maximum to improve performance
+  const int PRACTICAL_MAX_DURATION = 5000;
+  
   // Allocate Viterbi matrices
   // delta[t][j] = max log-probability of path ending at position t in state j
   double** delta = (double**)malloc(seq_len * sizeof(double*));
@@ -1074,7 +1078,8 @@ double hmm_viterbi(const HMMModel* model, double** observations,
       int j_end_index = hmm_exon_cycle_index(j);
 
       // Try different segment durations d
-      int max_d = (t + 1 < MAX_DURATION) ? (t + 1) : MAX_DURATION;
+      // Use practical limit to improve performance
+      int max_d = (t + 1 < PRACTICAL_MAX_DURATION) ? (t + 1) : PRACTICAL_MAX_DURATION;
 
       for (int d = 1; d <= max_d && d <= t + 1; d++) {
         // Determine entry state for this segment
