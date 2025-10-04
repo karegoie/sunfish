@@ -2,6 +2,7 @@
 #define HMM_H
 
 #include <stdbool.h>
+#include "constants.h"
 
 // HMM states
 typedef enum {
@@ -15,28 +16,13 @@ typedef enum {
   NUM_STATES = 7
 } HMMState;
 
-// Maximum number of wavelet scales (features)
-// Increased to support user-specified ranges up to 100 scales.
-#define MAX_NUM_WAVELETS 100
-
-// Maximum dimensionality of feature vectors (wavelet)
-#define MAX_NUM_FEATURES 8192
-
-// Number of GMM components per state (fixed)
-#define GMM_COMPONENTS 2
-
-// Mixture-of-Gaussians emission (fixed K=2)
+// Mixture-of-Gaussians emission (fixed K=GMM_COMPONENTS)
 typedef struct {
   double weight[GMM_COMPONENTS];
   double mean[GMM_COMPONENTS][MAX_NUM_FEATURES];
   double variance[GMM_COMPONENTS][MAX_NUM_FEATURES];
   int num_features;
 } MixtureEmission;
-
-// PWM structures for splice site scoring
-#define DONOR_MOTIF_SIZE 9
-#define ACCEPTOR_MOTIF_SIZE 15
-#define NUM_NUCLEOTIDES 4
 
 typedef struct {
   double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];

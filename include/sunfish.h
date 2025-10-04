@@ -3,15 +3,10 @@
 
 #include <stdbool.h>
 
+#include "constants.h"
 #include "fasta_parser.h"
 #include "gff_parser.h"
 #include "hmm.h"
-
-// Line and buffer sizes
-enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
-
-// Amino acids
-enum { NUM_AMINO_ACIDS = 20 };
 
 typedef struct {
   char* sequence;

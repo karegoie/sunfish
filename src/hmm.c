@@ -8,6 +8,7 @@
 
 #include "../include/hmm.h"
 #include "../include/thread_pool.h"
+#include "../include/constants.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -58,7 +59,7 @@ static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
 // training. Keep this small but non-zero to avoid numerical issues when
 // computing Gaussian log-PDFs. This value is referenced in multiple places
 // in this translation unit, so changing it ensures consistent behavior.
-static const double kVarianceFloor = 1e-2;
+// Now defined in constants.h
 
 // Small Dirichlet-style priors to prevent EM from driving rare/short states
 // (START/STOP codons) to zero probability. Keep priors small so they act as
@@ -67,11 +68,6 @@ static const double kTransPriorDefault = 1e-3;
 static const double kTransPriorStartStop = 1e-1;
 static const double kInitialPriorDefault = 1e-3;
 static const double kInitialPriorStartStop = 1e-1;
-
-// Use GMM_COMPONENTS from header
-#ifndef GMM_COMPONENTS
-#define GMM_COMPONENTS 2
-#endif
 
 typedef struct {
   HMMModel* model;
@@ -991,7 +987,8 @@ static double lognormal_log_pdf(int duration, double mean_log_duration,
 double hmm_viterbi(const HMMModel* model, double** observations,
                    const char* sequence, int seq_len, int* states) {
   // HSMM Viterbi with segment-based processing
-  const int MAX_DURATION = 10000; // Maximum segment duration to consider
+  // Maximum segment duration to consider (defined in constants.h)
+  // const int MAX_DURATION = 10000; 
 
   // Allocate Viterbi matrices
   // delta[t][j] = max log-probability of path ending at position t in state j

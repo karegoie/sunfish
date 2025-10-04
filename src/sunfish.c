@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../include/constants.h"
 #include "../include/cwt.h"
 #include "../include/fft.h"
 #include "../include/hmm.h"
@@ -27,8 +28,8 @@ static int g_num_threads = 0;
 static int g_total_feature_count = 16; // 8 scales * 2 (real + imaginary)
 
 // Chunk-based prediction configuration
-static int g_chunk_size = 50000;   // Default chunk size: 50kb
-static int g_chunk_overlap = 5000; // Default overlap: 5kb
+static int g_chunk_size = DEFAULT_CHUNK_SIZE;
+static int g_chunk_overlap = DEFAULT_CHUNK_OVERLAP;
 static bool g_use_chunking = true;
 
 static int get_env_thread_override(void);
@@ -3724,9 +3725,6 @@ static void handle_train(int argc, char* argv[]) {
   } else {
     fprintf(stderr, "Warning: Failed to train splice PWM model\n");
   }
-
-  const int kBaumWelchMaxIterations = 5; // FIXME
-  const double kBaumWelchThreshold = 10.0;
 
   fprintf(
       stderr,
