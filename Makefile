@@ -18,6 +18,7 @@ UTILS_SRC = $(SRCDIR)/utils.c
 FASTA_PARSER_SRC = $(SRCDIR)/fasta_parser.c
 GFF_PARSER_SRC = $(SRCDIR)/gff_parser.c
 SUNFISH_HMM_SRC = $(SRCDIR)/sunfish.c
+MAIN_SRC = $(SRCDIR)/main.c
 
 # Object files
 FFT_OBJ = $(OBJDIR)/fft.o
@@ -28,12 +29,13 @@ UTILS_OBJ = $(OBJDIR)/utils.o
 FASTA_PARSER_OBJ = $(OBJDIR)/fasta_parser.o
 GFF_PARSER_OBJ = $(OBJDIR)/gff_parser.o
 SUNFISH_HMM_OBJ = $(OBJDIR)/sunfish.o
+MAIN_OBJ = $(OBJDIR)/main.o
 
 # Build a single default executable named `sunfish` which is the HMM-based
 # binary (previously called sunfish_hmm). This simplifies the project so the
 # legacy logistic-regression-based `sunfish` is no longer built.
 SUNFISH_EXE = $(BINDIR)/sunfish
-SUNFISH_OBJS = $(FFT_OBJ) $(CWT_OBJ) $(HMM_OBJ) $(THREAD_POOL_OBJ) $(UTILS_OBJ) $(FASTA_PARSER_OBJ) $(GFF_PARSER_OBJ) $(SUNFISH_HMM_OBJ)
+SUNFISH_OBJS = $(FFT_OBJ) $(CWT_OBJ) $(HMM_OBJ) $(THREAD_POOL_OBJ) $(UTILS_OBJ) $(FASTA_PARSER_OBJ) $(GFF_PARSER_OBJ) $(SUNFISH_HMM_OBJ) $(MAIN_OBJ)
 
 
 all: directories $(SUNFISH_EXE)
@@ -85,7 +87,10 @@ $(OBJDIR)/fasta_parser.o: $(SRCDIR)/fasta_parser.c $(INCDIR)/fasta_parser.h $(IN
 $(OBJDIR)/gff_parser.o: $(SRCDIR)/gff_parser.c $(INCDIR)/gff_parser.h $(INCDIR)/sunfish.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OBJDIR)/sunfish.o: $(SRCDIR)/sunfish.c $(INCDIR)/sunfish.h $(INCDIR)/fft.h $(INCDIR)/cwt.h $(INCDIR)/hmm.h $(INCDIR)/thread_pool.h $(INCDIR)/fasta_parser.h $(INCDIR)/gff_parser.h
+$(OBJDIR)/sunfish.o: $(SRCDIR)/sunfish.c $(INCDIR)/sunfish.h $(INCDIR)/fft.h $(INCDIR)/cwt.h $(INCDIR)/hmm.h $(INCDIR)/thread_pool.h $(INCDIR)/fasta_parser.h $(INCDIR)/gff_parser.h $(INCDIR)/common_internal.h $(INCDIR)/constants.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/main.o: $(SRCDIR)/main.c $(INCDIR)/common_internal.h $(INCDIR)/train.h $(INCDIR)/predict.h $(INCDIR)/constants.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 
