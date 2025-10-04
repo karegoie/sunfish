@@ -27,7 +27,7 @@
 #define NUM_AMINO_ACIDS 20
 
 // HMM Training Constants
-#define kBaumWelchMaxIterations 5
+#define kBaumWelchMaxIterations 15
 #define kBaumWelchThreshold 10.0
 
 // Variance floor for numerical stability in GMM
