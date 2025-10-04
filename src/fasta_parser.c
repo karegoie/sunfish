@@ -33,6 +33,11 @@ FastaData* parse_fasta(const char* path) {
   }
   int cap = 16;
   data->records = (FastaRecord*)malloc(cap * sizeof(FastaRecord));
+  if (!data->records) {
+    fclose(fp);
+    free(data);
+    return NULL;
+  }
   data->count = 0;
   char line[MAX_LINE_LEN];
   char* cur = NULL;
@@ -48,9 +53,17 @@ FastaData* parse_fasta(const char* path) {
         cur = NULL;
       }
       if (data->count >= cap) {
-        cap *= 2;
-        data->records =
-            (FastaRecord*)realloc(data->records, cap * sizeof(FastaRecord));
+        int new_cap = cap * 2;
+        FastaRecord* new_records =
+            (FastaRecord*)realloc(data->records, new_cap * sizeof(FastaRecord));
+        if (!new_records) {
+          free(cur);
+          fclose(fp);
+          free_fasta_data(data);
+          return NULL;
+        }
+        data->records = new_records;
+        cap = new_cap;
       }
       const char* header = line + 1;
       size_t id_len = 0;
@@ -69,8 +82,16 @@ FastaData* parse_fasta(const char* path) {
     } else if (cur) {
       size_t ll = strlen(line);
       while (cur_len + ll + 1 > cur_cap) {
-        cur_cap *= 2;
-        cur = (char*)realloc(cur, cur_cap);
+        size_t new_cap = cur_cap * 2;
+        char* new_buf = (char*)realloc(cur, new_cap);
+        if (!new_buf) {
+          free(cur);
+          fclose(fp);
+          free_fasta_data(data);
+          return NULL;
+        }
+        cur = new_buf;
+        cur_cap = new_cap;
       }
       memcpy(cur + cur_len, line, ll + 1);
       cur_len += ll;

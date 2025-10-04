@@ -11,8 +11,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../include/constants.h"
 #include "../include/common_internal.h"
+#include "../include/constants.h"
 #include "../include/cwt.h"
 #include "../include/fft.h"
 #include "../include/hmm.h"
@@ -22,8 +22,8 @@
 // Global configuration
 // Default wavelet scales: powers of 3 from 3
 int g_num_wavelet_scales = 8;
-double g_wavelet_scales[MAX_NUM_WAVELETS] = {
-    3.0, 9.0, 27.0, 81.0, 243.0, 729.0, 2187.0, 6561.0};
+double g_wavelet_scales[MAX_NUM_WAVELETS] = {3.0,   9.0,   27.0,   81.0,
+                                             243.0, 729.0, 2187.0, 6561.0};
 // Default: 0 means "not set"; we'll use number of online processors at runtime
 int g_num_threads = 0;
 int g_total_feature_count = 16; // 8 scales * 2 (real + imaginary)
@@ -338,7 +338,7 @@ void predicted_gene_store_destroy(predicted_gene_store_t* store) {
 }
 
 bool predicted_gene_store_reserve(predicted_gene_store_t* store,
-                                         size_t desired) {
+                                  size_t desired) {
   if (!store)
     return false;
 
@@ -366,10 +366,10 @@ bool predicted_gene_store_reserve(predicted_gene_store_t* store,
    emitting, so these helpers are unnecessary and caused unused-function
    compiler warnings. */
 
-bool predicted_gene_store_add(predicted_gene_store_t* store,
-                                     const char* seq_id, char strand,
-                                     int gene_start, int gene_end, double score,
-                                     OutputExon* exons, size_t exon_count) {
+bool predicted_gene_store_add(predicted_gene_store_t* store, const char* seq_id,
+                              char strand, int gene_start, int gene_end,
+                              double score, OutputExon* exons,
+                              size_t exon_count) {
   if (!store || !seq_id || !exons || exon_count == 0)
     return false;
 
@@ -706,8 +706,7 @@ void predicted_gene_store_emit_to_queue(predicted_gene_store_t* store) {
 }
 
 // Parse command-line wavelet scales argument
-int parse_wavelet_scales(const char* arg, double* scales,
-                                int max_scales) {
+int parse_wavelet_scales(const char* arg, double* scales, int max_scales) {
   int count = 0;
   char* arg_copy = strdup(arg);
   char* token = strtok(arg_copy, ",");
@@ -723,8 +722,7 @@ int parse_wavelet_scales(const char* arg, double* scales,
 
 // Parse range in the form start:end:step and populate scales (up to max_scales)
 // Returns number of scales parsed, or -1 on error.
-int parse_wavelet_range(const char* arg, double* scales,
-                               int max_scales) {
+int parse_wavelet_range(const char* arg, double* scales, int max_scales) {
   if (!arg || !scales || max_scales <= 0)
     return -1;
 
@@ -795,7 +793,8 @@ void free_observation_sequence(double** observations, int seq_len) {
 }
 
 bool build_observation_matrix(const char* sequence, int seq_len,
-                                     double*** out_observations, int* out_num_features) {
+                              double*** out_observations,
+                              int* out_num_features) {
   if (seq_len <= 0)
     return false;
 
@@ -1065,8 +1064,8 @@ int calculate_num_chunks(int seq_len, int chunk_size, int overlap) {
 }
 
 // Helper function to get chunk boundaries
-void get_chunk_bounds(int seq_len, int chunk_size, int overlap,
-                             int chunk_idx, int* start, int* end) {
+void get_chunk_bounds(int seq_len, int chunk_size, int overlap, int chunk_idx,
+                      int* start, int* end) {
   if (!g_use_chunking || seq_len <= chunk_size) {
     *start = 0;
     *end = seq_len;
@@ -1234,9 +1233,6 @@ static void output_predicted_gene(const prediction_task_t* task,
 
 // Validate ORF: check start codon, stop codon, in-frame stops, and length
 static bool is_valid_orf(const char* cds_sequence) {
-  // FOR DEBUGGING PURPOSE ONLY; FIXME
-  return true;
-
   if (!cds_sequence) {
     return false;
   }
@@ -2146,9 +2142,9 @@ static void accumulate_statistics_for_segment(
 
 // Helper structure for collecting duration statistics
 typedef struct {
-  double* durations;  // Array of duration values (not log)
-  int count;          // Number of observations
-  int capacity;       // Allocated capacity
+  double* durations; // Array of duration values (not log)
+  int count;         // Number of observations
+  int capacity;      // Allocated capacity
 } DurationStats;
 
 static void
@@ -2185,8 +2181,8 @@ accumulate_duration_statistics(int seq_len, const int* state_labels,
           if (new_capacity < 16)
             new_capacity = 16;
 
-          double* new_array = (double*)realloc(stats->durations,
-                                               new_capacity * sizeof(double));
+          double* new_array =
+              (double*)realloc(stats->durations, new_capacity * sizeof(double));
 
           if (new_array) {
             stats->durations = new_array;
@@ -3574,7 +3570,7 @@ void handle_train(int argc, char* argv[]) {
         variance = 1e-6;
       if (mean < 1e-6)
         mean = 1e-6;
-      
+
       // Method of moments: shape = mean²/variance, scale = variance/mean
       exon_shape = (mean * mean) / variance;
       exon_scale = variance / mean;
@@ -3641,7 +3637,7 @@ void handle_train(int argc, char* argv[]) {
         if (variance < 1e-6)
           variance = 1e-6;
       }
-      
+
       if (mean < 1e-6)
         mean = 1e-6;
 
@@ -3653,10 +3649,10 @@ void handle_train(int argc, char* argv[]) {
       model.duration[i].scale = scale;
 
       double stddev = sqrt(variance);
-      fprintf(
-          stderr,
-          "State %d: %d duration segments, shape=%.4f, scale=%.4f (mean=%.4f, stddev=%.4f)\n", i,
-          duration_stats[i].count, shape, scale, mean, stddev);
+      fprintf(stderr,
+              "State %d: %d duration segments, shape=%.4f, scale=%.4f "
+              "(mean=%.4f, stddev=%.4f)\n",
+              i, duration_stats[i].count, shape, scale, mean, stddev);
     } else {
       // No segments observed for non-exon state, use defaults
       model.duration[i].shape = 1.0;

@@ -1064,13 +1064,18 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   }
 
   for (int t = 0; t < seq_len; t++) {
-    for (int j = 0; j < NUM_STATES; j++) {
+    for (int state = 0; state < NUM_STATES; state++) {
       double emission_log =
-          mixture_log_pdf(&model->emission[j], observations[t]);
+          mixture_log_pdf(&model->emission[state], observations[t]);
+
       if (t == 0) {
-        emission_log_sum[t][j] = emission_log;
+        emission_log_sum[t][state] = emission_log;
+      } else if (!isfinite(emission_log_sum[t - 1][state]) ||
+                 !isfinite(emission_log)) {
+        emission_log_sum[t][state] = -INFINITY;
       } else {
-        emission_log_sum[t][j] = emission_log_sum[t - 1][j] + emission_log;
+        emission_log_sum[t][state] =
+            emission_log_sum[t - 1][state] + emission_log;
       }
     }
   }
@@ -1132,30 +1137,48 @@ double hmm_viterbi(const HMMModel* model, double** observations,
         int start_pos = t - d + 1;
         if (j_is_exon) {
           double exon_emission_sum = 0.0;
-          for (int frame = 0; frame < 3; ++frame) {
-            HMMState frame_state = kExonCycleStates[frame];
-            double frame_sum = emission_log_sum[t][frame_state];
-            if (start_pos > 0) {
-              frame_sum -= emission_log_sum[start_pos - 1][frame_state];
-            }
-            exon_emission_sum += frame_sum;
-          }
-          segment_log_prob = exon_emission_sum / 3.0;
+          int frame_index = hmm_exon_entry_index(j_end_index, d);
+          bool invalid_emission = false;
 
-          if (d > 1 && exon_internal_transition_log_sum != NULL) {
-            segment_log_prob += exon_internal_transition_log_sum[t] -
-                                exon_internal_transition_log_sum[start_pos];
+          for (int pos = start_pos; pos <= t; ++pos) {
+            HMMState frame_state = kExonCycleStates[frame_index];
+            double emission_log = mixture_log_pdf(&model->emission[frame_state],
+                                                  observations[pos]);
+            if (!isfinite(emission_log)) {
+              invalid_emission = true;
+              break;
+            }
+            exon_emission_sum += emission_log;
+            frame_index = hmm_exon_next_index(frame_index);
+          }
+
+          if (invalid_emission) {
+            segment_log_prob = -INFINITY;
+          } else {
+            segment_log_prob = exon_emission_sum;
+            if (d > 1 && exon_internal_transition_log_sum != NULL) {
+              segment_log_prob += exon_internal_transition_log_sum[t] -
+                                  exon_internal_transition_log_sum[start_pos];
+            }
           }
         } else {
           double segment_emission;
-          if (start_pos == 0) {
+          if (!isfinite(emission_log_sum[t][j])) {
+            segment_emission = -INFINITY;
+          } else if (start_pos == 0) {
             segment_emission = emission_log_sum[t][j];
+          } else if (!isfinite(emission_log_sum[start_pos - 1][j])) {
+            segment_emission = -INFINITY;
           } else {
             segment_emission =
                 emission_log_sum[t][j] - emission_log_sum[start_pos - 1][j];
           }
+
           segment_log_prob += segment_emission;
         }
+
+        if (!isfinite(segment_log_prob))
+          continue;
 
         // Compute duration probability
         double duration_prob =

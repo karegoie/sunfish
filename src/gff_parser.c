@@ -40,6 +40,11 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
   } CdsTemp;
   int temp_cap = 128, temp_cnt = 0;
   CdsTemp* tmp = (CdsTemp*)malloc(temp_cap * sizeof(CdsTemp));
+  if (!tmp) {
+    fclose(fp);
+    *group_count = 0;
+    return NULL;
+  }
   char line[MAX_LINE_LEN];
   while (fgets(line, sizeof(line), fp)) {
     if (line[0] == '#' || line[0] == '\n')
@@ -65,7 +70,18 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
     parent[plen] = '\0';
     if (temp_cnt >= temp_cap) {
       temp_cap *= 2;
-      tmp = (CdsTemp*)realloc(tmp, temp_cap * sizeof(CdsTemp));
+      CdsTemp* new_tmp = (CdsTemp*)realloc(tmp, temp_cap * sizeof(CdsTemp));
+      if (!new_tmp) {
+        fclose(fp);
+        for (int j = 0; j < temp_cnt; j++) {
+          free(tmp[j].parent);
+          free(tmp[j].seqid);
+        }
+        free(tmp);
+        *group_count = 0;
+        return NULL;
+      }
+      tmp = new_tmp;
     }
     tmp[temp_cnt].parent = strdup(parent);
     tmp[temp_cnt].seqid = strdup(seqid);
@@ -78,6 +94,15 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
   fclose(fp);
   int grp_cap = 64, grp_cnt = 0;
   CdsGroup* groups = (CdsGroup*)malloc(grp_cap * sizeof(CdsGroup));
+  if (!groups) {
+    for (int i = 0; i < temp_cnt; i++) {
+      free(tmp[i].parent);
+      free(tmp[i].seqid);
+    }
+    free(tmp);
+    *group_count = 0;
+    return NULL;
+  }
   for (int i = 0; i < temp_cnt; i++) {
     int gi = -1;
     for (int j = 0; j < grp_cnt; j++) {
@@ -89,7 +114,28 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
     if (gi == -1) {
       if (grp_cnt >= grp_cap) {
         grp_cap *= 2;
-        groups = (CdsGroup*)realloc(groups, grp_cap * sizeof(CdsGroup));
+        CdsGroup* new_groups =
+            (CdsGroup*)realloc(groups, grp_cap * sizeof(CdsGroup));
+        if (!new_groups) {
+          for (int j = 0; j < temp_cnt; j++) {
+            free(tmp[j].parent);
+            free(tmp[j].seqid);
+          }
+          for (int j = 0; j < grp_cnt; j++) {
+            free(groups[j].parent_id);
+            if (groups[j].exons) {
+              for (int k = 0; k < groups[j].exon_count; k++) {
+                free(groups[j].exons[k].seqid);
+              }
+              free(groups[j].exons);
+            }
+          }
+          free(groups);
+          free(tmp);
+          *group_count = 0;
+          return NULL;
+        }
+        groups = new_groups;
       }
       gi = grp_cnt++;
       groups[gi].parent_id = strdup(tmp[i].parent);
@@ -97,8 +143,29 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
       groups[gi].exon_count = 0;
     }
     int ei = groups[gi].exon_count++;
-    groups[gi].exons =
+    Exon* new_exons =
         (Exon*)realloc(groups[gi].exons, groups[gi].exon_count * sizeof(Exon));
+    if (!new_exons) {
+      groups[gi].exon_count--;
+      for (int j = 0; j < temp_cnt; j++) {
+        free(tmp[j].parent);
+        free(tmp[j].seqid);
+      }
+      for (int j = 0; j < grp_cnt; j++) {
+        free(groups[j].parent_id);
+        if (groups[j].exons) {
+          for (int k = 0; k < groups[j].exon_count; k++) {
+            free(groups[j].exons[k].seqid);
+          }
+          free(groups[j].exons);
+        }
+      }
+      free(groups);
+      free(tmp);
+      *group_count = 0;
+      return NULL;
+    }
+    groups[gi].exons = new_exons;
     groups[gi].exons[ei].seqid = strdup(tmp[i].seqid);
     groups[gi].exons[ei].start = tmp[i].start;
     groups[gi].exons[ei].end = tmp[i].end;
