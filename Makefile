@@ -7,7 +7,7 @@ BINDIR = bin
 CC = gcc
 # Add -pthread to CFLAGS for proper threading support and ensure it's used
 # during compilation. Some linkers also require -pthread at link time.
-CFLAGS = -Wall -Wextra -std=c17 -DNDEBUG -O3 -I$(INCDIR) -pthread
+CFLAGS = -Wall -Wextra -std=c2x -DNDEBUG -O3 -I$(INCDIR) -pthread
 LDFLAGS =
 # Keep -lpthread in LIBS for linkers that accept it, but when doing a static
 # link we also pass -pthread on the linker line to ensure proper static
@@ -60,6 +60,27 @@ SUNFISH_STATIC_EXE = $(BINDIR)/sunfish.static
 .PHONY: static
 static: directories $(SUNFISH_STATIC_EXE)
 	@rm -rf $(OBJDIR)
+
+# Debug build target: builds a debug binary with AddressSanitizer and debug
+# symbols to help diagnose crashes.
+SUNFISH_DEBUG_EXE = $(BINDIR)/sunfish.debug
+.PHONY: debug
+debug: directories $(SUNFISH_DEBUG_EXE)
+
+$(SUNFISH_DEBUG_EXE): $(SUNFISH_OBJS)
+	# Recompile object files with debug and ASAN flags
+	@echo "Building debug objects with ASAN..."
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/fft.c -o $(OBJDIR)/fft.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/cwt.c -o $(OBJDIR)/cwt.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/hmm.c -o $(OBJDIR)/hmm.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/thread_pool.c -o $(OBJDIR)/thread_pool.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/utils.c -o $(OBJDIR)/utils.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/fasta_parser.c -o $(OBJDIR)/fasta_parser.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/gff_parser.c -o $(OBJDIR)/gff_parser.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/sunfish.c -o $(OBJDIR)/sunfish.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/main.c -o $(OBJDIR)/main.o
+	# Link with ASAN runtime
+	$(CC) -g -O0 -fsanitize=address $(OBJDIR)/*.o -pthread -lm -o $@
 
 $(SUNFISH_STATIC_EXE): $(SUNFISH_OBJS)
 	# When performing a static link include -pthread on the link line; some

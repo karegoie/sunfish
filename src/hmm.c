@@ -6,9 +6,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../include/constants.h"
 #include "../include/hmm.h"
 #include "../include/thread_pool.h"
-#include "../include/constants.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -350,10 +350,11 @@ void hmm_init(HMMModel* model, int num_features) {
     model->wavelet_scales[i] = 0.0;
 }
 
+#define LOG_2PI 1.8378770664093453 // log(2.0 * M_PI)
+
 double diag_gaussian_logpdf(const double* observation, const double* mean,
                             const double* variance, int num_features) {
   // Precompute constant factor for efficiency
-  static const double LOG_2PI = log(2.0 * M_PI);
   double log_prob = 0.0;
 
   for (int i = 0; i < num_features; i++) {
@@ -731,13 +732,39 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
     return false;
   }
 
-  double initial_acc[NUM_STATES];
-  double transition_acc[NUM_STATES][NUM_STATES];
-  double emission_mean_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
-  double emission_var_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
-  double component_weight_acc[NUM_STATES][GMM_COMPONENTS];
-  double state_count[NUM_STATES];
+  double* initial_acc = NULL;
+  double (*transition_acc)[NUM_STATES] = NULL;
+  double (*emission_mean_acc)[GMM_COMPONENTS][MAX_NUM_FEATURES] = NULL;
+  double (*emission_var_acc)[GMM_COMPONENTS][MAX_NUM_FEATURES] = NULL;
+  double (*component_weight_acc)[GMM_COMPONENTS] = NULL;
+  double* state_count = NULL;
   double total_log_likelihood = 0.0;
+
+  bool success = true;
+  bool initial_mutex_created = false;
+  bool log_mutex_created = false;
+  bool error_mutex_created = false;
+  int transition_init_count = 0;
+  int emission_init_count = 0;
+
+  /* Allocate large accumulators on the heap to avoid exhausting the
+   thread stack (stack-overflow observed with large MAX_NUM_FEATURES). */
+  initial_acc = (double*)calloc(NUM_STATES, sizeof(double));
+  transition_acc =
+      (double (*)[NUM_STATES])calloc(NUM_STATES, sizeof(*transition_acc));
+  emission_mean_acc = (double (*)[GMM_COMPONENTS][MAX_NUM_FEATURES])calloc(
+      NUM_STATES, sizeof(*emission_mean_acc));
+  emission_var_acc = (double (*)[GMM_COMPONENTS][MAX_NUM_FEATURES])calloc(
+      NUM_STATES, sizeof(*emission_var_acc));
+  component_weight_acc = (double (*)[GMM_COMPONENTS])calloc(
+      NUM_STATES, sizeof(*component_weight_acc));
+  state_count = (double*)calloc(NUM_STATES, sizeof(double));
+
+  if (!initial_acc || !transition_acc || !emission_mean_acc ||
+      !emission_var_acc || !component_weight_acc || !state_count) {
+    success = false;
+    goto cleanup;
+  }
 
   EStepSharedData shared = {.model = model,
                             .observations = observations,
@@ -750,13 +777,6 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
                             .state_count = state_count,
                             .total_log_likelihood = &total_log_likelihood,
                             .error_flag = 0};
-
-  bool success = true;
-  bool initial_mutex_created = false;
-  bool log_mutex_created = false;
-  bool error_mutex_created = false;
-  int transition_init_count = 0;
-  int emission_init_count = 0;
 
   if (pthread_mutex_init(&shared.initial_mutex, NULL) != 0) {
     success = false;
@@ -948,10 +968,10 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
   }
 
 cleanup:
-  for (int i = transition_init_count - 1; i >= 0; --i) {
+  for (int i = 0; i < transition_init_count; ++i) {
     pthread_mutex_destroy(&shared.transition_mutexes[i]);
   }
-  for (int i = emission_init_count - 1; i >= 0; --i) {
+  for (int i = 0; i < emission_init_count; ++i) {
     pthread_mutex_destroy(&shared.emission_mutexes[i]);
   }
   if (error_mutex_created) {
@@ -965,6 +985,20 @@ cleanup:
   }
 
   thread_pool_destroy(pool);
+
+  /* Free heap-allocated accumulators */
+  if (initial_acc)
+    free(initial_acc);
+  if (transition_acc)
+    free(transition_acc);
+  if (emission_mean_acc)
+    free(emission_mean_acc);
+  if (emission_var_acc)
+    free(emission_var_acc);
+  if (component_weight_acc)
+    free(component_weight_acc);
+  if (state_count)
+    free(state_count);
 
   return success;
 }
@@ -992,10 +1026,11 @@ static double gamma_log_pdf(int duration, double shape, double scale) {
   }
 
   double x = (double)duration;
-  
+
   // Log-PDF of Gamma distribution:
   // (k-1)*log(x) - x/θ - k*log(θ) - lgamma(k)
-  return (shape - 1.0) * log(x) - x / scale - shape * log(scale) - lgamma(shape);
+  return (shape - 1.0) * log(x) - x / scale - shape * log(scale) -
+         lgamma(shape);
 }
 
 double hmm_viterbi(const HMMModel* model, double** observations,
@@ -1004,7 +1039,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   // Maximum segment duration to consider (defined in constants.h)
   // Use a more reasonable maximum to improve performance
   const int PRACTICAL_MAX_DURATION = 5000;
-  
+
   // Allocate Viterbi matrices
   // delta[t][j] = max log-probability of path ending at position t in state j
   double** delta = (double**)malloc(seq_len * sizeof(double*));
@@ -1058,10 +1093,10 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   // Initialization (t=0): start with segments of length 1
   for (int j = 0; j < NUM_STATES; j++) {
     const StateDuration* duration_params = hmm_get_duration_params(model, j);
-    delta[0][j] = hmm_safe_log(model->initial[j]) +
-                  mixture_log_pdf(&model->emission[j], observations[0]) +
-                  gamma_log_pdf(1, duration_params->shape,
-                                duration_params->scale);
+    delta[0][j] =
+        hmm_safe_log(model->initial[j]) +
+        mixture_log_pdf(&model->emission[j], observations[0]) +
+        gamma_log_pdf(1, duration_params->shape, duration_params->scale);
     psi[0][j] = -1; // No previous state
     duration[0][j] = 1;
   }
@@ -1079,7 +1114,8 @@ double hmm_viterbi(const HMMModel* model, double** observations,
 
       // Try different segment durations d
       // Use practical limit to improve performance
-      int max_d = (t + 1 < PRACTICAL_MAX_DURATION) ? (t + 1) : PRACTICAL_MAX_DURATION;
+      int max_d =
+          (t + 1 < PRACTICAL_MAX_DURATION) ? (t + 1) : PRACTICAL_MAX_DURATION;
 
       for (int d = 1; d <= max_d && d <= t + 1; d++) {
         // Determine entry state for this segment
@@ -1123,8 +1159,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
 
         // Compute duration probability
         double duration_prob =
-            gamma_log_pdf(d, duration_params->shape,
-                          duration_params->scale);
+            gamma_log_pdf(d, duration_params->shape, duration_params->scale);
 
         // Consider transitions from all previous states
         if (d == t + 1) {
@@ -1305,8 +1340,15 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   }
 
   // Ensure exon frames share the same duration parameters when persisting.
-  HMMModel tmp_model = *model;
-  hmm_sync_exon_duration(&tmp_model);
+  // The HMMModel struct is large (contains big emission arrays). Copying it
+  // onto the stack can overflow the stack. Allocate a heap copy instead.
+  HMMModel* tmp_model = (HMMModel*)malloc(sizeof(HMMModel));
+  if (!tmp_model) {
+    fclose(fp);
+    return false;
+  }
+  *tmp_model = *model;
+  hmm_sync_exon_duration(tmp_model);
 
   fprintf(fp, "#HMM_MODEL_V1\n");
   fprintf(fp, "#num_features %d\n", model->num_features);
@@ -1365,7 +1407,7 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   fprintf(fp, "DURATION\n");
   for (int i = 0; i < NUM_STATES; i++) {
     const StateDuration* duration_params =
-        hmm_get_duration_params(&tmp_model, i);
+        hmm_get_duration_params(tmp_model, i);
     fprintf(fp, "%.10f %.10f\n", duration_params->shape,
             duration_params->scale);
   }
@@ -1441,6 +1483,7 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     fprintf(fp, "\n");
   }
 
+  free(tmp_model);
   fclose(fp);
   return true;
 }
