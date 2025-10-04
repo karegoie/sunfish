@@ -2,6 +2,7 @@
 #define HMM_H
 
 #include <stdbool.h>
+#include "constants.h"
 
 // HMM states
 typedef enum {
@@ -15,28 +16,13 @@ typedef enum {
   NUM_STATES = 7
 } HMMState;
 
-// Maximum number of wavelet scales (features)
-// Increased to support user-specified ranges up to 100 scales.
-#define MAX_NUM_WAVELETS 100
-
-// Maximum dimensionality of feature vectors (wavelet)
-#define MAX_NUM_FEATURES 8192
-
-// Number of GMM components per state (fixed)
-#define GMM_COMPONENTS 2
-
-// Mixture-of-Gaussians emission (fixed K=2)
+// Mixture-of-Gaussians emission (fixed K=GMM_COMPONENTS)
 typedef struct {
   double weight[GMM_COMPONENTS];
   double mean[GMM_COMPONENTS][MAX_NUM_FEATURES];
   double variance[GMM_COMPONENTS][MAX_NUM_FEATURES];
   int num_features;
 } MixtureEmission;
-
-// PWM structures for splice site scoring
-#define DONOR_MOTIF_SIZE 9
-#define ACCEPTOR_MOTIF_SIZE 15
-#define NUM_NUCLEOTIDES 4
 
 typedef struct {
   double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
@@ -48,10 +34,10 @@ typedef struct {
   double pwm_weight;
 } PWMModel;
 
-// Duration distribution parameters for HSMM
+// Duration distribution parameters for HSMM (Gamma distribution)
 typedef struct {
-  double mean_log_duration;   // mean of log(duration)
-  double stddev_log_duration; // standard deviation of log(duration)
+  double shape;  // k parameter (shape) of Gamma distribution
+  double scale;  // θ parameter (scale) of Gamma distribution
 } StateDuration;
 
 // HMM model structure
@@ -77,7 +63,7 @@ typedef struct {
   // PWM model for splice site scoring
   PWMModel pwm;
 
-  // Duration distribution parameters for HSMM (log-normal distribution)
+  // Duration distribution parameters for HSMM (Gamma distribution)
   StateDuration duration[NUM_STATES];
 
   // Chunking configuration stored with the model so prediction can reuse
