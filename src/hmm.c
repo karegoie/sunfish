@@ -1190,7 +1190,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
              * very large bonus (large positive log-probability). On mismatch,
              * set the transition probability to zero (log = -INFINITY).
              */
-            const double kHugeBonus = 1e1; // very large log-probability bonus
+            const double kHugeBonus = 1e2; // very large log-probability bonus
             int codon_pos = start_pos;     // transition occurs at segment start
 
             if (segment_entry_state == STATE_START_CODON) {

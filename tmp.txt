@@ -143,9 +143,15 @@ bool compute_cwt_features(const char* sequence, int seq_len,
     // Store real and imaginary parts only
     // features[s * 2] = real part
     // features[s * 2 + 1] = imaginary part
+    // Use indices directly to improve cache locality
+    int real_idx = s * 2;
+    int imag_idx = s * 2 + 1;
+    double* real_features = features[real_idx];
+    double* imag_features = features[imag_idx];
+    
     for (int i = 0; i < seq_len; i++) {
-      features[s * 2][i] = creal(cwt_result[i]);
-      features[s * 2 + 1][i] = cimag(cwt_result[i]);
+      real_features[i] = creal(cwt_result[i]);
+      imag_features[i] = cimag(cwt_result[i]);
     }
 
     free(cwt_result);
@@ -467,6 +473,7 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count) {
 #include <string.h>
 #include <unistd.h>
 
+#include "../include/constants.h"
 #include "../include/hmm.h"
 #include "../include/thread_pool.h"
 
@@ -519,7 +526,7 @@ static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
 // training. Keep this small but non-zero to avoid numerical issues when
 // computing Gaussian log-PDFs. This value is referenced in multiple places
 // in this translation unit, so changing it ensures consistent behavior.
-static const double kVarianceFloor = 1e-2;
+// Now defined in constants.h
 
 // Small Dirichlet-style priors to prevent EM from driving rare/short states
 // (START/STOP codons) to zero probability. Keep priors small so they act as
@@ -528,11 +535,6 @@ static const double kTransPriorDefault = 1e-3;
 static const double kTransPriorStartStop = 1e-1;
 static const double kInitialPriorDefault = 1e-3;
 static const double kInitialPriorStartStop = 1e-1;
-
-// Use GMM_COMPONENTS from header
-#ifndef GMM_COMPONENTS
-#define GMM_COMPONENTS 2
-#endif
 
 typedef struct {
   HMMModel* model;
@@ -791,20 +793,23 @@ void hmm_init(HMMModel* model, int num_features) {
   model->chunk_overlap = 0;
   model->use_chunking = 0;
 
-  // Initialize duration parameters with defaults
+  // Initialize duration parameters with defaults (Gamma distribution)
+  // Using method of moments: mean = k*θ, variance = k*θ²
+  // For mean=100, variance=10000 (stddev=100): k=1, θ=100
   for (int i = 0; i < NUM_STATES; i++) {
-    model->duration[i].mean_log_duration = 0.0;   // log(1) = 0
-    model->duration[i].stddev_log_duration = 1.0; // default stddev
+    model->duration[i].shape = 1.0;   // shape parameter k
+    model->duration[i].scale = 100.0; // scale parameter θ
   }
 
   hmm_sync_exon_duration(model);
 
   // Initialize start and stop codon durations (3 bp = 1 codon)
-  // log(3) ≈ 1.099
-  model->duration[STATE_START_CODON].mean_log_duration = 1.099;
-  model->duration[STATE_START_CODON].stddev_log_duration = 0.1;
-  model->duration[STATE_STOP_CODON].mean_log_duration = 1.099;
-  model->duration[STATE_STOP_CODON].stddev_log_duration = 0.1;
+  // For fixed duration of 3: high shape, low scale
+  // Mean = k*θ = 3, using k=9, θ=1/3 gives mean=3, stddev=1
+  model->duration[STATE_START_CODON].shape = 9.0;
+  model->duration[STATE_START_CODON].scale = 1.0 / 3.0;
+  model->duration[STATE_STOP_CODON].shape = 9.0;
+  model->duration[STATE_STOP_CODON].scale = 1.0 / 3.0;
 
   // Initialize wavelet scales metadata
   model->num_wavelet_scales = 0;
@@ -812,8 +817,11 @@ void hmm_init(HMMModel* model, int num_features) {
     model->wavelet_scales[i] = 0.0;
 }
 
+#define LOG_2PI 1.8378770664093453 // log(2.0 * M_PI)
+
 double diag_gaussian_logpdf(const double* observation, const double* mean,
                             const double* variance, int num_features) {
+  // Precompute constant factor for efficiency
   double log_prob = 0.0;
 
   for (int i = 0; i < num_features; i++) {
@@ -824,7 +832,8 @@ double diag_gaussian_logpdf(const double* observation, const double* mean,
       var = kVarianceFloor;
     }
 
-    log_prob += -0.5 * log(2.0 * M_PI * var) - 0.5 * (diff * diff) / var;
+    // Optimized: use precomputed LOG_2PI
+    log_prob += -0.5 * (LOG_2PI + log(var) + (diff * diff) / var);
   }
 
   return log_prob;
@@ -1190,13 +1199,39 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
     return false;
   }
 
-  double initial_acc[NUM_STATES];
-  double transition_acc[NUM_STATES][NUM_STATES];
-  double emission_mean_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
-  double emission_var_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
-  double component_weight_acc[NUM_STATES][GMM_COMPONENTS];
-  double state_count[NUM_STATES];
+  double* initial_acc = NULL;
+  double (*transition_acc)[NUM_STATES] = NULL;
+  double (*emission_mean_acc)[GMM_COMPONENTS][MAX_NUM_FEATURES] = NULL;
+  double (*emission_var_acc)[GMM_COMPONENTS][MAX_NUM_FEATURES] = NULL;
+  double (*component_weight_acc)[GMM_COMPONENTS] = NULL;
+  double* state_count = NULL;
   double total_log_likelihood = 0.0;
+
+  bool success = true;
+  bool initial_mutex_created = false;
+  bool log_mutex_created = false;
+  bool error_mutex_created = false;
+  int transition_init_count = 0;
+  int emission_init_count = 0;
+
+  /* Allocate large accumulators on the heap to avoid exhausting the
+   thread stack (stack-overflow observed with large MAX_NUM_FEATURES). */
+  initial_acc = (double*)calloc(NUM_STATES, sizeof(double));
+  transition_acc =
+      (double (*)[NUM_STATES])calloc(NUM_STATES, sizeof(*transition_acc));
+  emission_mean_acc = (double (*)[GMM_COMPONENTS][MAX_NUM_FEATURES])calloc(
+      NUM_STATES, sizeof(*emission_mean_acc));
+  emission_var_acc = (double (*)[GMM_COMPONENTS][MAX_NUM_FEATURES])calloc(
+      NUM_STATES, sizeof(*emission_var_acc));
+  component_weight_acc = (double (*)[GMM_COMPONENTS])calloc(
+      NUM_STATES, sizeof(*component_weight_acc));
+  state_count = (double*)calloc(NUM_STATES, sizeof(double));
+
+  if (!initial_acc || !transition_acc || !emission_mean_acc ||
+      !emission_var_acc || !component_weight_acc || !state_count) {
+    success = false;
+    goto cleanup;
+  }
 
   EStepSharedData shared = {.model = model,
                             .observations = observations,
@@ -1209,13 +1244,6 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
                             .state_count = state_count,
                             .total_log_likelihood = &total_log_likelihood,
                             .error_flag = 0};
-
-  bool success = true;
-  bool initial_mutex_created = false;
-  bool log_mutex_created = false;
-  bool error_mutex_created = false;
-  int transition_init_count = 0;
-  int emission_init_count = 0;
 
   if (pthread_mutex_init(&shared.initial_mutex, NULL) != 0) {
     success = false;
@@ -1407,10 +1435,10 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
   }
 
 cleanup:
-  for (int i = transition_init_count - 1; i >= 0; --i) {
+  for (int i = 0; i < transition_init_count; ++i) {
     pthread_mutex_destroy(&shared.transition_mutexes[i]);
   }
-  for (int i = emission_init_count - 1; i >= 0; --i) {
+  for (int i = 0; i < emission_init_count; ++i) {
     pthread_mutex_destroy(&shared.emission_mutexes[i]);
   }
   if (error_mutex_created) {
@@ -1425,34 +1453,59 @@ cleanup:
 
   thread_pool_destroy(pool);
 
+  /* Free heap-allocated accumulators */
+  if (initial_acc)
+    free(initial_acc);
+  if (transition_acc)
+    free(transition_acc);
+  if (emission_mean_acc)
+    free(emission_mean_acc);
+  if (emission_var_acc)
+    free(emission_var_acc);
+  if (component_weight_acc)
+    free(component_weight_acc);
+  if (state_count)
+    free(state_count);
+
   return success;
 }
 
-// Helper function to compute log probability of duration d under log-normal
+// Helper function to compute log probability of duration d under Gamma
 // distribution
-static double lognormal_log_pdf(int duration, double mean_log_duration,
-                                double stddev_log_duration) {
+// Gamma distribution PDF: (x^(k-1) * exp(-x/θ)) / (θ^k * Γ(k))
+// Log-PDF: (k-1)*log(x) - x/θ - k*log(θ) - lgamma(k)
+static double gamma_log_pdf(int duration, double shape, double scale) {
   if (duration <= 0) {
     return -INFINITY;
   }
 
-  if (stddev_log_duration < 1e-6) {
-    stddev_log_duration = 1e-6; // Prevent numerical issues
+  // Ensure parameters are valid
+  if (shape <= 0.0 || scale <= 0.0) {
+    return -INFINITY;
   }
 
-  double log_d = log((double)duration);
-  double diff = log_d - mean_log_duration;
-  double var = stddev_log_duration * stddev_log_duration;
+  // Prevent numerical issues with very small values
+  if (shape < 1e-6) {
+    shape = 1e-6;
+  }
+  if (scale < 1e-6) {
+    scale = 1e-6;
+  }
 
-  // Log-PDF of log-normal distribution:
-  // -log(d) - 0.5*log(2*pi*var) - (log(d) - mu)^2 / (2*var)
-  return -log_d - 0.5 * log(2.0 * M_PI * var) - (diff * diff) / (2.0 * var);
+  double x = (double)duration;
+
+  // Log-PDF of Gamma distribution:
+  // (k-1)*log(x) - x/θ - k*log(θ) - lgamma(k)
+  return (shape - 1.0) * log(x) - x / scale - shape * log(scale) -
+         lgamma(shape);
 }
 
 double hmm_viterbi(const HMMModel* model, double** observations,
                    const char* sequence, int seq_len, int* states) {
   // HSMM Viterbi with segment-based processing
-  const int MAX_DURATION = 2000; // Maximum segment duration to consider
+  // Maximum segment duration to consider (defined in constants.h)
+  // Use a more reasonable maximum to improve performance
+  const int PRACTICAL_MAX_DURATION = 5000;
 
   // Allocate Viterbi matrices
   // delta[t][j] = max log-probability of path ending at position t in state j
@@ -1507,10 +1560,10 @@ double hmm_viterbi(const HMMModel* model, double** observations,
   // Initialization (t=0): start with segments of length 1
   for (int j = 0; j < NUM_STATES; j++) {
     const StateDuration* duration_params = hmm_get_duration_params(model, j);
-    delta[0][j] = hmm_safe_log(model->initial[j]) +
-                  mixture_log_pdf(&model->emission[j], observations[0]) +
-                  lognormal_log_pdf(1, duration_params->mean_log_duration,
-                                    duration_params->stddev_log_duration);
+    delta[0][j] =
+        hmm_safe_log(model->initial[j]) +
+        mixture_log_pdf(&model->emission[j], observations[0]) +
+        gamma_log_pdf(1, duration_params->shape, duration_params->scale);
     psi[0][j] = -1; // No previous state
     duration[0][j] = 1;
   }
@@ -1527,7 +1580,9 @@ double hmm_viterbi(const HMMModel* model, double** observations,
       int j_end_index = hmm_exon_cycle_index(j);
 
       // Try different segment durations d
-      int max_d = (t + 1 < MAX_DURATION) ? (t + 1) : MAX_DURATION;
+      // Use practical limit to improve performance
+      int max_d =
+          (t + 1 < PRACTICAL_MAX_DURATION) ? (t + 1) : PRACTICAL_MAX_DURATION;
 
       for (int d = 1; d <= max_d && d <= t + 1; d++) {
         // Determine entry state for this segment
@@ -1571,8 +1626,7 @@ double hmm_viterbi(const HMMModel* model, double** observations,
 
         // Compute duration probability
         double duration_prob =
-            lognormal_log_pdf(d, duration_params->mean_log_duration,
-                              duration_params->stddev_log_duration);
+            gamma_log_pdf(d, duration_params->shape, duration_params->scale);
 
         // Consider transitions from all previous states
         if (d == t + 1) {
@@ -1753,8 +1807,15 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   }
 
   // Ensure exon frames share the same duration parameters when persisting.
-  HMMModel tmp_model = *model;
-  hmm_sync_exon_duration(&tmp_model);
+  // The HMMModel struct is large (contains big emission arrays). Copying it
+  // onto the stack can overflow the stack. Allocate a heap copy instead.
+  HMMModel* tmp_model = (HMMModel*)malloc(sizeof(HMMModel));
+  if (!tmp_model) {
+    fclose(fp);
+    return false;
+  }
+  *tmp_model = *model;
+  hmm_sync_exon_duration(tmp_model);
 
   fprintf(fp, "#HMM_MODEL_V1\n");
   fprintf(fp, "#num_features %d\n", model->num_features);
@@ -1809,13 +1870,13 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   }
   fprintf(fp, "\n");
 
-  // Save duration parameters (HSMM)
+  // Save duration parameters (HSMM with Gamma distribution)
   fprintf(fp, "DURATION\n");
   for (int i = 0; i < NUM_STATES; i++) {
     const StateDuration* duration_params =
-        hmm_get_duration_params(&tmp_model, i);
-    fprintf(fp, "%.10f %.10f\n", duration_params->mean_log_duration,
-            duration_params->stddev_log_duration);
+        hmm_get_duration_params(tmp_model, i);
+    fprintf(fp, "%.10f %.10f\n", duration_params->shape,
+            duration_params->scale);
   }
 
   // Save PWM if present
@@ -1889,6 +1950,7 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
     fprintf(fp, "\n");
   }
 
+  free(tmp_model);
   fclose(fp);
   return true;
 }
@@ -2365,8 +2427,8 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
   // Initialize duration parameters with defaults (for backward compatibility)
   for (int i = 0; i < NUM_STATES; i++) {
-    model->duration[i].mean_log_duration = 0.0;
-    model->duration[i].stddev_log_duration = 1.0;
+    model->duration[i].shape = 1.0;
+    model->duration[i].scale = 100.0;
   }
 
   // Read DURATION block if present (optional for backward compatibility)
@@ -2374,11 +2436,11 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
       strncmp(line, "DURATION", 8) == 0) {
     for (int i = 0; i < NUM_STATES; i++) {
       if (fgets(line, sizeof(line), fp) != NULL) {
-        if (sscanf(line, "%lf %lf", &model->duration[i].mean_log_duration,
-                   &model->duration[i].stddev_log_duration) != 2) {
+        if (sscanf(line, "%lf %lf", &model->duration[i].shape,
+                   &model->duration[i].scale) != 2) {
           // If parsing fails, keep defaults
-          model->duration[i].mean_log_duration = 0.0;
-          model->duration[i].stddev_log_duration = 1.0;
+          model->duration[i].shape = 1.0;
+          model->duration[i].scale = 100.0;
         }
       }
     }
@@ -2443,6 +2505,52 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
   fclose(fp);
   return true;
 
+==> src/main.c <==
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <string.h>
+
+#include "../include/common_internal.h"
+#include "../include/predict.h"
+#include "../include/train.h"
+
+int main(int argc, char* argv[]) {
+  // Ensure real-time output behavior
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  if (!update_feature_counts()) {
+    fprintf(stderr,
+            "Error: Default feature configuration exceeds supported limits.\n"
+            "Adjust MAX_NUM_FEATURES or reduce wavelet settings.\n");
+    return 1;
+  }
+
+  if (argc < 2) {
+    print_help(argv[0]);
+    return 0;
+  }
+
+  if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
+      strcmp(argv[1], "-h") == 0) {
+    print_help(argv[0]);
+    return 0;
+  }
+
+  if (strcmp(argv[1], "train") == 0) {
+    handle_train(argc, argv);
+  } else if (strcmp(argv[1], "predict") == 0) {
+    handle_predict(argc, argv);
+  } else {
+    fprintf(stderr, "Error: Unknown mode '%s'\n", argv[1]);
+    fprintf(stderr, "Valid commands: help, train, predict\n");
+    print_help(argv[0]);
+    return 1;
+  }
+
+  return 0;
+
 ==> src/sunfish.c <==
 #define _POSIX_C_SOURCE 200809L
 
@@ -2457,6 +2565,8 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 #include <string.h>
 #include <unistd.h>
 
+#include "../include/constants.h"
+#include "../include/common_internal.h"
 #include "../include/cwt.h"
 #include "../include/fft.h"
 #include "../include/hmm.h"
@@ -2465,37 +2575,24 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
 // Global configuration
 // Default wavelet scales: powers of 3 from 3
-static int g_num_wavelet_scales = 8;
-static double g_wavelet_scales[MAX_NUM_WAVELETS] = {
+int g_num_wavelet_scales = 8;
+double g_wavelet_scales[MAX_NUM_WAVELETS] = {
     3.0, 9.0, 27.0, 81.0, 243.0, 729.0, 2187.0, 6561.0};
 // Default: 0 means "not set"; we'll use number of online processors at runtime
-static int g_num_threads = 0;
-static int g_total_feature_count = 16; // 8 scales * 2 (real + imaginary)
+int g_num_threads = 0;
+int g_total_feature_count = 16; // 8 scales * 2 (real + imaginary)
 
 // Chunk-based prediction configuration
-static int g_chunk_size = 50000;   // Default chunk size: 50kb
-static int g_chunk_overlap = 5000; // Default overlap: 5kb
-static bool g_use_chunking = true;
-
-static int get_env_thread_override(void);
+int g_chunk_size = DEFAULT_CHUNK_SIZE;
+int g_chunk_overlap = DEFAULT_CHUNK_OVERLAP;
+bool g_use_chunking = true;
 
 // Thread-safe output queue
-typedef struct output_node_t {
-  char* gff_line;
-  struct output_node_t* next;
-} output_node_t;
+output_queue_t g_output_queue;
+pthread_mutex_t g_gene_counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+int g_gene_counter = 0;
 
-typedef struct {
-  output_node_t* head;
-  output_node_t* tail;
-  pthread_mutex_t mutex;
-} output_queue_t;
-
-static output_queue_t g_output_queue;
-static pthread_mutex_t g_gene_counter_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int g_gene_counter = 0;
-
-static int parse_threads_value(const char* arg) {
+int parse_threads_value(const char* arg) {
   if (arg == NULL)
     return -1;
 
@@ -2512,7 +2609,7 @@ static int parse_threads_value(const char* arg) {
   return (int)value;
 }
 
-static bool parse_non_negative_int(const char* arg, int* out_value) {
+bool parse_non_negative_int(const char* arg, int* out_value) {
   if (arg == NULL || out_value == NULL)
     return false;
 
@@ -2530,7 +2627,7 @@ static bool parse_non_negative_int(const char* arg, int* out_value) {
   return true;
 }
 
-static int detect_hardware_threads(void) {
+int detect_hardware_threads(void) {
   long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
   if (nprocs < 1)
     nprocs = 1;
@@ -2539,7 +2636,7 @@ static int detect_hardware_threads(void) {
   return (int)nprocs;
 }
 
-static int get_env_thread_override(void) {
+int get_env_thread_override(void) {
   const char* env_vars[] = {"SUNFISH_THREADS", "OMP_NUM_THREADS"};
   const size_t env_count = sizeof(env_vars) / sizeof(env_vars[0]);
 
@@ -2561,7 +2658,7 @@ static int get_env_thread_override(void) {
   return -1;
 }
 
-static void ensure_thread_count(const char* mode, bool threads_specified) {
+void ensure_thread_count(const char* mode, bool threads_specified) {
   const char* source = threads_specified ? "user-specified" : "default";
 
   if (!threads_specified && g_num_threads <= 0) {
@@ -2581,7 +2678,7 @@ static void ensure_thread_count(const char* mode, bool threads_specified) {
           source);
 }
 
-static bool update_feature_counts(void) {
+bool update_feature_counts(void) {
   int wavelet_features = g_num_wavelet_scales * 2;
 
   if (wavelet_features > MAX_NUM_FEATURES)
@@ -2678,14 +2775,14 @@ static int compare_gff_lines(const void* a, const void* b) {
 }
 
 // Initialize output queue
-static void output_queue_init(output_queue_t* queue) {
+void output_queue_init(output_queue_t* queue) {
   queue->head = NULL;
   queue->tail = NULL;
   pthread_mutex_init(&queue->mutex, NULL);
 }
 
 // Add output to queue (thread-safe)
-static void output_queue_add(output_queue_t* queue, const char* gff_line) {
+void output_queue_add(output_queue_t* queue, const char* gff_line) {
   output_node_t* node = (output_node_t*)malloc(sizeof(output_node_t));
   if (node == NULL)
     return;
@@ -2705,7 +2802,7 @@ static void output_queue_add(output_queue_t* queue, const char* gff_line) {
 }
 
 // Flush output queue to stdout (not thread-safe, call from main thread)
-static void output_queue_flush(output_queue_t* queue) {
+void output_queue_flush(output_queue_t* queue) {
   pthread_mutex_lock(&queue->mutex);
   output_node_t* node = queue->head;
   int count = 0;
@@ -2749,37 +2846,14 @@ static void output_queue_flush(output_queue_t* queue) {
 }
 
 // Destroy output queue
-static void output_queue_destroy(output_queue_t* queue) {
+void output_queue_destroy(output_queue_t* queue) {
   output_queue_flush(queue);
   pthread_mutex_destroy(&queue->mutex);
 }
 
-typedef struct {
-  int start;
-  int end;
-  int phase;
-} OutputExon;
+predicted_gene_store_t g_predicted_gene_store;
 
-typedef struct {
-  char* seq_id;
-  char strand;
-  int start; // 1-based inclusive
-  int end;   // 1-based inclusive
-  double score;
-  OutputExon* exons;
-  size_t exon_count;
-} PredictedGeneRecord;
-
-typedef struct {
-  PredictedGeneRecord* genes;
-  size_t count;
-  size_t capacity;
-  pthread_mutex_t mutex;
-} predicted_gene_store_t;
-
-static predicted_gene_store_t g_predicted_gene_store;
-
-static void free_predicted_gene_record(PredictedGeneRecord* gene) {
+void free_predicted_gene_record(PredictedGeneRecord* gene) {
   if (!gene)
     return;
 
@@ -2791,7 +2865,7 @@ static void free_predicted_gene_record(PredictedGeneRecord* gene) {
   gene->exon_count = 0;
 }
 
-static void predicted_gene_store_init(predicted_gene_store_t* store) {
+void predicted_gene_store_init(predicted_gene_store_t* store) {
   if (!store)
     return;
 
@@ -2801,7 +2875,7 @@ static void predicted_gene_store_init(predicted_gene_store_t* store) {
   pthread_mutex_init(&store->mutex, NULL);
 }
 
-static void predicted_gene_store_destroy(predicted_gene_store_t* store) {
+void predicted_gene_store_destroy(predicted_gene_store_t* store) {
   if (!store)
     return;
 
@@ -2817,7 +2891,7 @@ static void predicted_gene_store_destroy(predicted_gene_store_t* store) {
   pthread_mutex_destroy(&store->mutex);
 }
 
-static bool predicted_gene_store_reserve(predicted_gene_store_t* store,
+bool predicted_gene_store_reserve(predicted_gene_store_t* store,
                                          size_t desired) {
   if (!store)
     return false;
@@ -2846,7 +2920,7 @@ static bool predicted_gene_store_reserve(predicted_gene_store_t* store,
    emitting, so these helpers are unnecessary and caused unused-function
    compiler warnings. */
 
-static bool predicted_gene_store_add(predicted_gene_store_t* store,
+bool predicted_gene_store_add(predicted_gene_store_t* store,
                                      const char* seq_id, char strand,
                                      int gene_start, int gene_end, double score,
                                      OutputExon* exons, size_t exon_count) {
@@ -2905,7 +2979,7 @@ static int compare_gene_records_for_output(const void* a, const void* b) {
   return 0;
 }
 
-static void predicted_gene_store_emit_to_queue(predicted_gene_store_t* store) {
+void predicted_gene_store_emit_to_queue(predicted_gene_store_t* store) {
   if (!store)
     return;
 
@@ -3186,7 +3260,7 @@ static void predicted_gene_store_emit_to_queue(predicted_gene_store_t* store) {
 }
 
 // Parse command-line wavelet scales argument
-static int parse_wavelet_scales(const char* arg, double* scales,
+int parse_wavelet_scales(const char* arg, double* scales,
                                 int max_scales) {
   int count = 0;
   char* arg_copy = strdup(arg);
@@ -3203,7 +3277,7 @@ static int parse_wavelet_scales(const char* arg, double* scales,
 
 // Parse range in the form start:end:step and populate scales (up to max_scales)
 // Returns number of scales parsed, or -1 on error.
-static int parse_wavelet_range(const char* arg, double* scales,
+int parse_wavelet_range(const char* arg, double* scales,
                                int max_scales) {
   if (!arg || !scales || max_scales <= 0)
     return -1;
@@ -3264,7 +3338,7 @@ static int parse_wavelet_range(const char* arg, double* scales,
   return count;
 }
 
-static void free_observation_sequence(double** observations, int seq_len) {
+void free_observation_sequence(double** observations, int seq_len) {
   if (!observations)
     return;
 
@@ -3274,8 +3348,8 @@ static void free_observation_sequence(double** observations, int seq_len) {
   free(observations);
 }
 
-static bool build_observation_matrix(const char* sequence, int seq_len,
-                                     double*** out_observations) {
+bool build_observation_matrix(const char* sequence, int seq_len,
+                                     double*** out_observations, int* out_num_features) {
   if (seq_len <= 0)
     return false;
 
@@ -3354,6 +3428,8 @@ static bool build_observation_matrix(const char* sequence, int seq_len,
   free(features);
 
   *out_observations = observations;
+  if (out_num_features != NULL)
+    *out_num_features = num_feature_rows;
   return true;
 }
 
@@ -3488,7 +3564,7 @@ static void training_observation_worker(void* arg) {
     sequence = rc;
   }
 
-  if (!build_observation_matrix(sequence, effective_len, &result))
+  if (!build_observation_matrix(sequence, effective_len, &result, NULL))
     goto cleanup;
 
   task->observations_array[task->array_index] = result;
@@ -3531,7 +3607,7 @@ cleanup:
 }
 
 // Helper function to calculate number of chunks for a sequence
-static int calculate_num_chunks(int seq_len, int chunk_size, int overlap) {
+int calculate_num_chunks(int seq_len, int chunk_size, int overlap) {
   if (!g_use_chunking || seq_len <= chunk_size) {
     return 1; // No chunking needed
   }
@@ -3543,7 +3619,7 @@ static int calculate_num_chunks(int seq_len, int chunk_size, int overlap) {
 }
 
 // Helper function to get chunk boundaries
-static void get_chunk_bounds(int seq_len, int chunk_size, int overlap,
+void get_chunk_bounds(int seq_len, int chunk_size, int overlap,
                              int chunk_idx, int* start, int* end) {
   if (!g_use_chunking || seq_len <= chunk_size) {
     *start = 0;
@@ -3561,7 +3637,7 @@ static void get_chunk_bounds(int seq_len, int chunk_size, int overlap,
   }
 }
 
-static void validate_chunk_configuration_or_exit(const char* context) {
+void validate_chunk_configuration_or_exit(const char* context) {
   if (!g_use_chunking)
     return;
 
@@ -3786,7 +3862,7 @@ static void predict_sequence_worker(void* arg) {
   if (seq_len <= 0)
     goto cleanup;
 
-  if (!build_observation_matrix(task->sequence, seq_len, &observations)) {
+  if (!build_observation_matrix(task->sequence, seq_len, &observations, NULL)) {
     fprintf(stderr,
             "Warning: Failed to compute feature matrix for %s (%c strand)\n",
             seq_id, task->strand);
@@ -3878,21 +3954,22 @@ static void predict_sequence_worker(void* arg) {
       if (current_exon_start == -1)
         current_exon_start = i;
       gene_seq_end = i;
-      
+
       // If we hit a stop codon, this should end the gene
       if (stop_codon_state) {
         // Close current exon including the stop codon
         if (current_exon_start != -1) {
           int exon_end = i;
-          
+
           if (exon_count >= exon_capacity) {
             size_t new_capacity = exon_capacity * 2;
             PredictedExon* tmp = (PredictedExon*)realloc(
                 exon_buffer, new_capacity * sizeof(PredictedExon));
             if (!tmp) {
-              fprintf(stderr,
-                      "Warning: Failed to expand exon buffer for %s (%c strand)\n",
-                      seq_id, task->strand);
+              fprintf(
+                  stderr,
+                  "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                  seq_id, task->strand);
               goto cleanup;
             }
             exon_buffer = tmp;
@@ -3913,7 +3990,7 @@ static void predict_sequence_worker(void* arg) {
           exon_count++;
           current_exon_start = -1;
         }
-        
+
         // Output the gene
         if (exon_count > 0 && gene_seq_start >= 0 &&
             gene_seq_end >= gene_seq_start) {
@@ -3970,7 +4047,7 @@ static void predict_sequence_worker(void* arg) {
             }
           }
         }
-        
+
         // Reset for next gene
         gene_active = false;
         exon_count = 0;
@@ -4180,7 +4257,7 @@ cleanup:
 }
 
 // Training mode: Baum-Welch HMM training
-static void print_help(const char* progname) {
+void print_help(const char* progname) {
   printf("Sunfish HMM-based Gene Annotation Tool\n\n");
   printf("Usage:\n");
   printf("  %s <command> [options]\n\n", progname);
@@ -4438,20 +4515,21 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
 
     for (int e = 0; e < valid_count; e++) {
       RcExon* rc = &rc_exons[e];
-      
+
       // Mark the first 3 bases as START_CODON if this is the first rc exon
       int label_start = rc->start;
       int label_end = rc->end + 1; // +1 because the loop uses <=
-      
+
       if (e == 0 && (rc->end - rc->start + 1) >= 3) {
         // First exon in RC: mark first 3 bp as start codon
-        for (int pos = rc->start; pos < rc->start + 3 && pos <= rc->end && pos < seq_len; pos++) {
+        for (int pos = rc->start;
+             pos < rc->start + 3 && pos <= rc->end && pos < seq_len; pos++) {
           if (pos >= 0)
             state_labels[pos] = STATE_START_CODON;
         }
         label_start = rc->start + 3;
       }
-      
+
       // Mark the last 3 bases as STOP_CODON if this is the last rc exon
       if (e == valid_count - 1 && (rc->end - rc->start + 1) >= 3) {
         // Last exon in RC: mark last 3 bp as stop codon
@@ -4461,7 +4539,7 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
             state_labels[pos] = STATE_STOP_CODON;
         }
       }
-      
+
       // Label the remaining positions with frame states
       for (int pos = label_start; pos < label_end && pos < seq_len; pos++) {
         if (pos < 0)
@@ -4622,9 +4700,9 @@ static void accumulate_statistics_for_segment(
 
 // Helper structure for collecting duration statistics
 typedef struct {
-  double* log_durations; // Array of log(duration) values
-  int count;             // Number of observations
-  int capacity;          // Allocated capacity
+  double* durations;  // Array of duration values (not log)
+  int count;          // Number of observations
+  int capacity;       // Allocated capacity
 } DurationStats;
 
 static void
@@ -4661,17 +4739,17 @@ accumulate_duration_statistics(int seq_len, const int* state_labels,
           if (new_capacity < 16)
             new_capacity = 16;
 
-          double* new_array = (double*)realloc(stats->log_durations,
+          double* new_array = (double*)realloc(stats->durations,
                                                new_capacity * sizeof(double));
 
           if (new_array) {
-            stats->log_durations = new_array;
+            stats->durations = new_array;
             stats->capacity = new_capacity;
           }
         }
 
         if (stats->count < stats->capacity) {
-          stats->log_durations[stats->count] = log((double)duration);
+          stats->durations[stats->count] = (double)duration;
           stats->count++;
         }
       }
@@ -4738,9 +4816,10 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
       model->transition[row][col] /= row_sum;
     }
   }
-  
+
   // Enforce constraints for START_CODON state
-  // START_CODON should primarily transition to EXON_F0 (after 3 bp of start codon)
+  // START_CODON should primarily transition to EXON_F0 (after 3 bp of start
+  // codon)
   int start_row = STATE_START_CODON;
   double start_sum = 0.0;
   for (int col = 0; col < NUM_STATES; col++) {
@@ -4765,7 +4844,7 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
       model->transition[start_row][col] /= start_sum;
     }
   }
-  
+
   // Enforce constraints for STOP_CODON state
   // STOP_CODON should primarily transition to INTERGENIC or INTRON
   int stop_row = STATE_STOP_CODON;
@@ -4779,7 +4858,8 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
     model->transition[stop_row][STATE_INTRON] = 0.1;
     model->transition[stop_row][STATE_STOP_CODON] = 0.09; // self-loop for 3bp
     for (int col = 0; col < NUM_STATES; col++) {
-      if (col != STATE_INTERGENIC && col != STATE_INTRON && col != STATE_STOP_CODON)
+      if (col != STATE_INTERGENIC && col != STATE_INTRON &&
+          col != STATE_STOP_CODON)
         model->transition[stop_row][col] = 0.01 / (NUM_STATES - 3);
     }
   }
@@ -5055,7 +5135,7 @@ static SplicePWM* train_splice_model(const FastaData* genome,
   return pwm;
 }
 
-static void handle_train(int argc, char* argv[]) {
+void handle_train(int argc, char* argv[]) {
   if (argc < 4) {
     fprintf(stderr,
             "Usage: %s train <train.fasta> <train.gff> [--wavelet|-w "
@@ -5912,7 +5992,7 @@ static void handle_train(int argc, char* argv[]) {
   // Initialize duration statistics collectors
   DurationStats duration_stats[NUM_STATES];
   for (int i = 0; i < NUM_STATES; i++) {
-    duration_stats[i].log_durations = NULL;
+    duration_stats[i].durations = NULL;
     duration_stats[i].count = 0;
     duration_stats[i].capacity = 0;
   }
@@ -6029,52 +6109,61 @@ static void handle_train(int argc, char* argv[]) {
        idx++) {
     int state = (int)exon_states[idx];
     for (int j = 0; j < duration_stats[state].count; j++) {
-      double log_d = duration_stats[state].log_durations[j];
-      exon_sum += log_d;
-      exon_sum_sq += log_d * log_d;
+      double d = duration_stats[state].durations[j];
+      exon_sum += d;
+      exon_sum_sq += d * d;
     }
     exon_count += duration_stats[state].count;
   }
 
-  double exon_mean = 0.0;
-  double exon_stddev = 1.0;
+  double exon_shape = 1.0;
+  double exon_scale = 100.0;
   bool exon_has_data = exon_count > 0;
   if (exon_has_data) {
-    exon_mean = exon_sum / exon_count;
+    double mean = exon_sum / exon_count;
     if (exon_count > 1) {
       double variance =
           (exon_sum_sq - (exon_sum * exon_sum) / exon_count) / (exon_count - 1);
       if (variance < 1e-6)
         variance = 1e-6;
-      exon_stddev = sqrt(variance);
+      if (mean < 1e-6)
+        mean = 1e-6;
+      
+      // Method of moments: shape = mean²/variance, scale = variance/mean
+      exon_shape = (mean * mean) / variance;
+      exon_scale = variance / mean;
     } else {
-      exon_stddev = 1.0;
+      // Single observation: use default parameters with adjusted mean
+      exon_shape = 1.0;
+      exon_scale = mean;
     }
   }
 
-  // Compute mean and stddev of log-durations for each state
+  // Compute Gamma distribution parameters for each state
   for (int i = 0; i < NUM_STATES; i++) {
     bool is_exon_state =
         (i == STATE_EXON_F0 || i == STATE_EXON_F1 || i == STATE_EXON_F2);
 
     if (is_exon_state) {
       if (exon_has_data) {
-        model.duration[i].mean_log_duration = exon_mean;
-        model.duration[i].stddev_log_duration = exon_stddev;
+        model.duration[i].shape = exon_shape;
+        model.duration[i].scale = exon_scale;
 
         if (i == STATE_EXON_F0) {
+          double mean = exon_shape * exon_scale;
+          double stddev = sqrt(exon_shape) * exon_scale;
           fprintf(stderr,
                   "States 0/1/2 (exon): %d duration segments combined, "
-                  "mean_log=%.4f, stddev_log=%.4f (per-frame segments)\n",
-                  exon_count, exon_mean, exon_stddev);
+                  "shape=%.4f, scale=%.4f (mean=%.4f, stddev=%.4f)\n",
+                  exon_count, exon_shape, exon_scale, mean, stddev);
         } else {
           fprintf(stderr,
                   "State %d (exon): sharing shared exon duration parameters\n",
                   i);
         }
       } else {
-        model.duration[i].mean_log_duration = 0.0;
-        model.duration[i].stddev_log_duration = 1.0;
+        model.duration[i].shape = 1.0;
+        model.duration[i].scale = 100.0;
 
         if (i == STATE_EXON_F0) {
           fprintf(stderr, "States 0/1/2 (exon): No duration segments observed, "
@@ -6089,41 +6178,50 @@ static void handle_train(int argc, char* argv[]) {
       // Calculate mean for non-exon state
       double sum = 0.0;
       for (int j = 0; j < duration_stats[i].count; j++) {
-        sum += duration_stats[i].log_durations[j];
+        sum += duration_stats[i].durations[j];
       }
       double mean = sum / duration_stats[i].count;
 
-      // Calculate standard deviation
+      // Calculate variance
       double sum_sq = 0.0;
       for (int j = 0; j < duration_stats[i].count; j++) {
-        double diff = duration_stats[i].log_durations[j] - mean;
+        double diff = duration_stats[i].durations[j] - mean;
         sum_sq += diff * diff;
       }
 
-      double stddev = 1.0; // default
+      double variance = 1.0; // default
       if (duration_stats[i].count > 1) {
-        double variance = sum_sq / (duration_stats[i].count - 1);
-        stddev = sqrt(variance > 1e-6 ? variance : 1e-6);
+        variance = sum_sq / (duration_stats[i].count - 1);
+        if (variance < 1e-6)
+          variance = 1e-6;
       }
+      
+      if (mean < 1e-6)
+        mean = 1e-6;
 
-      model.duration[i].mean_log_duration = mean;
-      model.duration[i].stddev_log_duration = stddev;
+      // Method of moments: shape = mean²/variance, scale = variance/mean
+      double shape = (mean * mean) / variance;
+      double scale = variance / mean;
 
+      model.duration[i].shape = shape;
+      model.duration[i].scale = scale;
+
+      double stddev = sqrt(variance);
       fprintf(
           stderr,
-          "State %d: %d duration segments, mean_log=%.4f, stddev_log=%.4f\n", i,
-          duration_stats[i].count, mean, stddev);
+          "State %d: %d duration segments, shape=%.4f, scale=%.4f (mean=%.4f, stddev=%.4f)\n", i,
+          duration_stats[i].count, shape, scale, mean, stddev);
     } else {
       // No segments observed for non-exon state, use defaults
-      model.duration[i].mean_log_duration = 0.0;
-      model.duration[i].stddev_log_duration = 1.0;
+      model.duration[i].shape = 1.0;
+      model.duration[i].scale = 100.0;
       fprintf(stderr,
               "State %d: No duration segments observed, using defaults\n", i);
     }
 
     // Free duration statistics
-    if (duration_stats[i].log_durations) {
-      free(duration_stats[i].log_durations);
+    if (duration_stats[i].durations) {
+      free(duration_stats[i].durations);
     }
   }
 
@@ -6166,9 +6264,6 @@ static void handle_train(int argc, char* argv[]) {
   } else {
     fprintf(stderr, "Warning: Failed to train splice PWM model\n");
   }
-
-  const int kBaumWelchMaxIterations = 50; // FIXME
-  const double kBaumWelchThreshold = 10.0;
 
   fprintf(
       stderr,
@@ -6216,7 +6311,7 @@ static void handle_train(int argc, char* argv[]) {
 }
 
 // Prediction mode: Parallel Viterbi prediction
-static void handle_predict(int argc, char* argv[]) {
+void handle_predict(int argc, char* argv[]) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s predict <target.fasta> [--threads|-t N]\n",
             argv[0]);
@@ -6537,43 +6632,6 @@ static void handle_predict(int argc, char* argv[]) {
   thread_pool_destroy(pool);
   output_queue_destroy(&g_output_queue);
   free_fasta_data(genome);
-}
-
-int main(int argc, char* argv[]) {
-  // Ensure real-time output behavior
-  setvbuf(stdout, NULL, _IOLBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
-
-  if (!update_feature_counts()) {
-    fprintf(stderr,
-            "Error: Default feature configuration exceeds supported limits.\n"
-            "Adjust MAX_NUM_FEATURES or reduce wavelet settings.\n");
-    return 1;
-  }
-
-  if (argc < 2) {
-    print_help(argv[0]);
-    return 0;
-  }
-
-  if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
-      strcmp(argv[1], "-h") == 0) {
-    print_help(argv[0]);
-    return 0;
-  }
-
-  if (strcmp(argv[1], "train") == 0) {
-    handle_train(argc, argv);
-  } else if (strcmp(argv[1], "predict") == 0) {
-    handle_predict(argc, argv);
-  } else {
-    fprintf(stderr, "Error: Unknown mode '%s'\n", argv[1]);
-    fprintf(stderr, "Valid commands: help, train, predict\n");
-    print_help(argv[0]);
-    return 1;
-  }
-
-  return 0;
 
 ==> src/thread_pool.c <==
 #include <pthread.h>
@@ -6819,6 +6877,156 @@ char* reverse_complement(const char* sequence) {
 
   return rc;
 
+==> include/common_internal.h <==
+#ifndef COMMON_INTERNAL_H
+#define COMMON_INTERNAL_H
+
+#include <pthread.h>
+#include <stdbool.h>
+
+#include "constants.h"
+#include "hmm.h"
+
+// Global configuration variables
+extern int g_num_wavelet_scales;
+extern double g_wavelet_scales[MAX_NUM_WAVELETS];
+extern int g_num_threads;
+extern int g_total_feature_count;
+extern int g_chunk_size;
+extern int g_chunk_overlap;
+extern bool g_use_chunking;
+
+// Thread-safe output queue structures
+typedef struct output_node_t {
+  char* gff_line;
+  struct output_node_t* next;
+} output_node_t;
+
+typedef struct {
+  output_node_t* head;
+  output_node_t* tail;
+  pthread_mutex_t mutex;
+} output_queue_t;
+
+extern output_queue_t g_output_queue;
+extern pthread_mutex_t g_gene_counter_mutex;
+extern int g_gene_counter;
+
+// Predicted gene structures
+typedef struct {
+  int start;
+  int end;
+  int phase;
+} OutputExon;
+
+typedef struct {
+  char* seq_id;
+  char strand;
+  int start; // 1-based inclusive
+  int end;   // 1-based inclusive
+  double score;
+  OutputExon* exons;
+  size_t exon_count;
+} PredictedGeneRecord;
+
+typedef struct {
+  PredictedGeneRecord* genes;
+  size_t count;
+  size_t capacity;
+  pthread_mutex_t mutex;
+} predicted_gene_store_t;
+
+extern predicted_gene_store_t g_predicted_gene_store;
+
+// Common utility functions
+int parse_threads_value(const char* arg);
+bool parse_non_negative_int(const char* arg, int* out_value);
+int detect_hardware_threads(void);
+int get_env_thread_override(void);
+void ensure_thread_count(const char* mode, bool threads_specified);
+bool update_feature_counts(void);
+
+// Output queue functions
+void output_queue_init(output_queue_t* queue);
+void output_queue_add(output_queue_t* queue, const char* gff_line);
+void output_queue_flush(output_queue_t* queue);
+void output_queue_destroy(output_queue_t* queue);
+
+// Predicted gene store functions
+void free_predicted_gene_record(PredictedGeneRecord* gene);
+void predicted_gene_store_init(predicted_gene_store_t* store);
+void predicted_gene_store_destroy(predicted_gene_store_t* store);
+bool predicted_gene_store_reserve(predicted_gene_store_t* store,
+                                  size_t desired);
+bool predicted_gene_store_add(predicted_gene_store_t* store,
+                              const char* seq_id, char strand, int gene_start,
+                              int gene_end, double score, OutputExon* exons,
+                              size_t exon_count);
+void predicted_gene_store_emit_to_queue(predicted_gene_store_t* store);
+
+// Wavelet parsing functions
+int parse_wavelet_scales(const char* arg, double* scales, int max_scales);
+int parse_wavelet_range(const char* arg, double* scales, int max_scales);
+
+// Observation matrix functions
+void free_observation_sequence(double** observations, int seq_len);
+bool build_observation_matrix(const char* sequence, int seq_len,
+                              double*** out_observations, int* out_num_features);
+
+// Chunking functions
+int calculate_num_chunks(int seq_len, int chunk_size, int overlap);
+void get_chunk_bounds(int seq_len, int chunk_size, int overlap, int chunk_idx,
+                      int* start, int* end);
+void validate_chunk_configuration_or_exit(const char* context);
+
+// Help and utilities
+void print_help(const char* progname);
+
+
+==> include/constants.h <==
+#ifndef CONSTANTS_H
+#define CONSTANTS_H
+
+// HMM and Model Configuration Constants
+
+// Maximum number of wavelet scales (features)
+// Increased to support user-specified ranges up to 100 scales.
+#define MAX_NUM_WAVELETS 100
+
+// Maximum dimensionality of feature vectors (wavelet)
+#define MAX_NUM_FEATURES 100
+
+// Number of GMM components per state
+#define GMM_COMPONENTS 3
+
+// PWM structures for splice site scoring
+#define DONOR_MOTIF_SIZE 9
+#define ACCEPTOR_MOTIF_SIZE 15
+#define NUM_NUCLEOTIDES 4
+
+// Line and buffer sizes
+#define MAX_LINE_LEN 50000
+#define MAX_PEPTIDE_LEN 100000
+#define MAX_DNA_LEN 1000000
+
+// Amino acids
+#define NUM_AMINO_ACIDS 20
+
+// HMM Training Constants
+#define kBaumWelchMaxIterations 5
+#define kBaumWelchThreshold 10.0
+
+// Variance floor for numerical stability in GMM
+#define kVarianceFloor 1e-5
+
+// Maximum segment duration to consider in HSMM Viterbi
+#define MAX_DURATION 10000
+
+// Default chunking configuration for long sequences
+#define DEFAULT_CHUNK_SIZE 50000
+#define DEFAULT_CHUNK_OVERLAP 5000
+
+
 ==> include/cwt.h <==
 #ifndef CWT_H
 #define CWT_H
@@ -6967,6 +7175,7 @@ CdsGroup* parse_gff_for_cds(const char* path, int* group_count);
 #define HMM_H
 
 #include <stdbool.h>
+#include "constants.h"
 
 // HMM states
 typedef enum {
@@ -6980,28 +7189,13 @@ typedef enum {
   NUM_STATES = 7
 } HMMState;
 
-// Maximum number of wavelet scales (features)
-// Increased to support user-specified ranges up to 100 scales.
-#define MAX_NUM_WAVELETS 100
-
-// Maximum dimensionality of feature vectors (wavelet)
-#define MAX_NUM_FEATURES 8192
-
-// Number of GMM components per state (fixed)
-#define GMM_COMPONENTS 2
-
-// Mixture-of-Gaussians emission (fixed K=2)
+// Mixture-of-Gaussians emission (fixed K=GMM_COMPONENTS)
 typedef struct {
   double weight[GMM_COMPONENTS];
   double mean[GMM_COMPONENTS][MAX_NUM_FEATURES];
   double variance[GMM_COMPONENTS][MAX_NUM_FEATURES];
   int num_features;
 } MixtureEmission;
-
-// PWM structures for splice site scoring
-#define DONOR_MOTIF_SIZE 9
-#define ACCEPTOR_MOTIF_SIZE 15
-#define NUM_NUCLEOTIDES 4
 
 typedef struct {
   double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
@@ -7013,10 +7207,10 @@ typedef struct {
   double pwm_weight;
 } PWMModel;
 
-// Duration distribution parameters for HSMM
+// Duration distribution parameters for HSMM (Gamma distribution)
 typedef struct {
-  double mean_log_duration;   // mean of log(duration)
-  double stddev_log_duration; // standard deviation of log(duration)
+  double shape;  // k parameter (shape) of Gamma distribution
+  double scale;  // θ parameter (scale) of Gamma distribution
 } StateDuration;
 
 // HMM model structure
@@ -7042,7 +7236,7 @@ typedef struct {
   // PWM model for splice site scoring
   PWMModel pwm;
 
-  // Duration distribution parameters for HSMM (log-normal distribution)
+  // Duration distribution parameters for HSMM (Gamma distribution)
   StateDuration duration[NUM_STATES];
 
   // Chunking configuration stored with the model so prediction can reuse
@@ -7119,21 +7313,26 @@ bool hmm_save_model(const HMMModel* model, const char* filename);
 bool hmm_load_model(HMMModel* model, const char* filename);
 
 
+==> include/predict.h <==
+/* predict.h - declarations for prediction mode */
+
+#ifndef PREDICT_H
+#define PREDICT_H
+
+/* Prediction entry point used by main.c */
+void handle_predict(int argc, char* argv[]);
+
+
 ==> include/sunfish.h <==
 #ifndef SUNFISH_H
 #define SUNFISH_H
 
 #include <stdbool.h>
 
+#include "constants.h"
 #include "fasta_parser.h"
 #include "gff_parser.h"
 #include "hmm.h"
-
-// Line and buffer sizes
-enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
-
-// Amino acids
-enum { NUM_AMINO_ACIDS = 20 };
 
 typedef struct {
   char* sequence;
@@ -7220,4 +7419,16 @@ void thread_pool_wait(thread_pool_t* pool);
  * @param pool Thread pool to destroy
  */
 void thread_pool_destroy(thread_pool_t* pool);
+
+
+==> include/train.h <==
+#ifndef TRAIN_H
+#define TRAIN_H
+
+/**
+ * Handle training mode: train HMM model from FASTA and GFF inputs
+ * @param argc Argument count
+ * @param argv Argument vector
+ */
+void handle_train(int argc, char* argv[]);
 

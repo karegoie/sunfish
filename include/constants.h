@@ -8,10 +8,10 @@
 #define MAX_NUM_WAVELETS 100
 
 // Maximum dimensionality of feature vectors (wavelet)
-#define MAX_NUM_FEATURES 8192
+#define MAX_NUM_FEATURES 100
 
 // Number of GMM components per state
-#define GMM_COMPONENTS 3
+#define GMM_COMPONENTS 2
 
 // PWM structures for splice site scoring
 #define DONOR_MOTIF_SIZE 9
@@ -31,7 +31,7 @@
 #define kBaumWelchThreshold 10.0
 
 // Variance floor for numerical stability in GMM
-#define kVarianceFloor 1e-2
+#define kVarianceFloor 1e-5
 
 // Maximum segment duration to consider in HSMM Viterbi
 #define MAX_DURATION 10000
