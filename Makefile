@@ -5,8 +5,13 @@ OBJDIR = obj
 BINDIR = bin
 
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c17 -DNDEBUG -O3 -I$(INCDIR)
+# Add -pthread to CFLAGS for proper threading support and ensure it's used
+# during compilation. Some linkers also require -pthread at link time.
+CFLAGS = -Wall -Wextra -std=c17 -DNDEBUG -O3 -I$(INCDIR) -pthread
 LDFLAGS =
+# Keep -lpthread in LIBS for linkers that accept it, but when doing a static
+# link we also pass -pthread on the linker line to ensure proper static
+# thread support where available.
 LIBS = -lm -lpthread
 
 # Source files used for the HMM-based build
@@ -57,7 +62,9 @@ static: directories $(SUNFISH_STATIC_EXE)
 	@rm -rf $(OBJDIR)
 
 $(SUNFISH_STATIC_EXE): $(SUNFISH_OBJS)
-	$(CC) -static $(SUNFISH_OBJS) $(LDFLAGS) $(LIBS) -o $@
+	# When performing a static link include -pthread on the link line; some
+	# systems require it to pull in proper thread startup code.
+	$(CC) -static $(SUNFISH_OBJS) $(LDFLAGS) -pthread $(LIBS) -o $@
 
 directories:
 	@mkdir -p $(OBJDIR) $(BINDIR)

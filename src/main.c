@@ -4,8 +4,8 @@
 #include <string.h>
 
 #include "../include/common_internal.h"
-#include "../include/train.h"
 #include "../include/predict.h"
+#include "../include/train.h"
 
 int main(int argc, char* argv[]) {
   // Ensure real-time output behavior
