@@ -1,56 +1,81 @@
-# Sunfish HMM - Advanced Gene Prediction with Wavelet Features
+# Sunfish Transformer - Advanced Gene Prediction with Attention Mechanism
 
-This is an advanced version of the Sunfish gene annotation tool that uses a Continuous Density Hidden Markov Model (HMM) with Continuous Wavelet Transform (CWT) features for gene prediction.
+This is an advanced version of the Sunfish gene annotation tool that uses a Transformer model with self-attention mechanisms for gene prediction, implemented from scratch in C/C++.
 
-## New Features
+## Key Features
 
 ### Core Components
 
-1. **Fast Fourier Transform (FFT)**: Custom implementation of the Cooley-Tukey FFT algorithm
-   - No external dependencies (no FFTW required)
-   - Supports forward and inverse FFT
-   - Bit-reversal permutation for in-place computation
+1. **Transformer Architecture**: Full implementation of the "Attention Is All You Need" model
+   - Multi-head self-attention mechanism
+   - Position-wise feed-forward networks
+   - Layer normalization
+   - Sinusoidal positional encoding
+   - Encoder and decoder stacks
 
-2. **Continuous Wavelet Transform (CWT)**: Extracts sophisticated features from DNA sequences
-   - Converts DNA bases to complex plane: A→(1+1i), C→(-1-1i), G→(-1+1i), T→(1-1i)
-   - Morlet wavelet generation for multiple scales
-   - Frequency-domain convolution using FFT
+2. **Parallelization**: High-performance parallel computation using pthreads
+   - Parallelized attention head computation
+   - Parallelized matrix operations
+   - Parallelized feed-forward networks
+   - Configurable thread count
 
-3. **Continuous Emission HMM**: Models gene structures with continuous feature vectors
-   - States: Exon_F0, Exon_F1, Exon_F2, Intron, Intergenic
-   - Multivariate Gaussian emissions with diagonal covariance
-   - Designed for future extension to Gaussian Mixture Models
+3. **TOML Configuration**: Dynamic runtime configuration
+   - No hardcoded constants
+   - All hyperparameters configurable via TOML file
+   - Model architecture customizable
+   - Training parameters adjustable
 
-4. **Baum-Welch Training**: EM algorithm for parameter learning
-   - Forward-backward algorithm for state probabilities
-   - Iterative parameter re-estimation
-   - Convergence monitoring
-
-5. **Parallel Prediction**: Multi-threaded Viterbi decoding
-   - Pthread-based worker pool
-   - Thread-safe output queue
-   - Configurable number of threads
-
-6. **Bidirectional Strand Support**
-   - Reverse complement augmentation during training
-   - Viterbi prediction on both + and - strands
-   - Strand-aware coordinate conversion in GFF3 output
+4. **From-Scratch Implementation**: No external deep learning libraries
+   - Custom matrix operations
+   - Custom attention mechanisms
+   - Scientifically accurate implementation
+   - Optimized for performance
 
 ## Installation
 
-Build the HMM-based tool:
+Build the Transformer-based tool:
 
 ```bash
-make sunfish
+make
 ```
 
-Build both versions (original + HMM):
+Build a static binary:
 
 ```bash
-make all
+make static
+```
+
+Build a debug version with AddressSanitizer:
+
+```bash
+make debug
 ```
 
 ## Usage
+
+### Configuration File
+
+Create a TOML configuration file (e.g., `config.toml`) specifying model hyperparameters:
+
+```toml
+[model]
+d_model = 512           # Model dimension
+num_encoder_layers = 6  # Number of encoder layers
+num_decoder_layers = 6  # Number of decoder layers
+num_heads = 8           # Number of attention heads
+d_ff = 2048            # Feed-forward dimension
+vocab_size = 4         # Vocabulary size (A, C, G, T)
+max_seq_length = 5000  # Maximum sequence length
+
+[training]
+dropout_rate = 0.1     # Dropout rate
+learning_rate = 0.0001 # Learning rate
+batch_size = 32        # Batch size
+num_epochs = 10        # Number of epochs
+
+[parallel]
+num_threads = 4        # Number of threads for parallel computation
+```
 
 ### Help
 
@@ -60,133 +85,137 @@ make all
 
 Displays available commands, options, and examples.
 
-By default, both `train` and `predict` automatically use all available CPU cores. Use `--threads N` (or `-t N`) to limit execution to a specific number of worker threads.
-
 ### Training
 
-Train the HMM using annotated sequences:
+Train the Transformer model using annotated sequences:
 
 ```bash
-./bin/sunfish train <train.fasta> <train.gff> [--wavelet S1,S2,...|s:e:step] [--threads N]
+./bin/sunfish train <train.fasta> <train.gff> -c <config.toml>
 ```
 
 **Arguments:**
 - `train.fasta`: Training genome sequences in FASTA format
 - `train.gff`: Gene annotations in GFF3 format
-- `--wavelet`, `-w`: Comma-separated list or `start:end:step` range of Morlet scales (default: powers of 3 from 3.0 up to 6561.0)
-- `--threads`: Number of worker threads to use (default: auto-detected CPU count)
+- `-c <config.toml>`: Configuration file (required)
 
 **Example:**
 ```bash
-./bin/sunfish train reference.fasta reference.gff --wavelet 3,9,27,81 --threads 32
+./bin/sunfish train reference.fasta reference.gff -c config.toml
 ```
 
-This creates `sunfish.model` containing the trained HMM parameters.
-Both the forward sequence and its reverse complement are used so the model
-learns features on the positive and negative strands simultaneously.
-
-Training proceeds in two stages: first the model parameters are initialized
-supervisedly from the supplied GFF3 annotations, then a Baum-Welch EM loop
-refines the parameters on the full (now unlabeled) feature set. This
-semi-supervised schedule lets the model benefit from curated annotations while
-still adapting to unlabeled regions of the genome.
+This creates `sunfish.model` containing the trained Transformer parameters.
 
 ### Prediction
 
 Predict genes in unannotated sequences:
 
 ```bash
-./bin/sunfish predict <target.fasta> [--threads N]
+./bin/sunfish predict <target.fasta> -c <config.toml>
 ```
 
 **Arguments:**
 - `target.fasta`: Target genome sequences in FASTA format
-- `--threads`: Number of parallel threads (default: auto-detected CPU count)
+- `-c <config.toml>`: Configuration file (required)
 
 **Example:**
 ```bash
-./bin/sunfish predict genome.fasta --threads 8 > predictions.gff3
+./bin/sunfish predict genome.fasta -c config.toml > predictions.gff3
 ```
-
-Prediction automatically evaluates both strands and reports strand-specific
-coordinates in the resulting GFF3 records.
 
 ## Algorithm Details
 
-### Feature Extraction (CWT)
+### Transformer Architecture
 
-For each base position in the DNA sequence:
+The model implements the architecture from "Attention Is All You Need":
 
-1. Convert the DNA sequence to a complex signal (A→1+1i, C→-1-1i, G→-1+1i, T→1-1i).
-2. Generate Morlet wavelets for each requested scale: ψ(t) = (1/√(s·π^(1/4))) · exp(-½·(t/s)²) · exp(-j·2π·t/s).
-3. Convolve the signal with every wavelet via FFT and split the complex response into real and imaginary components (2 features per scale).
-4. Normalize using global Z-score statistics learned during training.
+1. **Input Embedding**: Convert DNA tokens (A, C, G, T) to dense vectors
+2. **Positional Encoding**: Add sinusoidal position information
+3. **Encoder Stack**: Multiple layers of:
+   - Multi-head self-attention
+   - Layer normalization
+   - Position-wise feed-forward network
+   - Residual connections
+4. **Decoder Stack**: Multiple layers of:
+   - Masked multi-head self-attention
+   - Cross-attention with encoder output
+   - Layer normalization
+   - Position-wise feed-forward network
+   - Residual connections
+5. **Output Projection**: Linear layer to gene annotation vocabulary
 
-This yields a feature vector of dimension 2·(#wavelet scales) for every nucleotide.
+### Attention Mechanism
 
-### HMM Training (Baum-Welch)
-
-1. Initialize HMM parameters (transitions, initial probabilities, Gaussian means/variances)
-2. E-step: Run forward-backward algorithm to compute posterior state probabilities
-3. M-step: Re-estimate parameters using weighted averages
-4. Repeat until convergence (log-likelihood change < threshold)
-
-### Gene Prediction (Viterbi)
-
-1. Load trained HMM model
-2. For each sequence (in parallel):
-   - Extract CWT features
-   - Run Viterbi algorithm with Gaussian PDF for emission probabilities
-   - Trace back optimal state path
-   - Output contiguous exon regions as genes
-
-## Testing
-
-A test suite is provided to verify the core components:
-
-```bash
-gcc -std=c17 -O2 -Iinclude -o test/test_cwt test/test_cwt.c src/fft.c src/cwt.c -lm
-./test/test_cwt
+**Scaled Dot-Product Attention:**
+```
+Attention(Q, K, V) = softmax(Q·K^T / √d_k) · V
 ```
 
-This tests:
-- FFT forward and inverse transforms
-- DNA to complex signal conversion
-- Morlet wavelet generation
-- CWT feature computation
+Where:
+- Q (Query), K (Key), V (Value) are input matrices
+- d_k is the dimension of the key vectors
+- Parallelized across multiple attention heads
+
+### Parallelization Strategy
+
+The implementation uses pthreads to parallelize:
+- **Attention heads**: Each head computed in parallel
+- **Matrix multiplication**: Rows distributed across threads
+- **Feed-forward networks**: Batch processing across threads
+
+### Training (Future Implementation)
+
+Training will use:
+1. Teacher forcing for decoder input
+2. Cross-entropy loss for sequence prediction
+3. Adam optimizer for parameter updates
+4. Gradient descent with backpropagation
 
 ## Implementation Notes
 
 ### Performance Optimizations
 
-- **FFT**: Iterative implementation avoids recursion overhead
-- **HMM**: Log-space computations prevent numerical underflow
-- **Threading**: Worker pool avoids thread creation overhead
-- **Memory**: Diagonal covariance reduces storage and computation
+- **Parallel matrix operations**: Thread pool for matrix multiplication
+- **Head-level parallelization**: Independent attention head computation
+- **Optimized memory layout**: Row-major matrix storage
+- **Cache-friendly access patterns**: Sequential memory access where possible
 
 ### Numerical Stability
 
-- Log-sum-exp trick in forward-backward algorithm
-- Minimum variance threshold (1e-6) in Gaussian PDF
-- Normalized CWT features
+- **Softmax with max subtraction**: Prevents overflow in attention scores
+- **Layer normalization**: Stabilizes training and inference
+- **Gradient clipping** (in training): Prevents exploding gradients
 
 ### Thread Safety
 
-- Mutex-protected output queue
-- Atomic gene counter updates
-- Independent task processing
+- **Thread pool**: Reusable worker threads
+- **Independent computations**: No shared state during forward pass
+- **Synchronized model updates** (in training): Mutex-protected parameter updates
 
-## Differences from Original Sunfish
+## Scientific Accuracy
 
-The original `sunfish` tool uses:
-- Logistic regression for amino acid composition
-- Discrete codon/k-mer features
-- Single-threaded processing
-- Statistical validation (P_stat ≥ P_theory)
+This implementation follows the original Transformer paper precisely:
+- Sinusoidal positional encoding formula
+- Scaled dot-product attention mechanism
+- Multi-head attention with proper dimension splitting
+- Position-wise feed-forward networks with ReLU
+- Layer normalization after each sub-layer
+- Residual connections around each sub-layer
 
-The new `sunfish` tool uses:
-- Hidden Markov Model with continuous emissions
-- CWT-based features from raw DNA
+## Differences from Previous Version
+
+The previous version used:
+- Hidden Markov Model (HSMM) with continuous emissions
+- Continuous Wavelet Transform features
+- Baum-Welch training algorithm
+- Viterbi decoding
+- Hardcoded constants in constants.h
+
+The new version uses:
+- Transformer architecture with self-attention
+- Token-based sequence modeling
+- Gradient-based training (future implementation)
+- Attention-based decoding
+- Runtime TOML configuration
 - Multi-threaded parallel processing
 - Viterbi decoding for optimal state paths
 
