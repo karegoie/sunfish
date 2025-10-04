@@ -34,10 +34,10 @@ typedef struct {
   double pwm_weight;
 } PWMModel;
 
-// Duration distribution parameters for HSMM
+// Duration distribution parameters for HSMM (Gamma distribution)
 typedef struct {
-  double mean_log_duration;   // mean of log(duration)
-  double stddev_log_duration; // standard deviation of log(duration)
+  double shape;  // k parameter (shape) of Gamma distribution
+  double scale;  // θ parameter (scale) of Gamma distribution
 } StateDuration;
 
 // HMM model structure
@@ -63,7 +63,7 @@ typedef struct {
   // PWM model for splice site scoring
   PWMModel pwm;
 
-  // Duration distribution parameters for HSMM (log-normal distribution)
+  // Duration distribution parameters for HSMM (Gamma distribution)
   StateDuration duration[NUM_STATES];
 
   // Chunking configuration stored with the model so prediction can reuse

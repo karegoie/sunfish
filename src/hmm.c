@@ -326,20 +326,23 @@ void hmm_init(HMMModel* model, int num_features) {
   model->chunk_overlap = 0;
   model->use_chunking = 0;
 
-  // Initialize duration parameters with defaults
+  // Initialize duration parameters with defaults (Gamma distribution)
+  // Using method of moments: mean = k*θ, variance = k*θ²
+  // For mean=100, variance=10000 (stddev=100): k=1, θ=100
   for (int i = 0; i < NUM_STATES; i++) {
-    model->duration[i].mean_log_duration = 0.0;   // log(1) = 0
-    model->duration[i].stddev_log_duration = 1.0; // default stddev
+    model->duration[i].shape = 1.0;   // shape parameter k
+    model->duration[i].scale = 100.0; // scale parameter θ
   }
 
   hmm_sync_exon_duration(model);
 
   // Initialize start and stop codon durations (3 bp = 1 codon)
-  // log(3) ≈ 1.099
-  model->duration[STATE_START_CODON].mean_log_duration = 1.099;
-  model->duration[STATE_START_CODON].stddev_log_duration = 0.1;
-  model->duration[STATE_STOP_CODON].mean_log_duration = 1.099;
-  model->duration[STATE_STOP_CODON].stddev_log_duration = 0.1;
+  // For fixed duration of 3: high shape, low scale
+  // Mean = k*θ = 3, using k=9, θ=1/3 gives mean=3, stddev=1
+  model->duration[STATE_START_CODON].shape = 9.0;
+  model->duration[STATE_START_CODON].scale = 1.0 / 3.0;
+  model->duration[STATE_STOP_CODON].shape = 9.0;
+  model->duration[STATE_STOP_CODON].scale = 1.0 / 3.0;
 
   // Initialize wavelet scales metadata
   model->num_wavelet_scales = 0;
@@ -963,25 +966,33 @@ cleanup:
   return success;
 }
 
-// Helper function to compute log probability of duration d under log-normal
+// Helper function to compute log probability of duration d under Gamma
 // distribution
-static double lognormal_log_pdf(int duration, double mean_log_duration,
-                                double stddev_log_duration) {
+// Gamma distribution PDF: (x^(k-1) * exp(-x/θ)) / (θ^k * Γ(k))
+// Log-PDF: (k-1)*log(x) - x/θ - k*log(θ) - lgamma(k)
+static double gamma_log_pdf(int duration, double shape, double scale) {
   if (duration <= 0) {
     return -INFINITY;
   }
 
-  if (stddev_log_duration < 1e-6) {
-    stddev_log_duration = 1e-6; // Prevent numerical issues
+  // Ensure parameters are valid
+  if (shape <= 0.0 || scale <= 0.0) {
+    return -INFINITY;
   }
 
-  double log_d = log((double)duration);
-  double diff = log_d - mean_log_duration;
-  double var = stddev_log_duration * stddev_log_duration;
+  // Prevent numerical issues with very small values
+  if (shape < 1e-6) {
+    shape = 1e-6;
+  }
+  if (scale < 1e-6) {
+    scale = 1e-6;
+  }
 
-  // Log-PDF of log-normal distribution:
-  // -log(d) - 0.5*log(2*pi*var) - (log(d) - mu)^2 / (2*var)
-  return -log_d - 0.5 * log(2.0 * M_PI * var) - (diff * diff) / (2.0 * var);
+  double x = (double)duration;
+  
+  // Log-PDF of Gamma distribution:
+  // (k-1)*log(x) - x/θ - k*log(θ) - lgamma(k)
+  return (shape - 1.0) * log(x) - x / scale - shape * log(scale) - lgamma(shape);
 }
 
 double hmm_viterbi(const HMMModel* model, double** observations,
@@ -1045,8 +1056,8 @@ double hmm_viterbi(const HMMModel* model, double** observations,
     const StateDuration* duration_params = hmm_get_duration_params(model, j);
     delta[0][j] = hmm_safe_log(model->initial[j]) +
                   mixture_log_pdf(&model->emission[j], observations[0]) +
-                  lognormal_log_pdf(1, duration_params->mean_log_duration,
-                                    duration_params->stddev_log_duration);
+                  gamma_log_pdf(1, duration_params->shape,
+                                duration_params->scale);
     psi[0][j] = -1; // No previous state
     duration[0][j] = 1;
   }
@@ -1107,8 +1118,8 @@ double hmm_viterbi(const HMMModel* model, double** observations,
 
         // Compute duration probability
         double duration_prob =
-            lognormal_log_pdf(d, duration_params->mean_log_duration,
-                              duration_params->stddev_log_duration);
+            gamma_log_pdf(d, duration_params->shape,
+                          duration_params->scale);
 
         // Consider transitions from all previous states
         if (d == t + 1) {
@@ -1345,13 +1356,13 @@ bool hmm_save_model(const HMMModel* model, const char* filename) {
   }
   fprintf(fp, "\n");
 
-  // Save duration parameters (HSMM)
+  // Save duration parameters (HSMM with Gamma distribution)
   fprintf(fp, "DURATION\n");
   for (int i = 0; i < NUM_STATES; i++) {
     const StateDuration* duration_params =
         hmm_get_duration_params(&tmp_model, i);
-    fprintf(fp, "%.10f %.10f\n", duration_params->mean_log_duration,
-            duration_params->stddev_log_duration);
+    fprintf(fp, "%.10f %.10f\n", duration_params->shape,
+            duration_params->scale);
   }
 
   // Save PWM if present
@@ -1901,8 +1912,8 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
 
   // Initialize duration parameters with defaults (for backward compatibility)
   for (int i = 0; i < NUM_STATES; i++) {
-    model->duration[i].mean_log_duration = 0.0;
-    model->duration[i].stddev_log_duration = 1.0;
+    model->duration[i].shape = 1.0;
+    model->duration[i].scale = 100.0;
   }
 
   // Read DURATION block if present (optional for backward compatibility)
@@ -1910,11 +1921,11 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
       strncmp(line, "DURATION", 8) == 0) {
     for (int i = 0; i < NUM_STATES; i++) {
       if (fgets(line, sizeof(line), fp) != NULL) {
-        if (sscanf(line, "%lf %lf", &model->duration[i].mean_log_duration,
-                   &model->duration[i].stddev_log_duration) != 2) {
+        if (sscanf(line, "%lf %lf", &model->duration[i].shape,
+                   &model->duration[i].scale) != 2) {
           // If parsing fails, keep defaults
-          model->duration[i].mean_log_duration = 0.0;
-          model->duration[i].stddev_log_duration = 1.0;
+          model->duration[i].shape = 1.0;
+          model->duration[i].scale = 100.0;
         }
       }
     }

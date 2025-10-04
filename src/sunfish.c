@@ -2146,9 +2146,9 @@ static void accumulate_statistics_for_segment(
 
 // Helper structure for collecting duration statistics
 typedef struct {
-  double* log_durations; // Array of log(duration) values
-  int count;             // Number of observations
-  int capacity;          // Allocated capacity
+  double* durations;  // Array of duration values (not log)
+  int count;          // Number of observations
+  int capacity;       // Allocated capacity
 } DurationStats;
 
 static void
@@ -2185,17 +2185,17 @@ accumulate_duration_statistics(int seq_len, const int* state_labels,
           if (new_capacity < 16)
             new_capacity = 16;
 
-          double* new_array = (double*)realloc(stats->log_durations,
+          double* new_array = (double*)realloc(stats->durations,
                                                new_capacity * sizeof(double));
 
           if (new_array) {
-            stats->log_durations = new_array;
+            stats->durations = new_array;
             stats->capacity = new_capacity;
           }
         }
 
         if (stats->count < stats->capacity) {
-          stats->log_durations[stats->count] = log((double)duration);
+          stats->durations[stats->count] = (double)duration;
           stats->count++;
         }
       }
@@ -3438,7 +3438,7 @@ void handle_train(int argc, char* argv[]) {
   // Initialize duration statistics collectors
   DurationStats duration_stats[NUM_STATES];
   for (int i = 0; i < NUM_STATES; i++) {
-    duration_stats[i].log_durations = NULL;
+    duration_stats[i].durations = NULL;
     duration_stats[i].count = 0;
     duration_stats[i].capacity = 0;
   }
@@ -3555,52 +3555,61 @@ void handle_train(int argc, char* argv[]) {
        idx++) {
     int state = (int)exon_states[idx];
     for (int j = 0; j < duration_stats[state].count; j++) {
-      double log_d = duration_stats[state].log_durations[j];
-      exon_sum += log_d;
-      exon_sum_sq += log_d * log_d;
+      double d = duration_stats[state].durations[j];
+      exon_sum += d;
+      exon_sum_sq += d * d;
     }
     exon_count += duration_stats[state].count;
   }
 
-  double exon_mean = 0.0;
-  double exon_stddev = 1.0;
+  double exon_shape = 1.0;
+  double exon_scale = 100.0;
   bool exon_has_data = exon_count > 0;
   if (exon_has_data) {
-    exon_mean = exon_sum / exon_count;
+    double mean = exon_sum / exon_count;
     if (exon_count > 1) {
       double variance =
           (exon_sum_sq - (exon_sum * exon_sum) / exon_count) / (exon_count - 1);
       if (variance < 1e-6)
         variance = 1e-6;
-      exon_stddev = sqrt(variance);
+      if (mean < 1e-6)
+        mean = 1e-6;
+      
+      // Method of moments: shape = mean²/variance, scale = variance/mean
+      exon_shape = (mean * mean) / variance;
+      exon_scale = variance / mean;
     } else {
-      exon_stddev = 1.0;
+      // Single observation: use default parameters with adjusted mean
+      exon_shape = 1.0;
+      exon_scale = mean;
     }
   }
 
-  // Compute mean and stddev of log-durations for each state
+  // Compute Gamma distribution parameters for each state
   for (int i = 0; i < NUM_STATES; i++) {
     bool is_exon_state =
         (i == STATE_EXON_F0 || i == STATE_EXON_F1 || i == STATE_EXON_F2);
 
     if (is_exon_state) {
       if (exon_has_data) {
-        model.duration[i].mean_log_duration = exon_mean;
-        model.duration[i].stddev_log_duration = exon_stddev;
+        model.duration[i].shape = exon_shape;
+        model.duration[i].scale = exon_scale;
 
         if (i == STATE_EXON_F0) {
+          double mean = exon_shape * exon_scale;
+          double stddev = sqrt(exon_shape) * exon_scale;
           fprintf(stderr,
                   "States 0/1/2 (exon): %d duration segments combined, "
-                  "mean_log=%.4f, stddev_log=%.4f (per-frame segments)\n",
-                  exon_count, exon_mean, exon_stddev);
+                  "shape=%.4f, scale=%.4f (mean=%.4f, stddev=%.4f)\n",
+                  exon_count, exon_shape, exon_scale, mean, stddev);
         } else {
           fprintf(stderr,
                   "State %d (exon): sharing shared exon duration parameters\n",
                   i);
         }
       } else {
-        model.duration[i].mean_log_duration = 0.0;
-        model.duration[i].stddev_log_duration = 1.0;
+        model.duration[i].shape = 1.0;
+        model.duration[i].scale = 100.0;
 
         if (i == STATE_EXON_F0) {
           fprintf(stderr, "States 0/1/2 (exon): No duration segments observed, "
@@ -3615,41 +3624,50 @@ void handle_train(int argc, char* argv[]) {
       // Calculate mean for non-exon state
       double sum = 0.0;
       for (int j = 0; j < duration_stats[i].count; j++) {
-        sum += duration_stats[i].log_durations[j];
+        sum += duration_stats[i].durations[j];
       }
       double mean = sum / duration_stats[i].count;
 
-      // Calculate standard deviation
+      // Calculate variance
       double sum_sq = 0.0;
       for (int j = 0; j < duration_stats[i].count; j++) {
-        double diff = duration_stats[i].log_durations[j] - mean;
+        double diff = duration_stats[i].durations[j] - mean;
         sum_sq += diff * diff;
       }
 
-      double stddev = 1.0; // default
+      double variance = 1.0; // default
       if (duration_stats[i].count > 1) {
-        double variance = sum_sq / (duration_stats[i].count - 1);
-        stddev = sqrt(variance > 1e-6 ? variance : 1e-6);
+        variance = sum_sq / (duration_stats[i].count - 1);
+        if (variance < 1e-6)
+          variance = 1e-6;
       }
+      
+      if (mean < 1e-6)
+        mean = 1e-6;
 
-      model.duration[i].mean_log_duration = mean;
-      model.duration[i].stddev_log_duration = stddev;
+      // Method of moments: shape = mean²/variance, scale = variance/mean
+      double shape = (mean * mean) / variance;
+      double scale = variance / mean;
 
+      model.duration[i].shape = shape;
+      model.duration[i].scale = scale;
+
+      double stddev = sqrt(variance);
       fprintf(
           stderr,
-          "State %d: %d duration segments, mean_log=%.4f, stddev_log=%.4f\n", i,
-          duration_stats[i].count, mean, stddev);
+          "State %d: %d duration segments, shape=%.4f, scale=%.4f (mean=%.4f, stddev=%.4f)\n", i,
+          duration_stats[i].count, shape, scale, mean, stddev);
     } else {
       // No segments observed for non-exon state, use defaults
-      model.duration[i].mean_log_duration = 0.0;
-      model.duration[i].stddev_log_duration = 1.0;
+      model.duration[i].shape = 1.0;
+      model.duration[i].scale = 100.0;
       fprintf(stderr,
               "State %d: No duration segments observed, using defaults\n", i);
     }
 
     // Free duration statistics
-    if (duration_stats[i].log_durations) {
-      free(duration_stats[i].log_durations);
+    if (duration_stats[i].durations) {
+      free(duration_stats[i].durations);
     }
   }
 

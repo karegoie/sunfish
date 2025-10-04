@@ -11,7 +11,7 @@
 #define MAX_NUM_FEATURES 8192
 
 // Number of GMM components per state
-#define GMM_COMPONENTS 2
+#define GMM_COMPONENTS 3
 
 // PWM structures for splice site scoring
 #define DONOR_MOTIF_SIZE 9
