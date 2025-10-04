@@ -1,404 +1,3 @@
-==> include/cwt.h <==
-#ifndef CWT_H
-#define CWT_H
-
-#include <complex.h>
-#include <stdbool.h>
-
-#include "fft.h"
-
-/**
- * Convert DNA base to complex number on the complex plane.
- * A -> (1+1i), T -> (1-1i), G -> (-1+1i), C -> (-1-1i)
- * @param base DNA base character
- * @return Complex number representation
- */
-cplx dna_to_complex(char base);
-
-/**
- * Convert DNA sequence to numerical signal (complex array).
- * @param sequence DNA sequence string
- * @param length Length of sequence
- * @param output Output array (must be pre-allocated)
- */
-void dna_to_signal(const char* sequence, int length, cplx* output);
-
-/**
- * Generate Morlet wavelet for a given scale parameter.
- * Formula: ψ(t) = (1/√(s·π^(1/4))) * exp(-1/2 * (t/s)^2) * exp(-j*2π*t/s)
- * @param scale Scale parameter s
- * @param length Length of the wavelet (should be centered at length/2)
- * @param output Output array (must be pre-allocated)
- */
-void generate_morlet_wavelet(double scale, int length, cplx* output);
-
-/**
- * Perform convolution using FFT.
- * @param signal Input signal
- * @param signal_len Length of signal
- * @param wavelet Wavelet kernel
- * @param wavelet_len Length of wavelet
- * @param output Output array (must be pre-allocated, size signal_len)
- * @return true on success, false on error
- */
-bool convolve_with_wavelet(const cplx* signal, int signal_len,
-                           const cplx* wavelet, int wavelet_len,
-                           cplx* output);
-
-/**
- * Compute CWT features for a DNA sequence at multiple scales.
- * @param sequence DNA sequence
- * @param seq_len Length of sequence
- * @param scales Array of scale parameters
- * @param num_scales Number of scales
- * @param features Output 2D array [num_scales][seq_len] (must be pre-allocated)
- * @return true on success, false on error
- */
-bool compute_cwt_features(const char* sequence, int seq_len,
-                          const double* scales, int num_scales,
-                          double** features);
-
-
-==> include/fasta_parser.h <==
-#ifndef FASTA_PARSER_H
-#define FASTA_PARSER_H
-
-// Data Structures
-typedef struct {
-  char* id;
-  char* sequence;
-} FastaRecord;
-
-typedef struct {
-  FastaRecord* records;
-  int count;
-} FastaData;
-
-void free_fasta_data(FastaData* data);
-FastaData* parse_fasta(const char* path);
-
-
-==> include/fft.h <==
-#ifndef FFT_H
-#define FFT_H
-
-#include <complex.h>
-#include <stdbool.h>
-
-// Type alias for convenience
-typedef double complex cplx;
-
-/**
- * Compute the Fast Fourier Transform (FFT) using Cooley-Tukey algorithm.
- * @param x Input/output array of complex numbers
- * @param N Length of array (must be power of 2)
- * @param inverse If true, compute inverse FFT
- */
-void fft(cplx* x, int N, bool inverse);
-
-/**
- * Compute inverse FFT with proper normalization.
- * @param x Input/output array of complex numbers
- * @param N Length of array (must be power of 2)
- */
-void ifft(cplx* x, int N);
-
-/**
- * Check if a number is a power of 2.
- * @param n Number to check
- * @return true if n is a power of 2, false otherwise
- */
-bool is_power_of_2(int n);
-
-/**
- * Find next power of 2 greater than or equal to n.
- * @param n Input number
- * @return Next power of 2
- */
-int next_power_of_2(int n);
-
-
-==> include/gff_parser.h <==
-#ifndef GFF_PARSER_H
-#define GFF_PARSER_H
-
-// Data Structures
-typedef struct {
-  char* seqid;
-  int start;
-  int end;
-  char strand;
-  int phase;
-} Exon;
-
-typedef struct {
-  char* parent_id;
-  Exon* exons;
-  int exon_count;
-} CdsGroup;
-
-void free_cds_groups(CdsGroup* groups, int count);
-CdsGroup* parse_gff_for_cds(const char* path, int* group_count);
-
-
-==> include/hmm.h <==
-#ifndef HMM_H
-#define HMM_H
-
-#include <stdbool.h>
-
-// HMM states
-typedef enum {
-  STATE_EXON_F0 = 0,
-  STATE_EXON_F1 = 1,
-  STATE_EXON_F2 = 2,
-  STATE_INTRON = 3,
-  STATE_INTERGENIC = 4,
-  NUM_STATES = 5
-} HMMState;
-
-// Maximum number of wavelet scales (features)
-// Increased to support user-specified ranges up to 100 scales.
-#define MAX_NUM_WAVELETS 100
-
-// Maximum dimensionality of feature vectors (wavelet)
-#define MAX_NUM_FEATURES 8192
-
-// Number of GMM components per state (fixed)
-#define GMM_COMPONENTS 2
-
-// Mixture-of-Gaussians emission (fixed K=2)
-typedef struct {
-  double weight[GMM_COMPONENTS];
-  double mean[GMM_COMPONENTS][MAX_NUM_FEATURES];
-  double variance[GMM_COMPONENTS][MAX_NUM_FEATURES];
-  int num_features;
-} MixtureEmission;
-
-// PWM structures for splice site scoring
-#define DONOR_MOTIF_SIZE 9
-#define ACCEPTOR_MOTIF_SIZE 15
-#define NUM_NUCLEOTIDES 4
-
-typedef struct {
-  double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
-  double acceptor_pwm[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
-  double min_donor_score;
-  double min_acceptor_score;
-  int has_donor;
-  int has_acceptor;
-  double pwm_weight;
-} PWMModel;
-
-// Duration distribution parameters for HSMM
-typedef struct {
-  double mean_log_duration;   // mean of log(duration)
-  double stddev_log_duration; // standard deviation of log(duration)
-} StateDuration;
-
-// HMM model structure
-typedef struct {
-  // Transition probabilities: transition[i][j] = P(state_j | state_i)
-  double transition[NUM_STATES][NUM_STATES];
-
-  // Initial state probabilities
-  double initial[NUM_STATES];
-
-  // Emission parameters for each state (mixture of diagonal Gaussians)
-  MixtureEmission emission[NUM_STATES];
-
-  int num_features;
-  int wavelet_feature_count;
-  int num_wavelet_scales;
-  double wavelet_scales[MAX_NUM_WAVELETS];
-
-  // Global feature statistics for Z-score normalization
-  double global_feature_mean[MAX_NUM_FEATURES];
-  double global_feature_stddev[MAX_NUM_FEATURES];
-
-  // PWM model for splice site scoring
-  PWMModel pwm;
-
-  // Duration distribution parameters for HSMM (log-normal distribution)
-  StateDuration duration[NUM_STATES];
-
-  // Chunking configuration stored with the model so prediction can reuse
-  // the chunk size and overlap that were used during training.
-  int chunk_size;    // recommended chunk size in bases (0 = unspecified)
-  int chunk_overlap; // recommended chunk overlap in bases
-  int use_chunking; // boolean (0/1) whether chunking was enabled when model was
-                    // trained
-} HMMModel;
-
-/**
- * Initialize HMM with default/random parameters.
- * @param model HMM model to initialize
- * @param num_features Number of CWT features (wavelet scales)
- */
-void hmm_init(HMMModel* model, int num_features);
-
-/**
- * Compute Gaussian probability density function (PDF) for diagonal covariance.
- * @param observation Feature vector
- * @param mean Mean vector
- * @param variance Variance vector (diagonal of covariance matrix)
- * @param num_features Dimension of vectors
- * @return Log probability
- */
-/* Diagonal Gaussian log-PDF used internally by GMM routines */
-double diag_gaussian_logpdf(const double* observation, const double* mean,
-                            const double* variance, int num_features);
-
-/* Mixture log-PDF for emission models */
-double mixture_log_pdf(const MixtureEmission* emission,
-                       const double* observation);
-
-/**
- * Train HMM using Baum-Welch algorithm.
- * @param model HMM model to train
- * @param observations Array of observation sequences (2D:
- * [num_sequences][seq_len][num_features])
- * @param seq_lengths Length of each sequence
- * @param num_sequences Number of training sequences
- * @param max_iterations Maximum number of EM iterations
- * @param convergence_threshold Convergence threshold for log-likelihood change
- * @return true on success, false on error
- */
-bool hmm_train_baum_welch(HMMModel* model, double*** observations,
-                          int* seq_lengths, int num_sequences,
-                          int max_iterations, double convergence_threshold);
-
-/**
- * Predict state sequence using Viterbi algorithm.
- * @param model HMM model
- * @param observations Observation sequence [seq_len][num_features]
- * @param seq_len Length of sequence
- * @param states Output state sequence (must be pre-allocated)
- * @return Log probability of most likely path
- */
-double hmm_viterbi(const HMMModel* model, double** observations,
-                   const char* sequence, int seq_len, int* states);
-
-/**
- * Save HMM model to file.
- * @param model HMM model
- * @param filename Output filename
- * @return true on success, false on error
- */
-bool hmm_save_model(const HMMModel* model, const char* filename);
-
-/**
- * Load HMM model from file.
- * @param model HMM model to load into
- * @param filename Input filename
- * @return true on success, false on error
- */
-bool hmm_load_model(HMMModel* model, const char* filename);
-
-
-==> include/sunfish.h <==
-#ifndef SUNFISH_H
-#define SUNFISH_H
-
-#include <stdbool.h>
-
-#include "fasta_parser.h"
-#include "gff_parser.h"
-#include "hmm.h"
-
-// Line and buffer sizes
-enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
-
-// Amino acids
-enum { NUM_AMINO_ACIDS = 20 };
-
-typedef struct {
-  char* sequence;
-  int counts[NUM_AMINO_ACIDS];
-  int exon_count;
-  int cds_length_nt;
-} PeptideInfo;
-
-// PWM Structures
-typedef struct {
-  double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
-  double acceptor_pwm[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
-  double min_donor_score;
-  double min_acceptor_score;
-} SplicePWM;
-
-typedef struct {
-  int donor_counts[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
-  int acceptor_counts[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
-  int total_donor_sites;
-  int total_acceptor_sites;
-} SpliceCounts;
-
-char* reverse_complement(const char* sequence);
-
-
-==> include/thread_pool.h <==
-#ifndef THREAD_POOL_H
-#define THREAD_POOL_H
-
-#include <pthread.h>
-#include <stdbool.h>
-
-// Task function signature
-typedef void (*task_func_t)(void* arg);
-
-// Task structure
-typedef struct task_t {
-  task_func_t function;
-  void* argument;
-  struct task_t* next;
-} task_t;
-
-// Thread pool structure
-typedef struct {
-  pthread_t* threads;
-  int thread_count;
-  
-  task_t* task_queue_head;
-  task_t* task_queue_tail;
-  
-  pthread_mutex_t queue_mutex;
-  pthread_cond_t queue_cond;
-  pthread_cond_t done_cond;
-  
-  int active_tasks;
-  bool shutdown;
-} thread_pool_t;
-
-/**
- * Create a thread pool with specified number of worker threads.
- * @param num_threads Number of worker threads to create
- * @return Pointer to thread pool, or NULL on error
- */
-thread_pool_t* thread_pool_create(int num_threads);
-
-/**
- * Add a task to the thread pool's queue.
- * @param pool Thread pool
- * @param function Function to execute
- * @param arg Argument to pass to function
- * @return true on success, false on error
- */
-bool thread_pool_add_task(thread_pool_t* pool, task_func_t function, void* arg);
-
-/**
- * Wait for all tasks to complete.
- * @param pool Thread pool
- */
-void thread_pool_wait(thread_pool_t* pool);
-
-/**
- * Destroy the thread pool and free all resources.
- * @param pool Thread pool to destroy
- */
-void thread_pool_destroy(thread_pool_t* pool);
-
-
 ==> src/cwt.c <==
 #include <complex.h>
 #include <ctype.h>
@@ -881,7 +480,11 @@ static inline bool hmm_is_exon_state(int state) {
 }
 
 static inline int hmm_duration_state_index(int state) {
-  return hmm_is_exon_state(state) ? STATE_EXON_F0 : state;
+  // Exon frame states share duration parameters
+  if (hmm_is_exon_state(state))
+    return STATE_EXON_F0;
+  // Start and stop codons have their own duration parameters
+  return state;
 }
 
 static inline const StateDuration*
@@ -917,6 +520,14 @@ static const HMMState kExonCycleStates[3] = {STATE_EXON_F0, STATE_EXON_F1,
 // computing Gaussian log-PDFs. This value is referenced in multiple places
 // in this translation unit, so changing it ensures consistent behavior.
 static const double kVarianceFloor = 1e-2;
+
+// Small Dirichlet-style priors to prevent EM from driving rare/short states
+// (START/STOP codons) to zero probability. Keep priors small so they act as
+// smoothing rather than dominating learned counts.
+static const double kTransPriorDefault = 1e-3;
+static const double kTransPriorStartStop = 1e-1;
+static const double kInitialPriorDefault = 1e-3;
+static const double kInitialPriorStartStop = 1e-1;
 
 // Use GMM_COMPONENTS from header
 #ifndef GMM_COMPONENTS
@@ -1187,6 +798,13 @@ void hmm_init(HMMModel* model, int num_features) {
   }
 
   hmm_sync_exon_duration(model);
+
+  // Initialize start and stop codon durations (3 bp = 1 codon)
+  // log(3) ≈ 1.099
+  model->duration[STATE_START_CODON].mean_log_duration = 1.099;
+  model->duration[STATE_START_CODON].stddev_log_duration = 0.1;
+  model->duration[STATE_STOP_CODON].mean_log_duration = 1.099;
+  model->duration[STATE_STOP_CODON].stddev_log_duration = 0.1;
 
   // Initialize wavelet scales metadata
   model->num_wavelet_scales = 0;
@@ -1682,10 +1300,22 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
       break;
     }
 
+    // Apply small Dirichlet priors to initial probabilities to prevent
+    // vanishing probabilities for short constrained states (START/STOP).
     double initial_sum = 0.0;
     for (int i = 0; i < NUM_STATES; i++) {
       initial_sum += initial_acc[i];
     }
+
+    // Add priors
+    for (int i = 0; i < NUM_STATES; i++) {
+      double prior = kInitialPriorDefault;
+      if (i == STATE_START_CODON || i == STATE_STOP_CODON)
+        prior = kInitialPriorStartStop;
+      initial_acc[i] += prior;
+      initial_sum += prior;
+    }
+
     if (initial_sum <= 0.0) {
       double uniform = 1.0 / NUM_STATES;
       for (int i = 0; i < NUM_STATES; i++) {
@@ -1694,8 +1324,8 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
     } else {
       for (int i = 0; i < NUM_STATES; i++) {
         model->initial[i] = initial_acc[i] / initial_sum;
-        if (model->initial[i] < 1e-10)
-          model->initial[i] = 1e-10;
+        if (model->initial[i] < 1e-12)
+          model->initial[i] = 1e-12;
       }
     }
 
@@ -1704,14 +1334,26 @@ bool hmm_train_baum_welch(HMMModel* model, double*** observations,
       for (int j = 0; j < NUM_STATES; j++) {
         trans_sum += transition_acc[i][j];
       }
+
+      // Add small transition priors. Use a larger prior when the target
+      // state is START or STOP to preserve transitions into these short
+      // states.
+      for (int j = 0; j < NUM_STATES; j++) {
+        double prior = kTransPriorDefault;
+        if (j == STATE_START_CODON || j == STATE_STOP_CODON)
+          prior = kTransPriorStartStop;
+        transition_acc[i][j] += prior;
+        trans_sum += prior;
+      }
+
       for (int j = 0; j < NUM_STATES; j++) {
         if (trans_sum > 0.0) {
           model->transition[i][j] = transition_acc[i][j] / trans_sum;
         } else {
           model->transition[i][j] = 1.0 / NUM_STATES;
         }
-        if (model->transition[i][j] < 1e-10)
-          model->transition[i][j] = 1e-10;
+        if (model->transition[i][j] < 1e-12)
+          model->transition[i][j] = 1e-12;
       }
     }
 
@@ -1949,12 +1591,72 @@ double hmm_viterbi(const HMMModel* model, double** observations,
             if (delta[prev_pos][i] <= -INFINITY)
               continue;
 
+            // Compute base transition log
             double transition_log =
                 hmm_safe_log(model->transition[i][segment_entry_state]);
+
+            /*
+             * Enforce exact start/stop codon checks by directly examining the
+             * nucleotide sequence at the transition position (start_pos).
+             * If entering START_CODON or STOP_CODON, require the underlying
+             * 3-nt codon to match the expected motif(s). On match, provide a
+             * very large bonus (large positive log-probability). On mismatch,
+             * set the transition probability to zero (log = -INFINITY).
+             */
+            const double kHugeBonus = 1e1; // very large log-probability bonus
+            int codon_pos = start_pos;     // transition occurs at segment start
+
+            if (segment_entry_state == STATE_START_CODON) {
+              // Need 3 bases starting at codon_pos
+              if (codon_pos + 3 <= seq_len) {
+                char b0 = normalize_base(sequence[codon_pos]);
+                char b1 = normalize_base(sequence[codon_pos + 1]);
+                char b2 = normalize_base(sequence[codon_pos + 2]);
+                if (is_strict_dna_base(b0) && is_strict_dna_base(b1) &&
+                    is_strict_dna_base(b2) && b0 == 'A' && b1 == 'T' &&
+                    b2 == 'G') {
+                  transition_log =
+                      hmm_safe_log(model->transition[i][segment_entry_state]) +
+                      kHugeBonus;
+                } else {
+                  transition_log = -INFINITY; // hard penalty for mismatch
+                }
+              } else {
+                transition_log =
+                    -INFINITY; // out-of-bounds -> treat as mismatch
+              }
+            } else if (segment_entry_state == STATE_STOP_CODON) {
+              if (codon_pos + 3 <= seq_len) {
+                char b0 = normalize_base(sequence[codon_pos]);
+                char b1 = normalize_base(sequence[codon_pos + 1]);
+                char b2 = normalize_base(sequence[codon_pos + 2]);
+                if (is_strict_dna_base(b0) && is_strict_dna_base(b1) &&
+                    is_strict_dna_base(b2)) {
+                  // Check for TAA, TAG, or TGA
+                  if ((b0 == 'T' && b1 == 'A' && b2 == 'A') ||
+                      (b0 == 'T' && b1 == 'A' && b2 == 'G') ||
+                      (b0 == 'T' && b1 == 'G' && b2 == 'A')) {
+                    transition_log =
+                        hmm_safe_log(
+                            model->transition[i][segment_entry_state]) +
+                        kHugeBonus;
+                  } else {
+                    transition_log = -INFINITY;
+                  }
+                } else {
+                  transition_log = -INFINITY;
+                }
+              } else {
+                transition_log = -INFINITY;
+              }
+            }
+
             // Add splice signal adjustment at the transition point (t-d+1)
-            transition_log += splice_signal_adjustment(sequence, seq_len, i,
-                                                       segment_entry_state,
-                                                       t - d + 1, &model->pwm);
+            if (isfinite(transition_log) && transition_log > -INFINITY / 2.0) {
+              transition_log += splice_signal_adjustment(
+                  sequence, seq_len, i, segment_entry_state, t - d + 1,
+                  &model->pwm);
+            }
 
             double score = delta[prev_pos][i] + transition_log +
                            segment_log_prob + duration_prob;
@@ -2264,6 +1966,16 @@ bool hmm_load_model(HMMModel* model, const char* filename) {
       continue;
     }
     (void)sscanf(line, "#num_states %d", &tmp_num_states);
+  }
+
+  // Validate number of states matches current implementation
+  if (tmp_num_states != NUM_STATES) {
+    fprintf(stderr,
+            "Warning: Model file has %d states but current implementation "
+            "expects %d states.\n",
+            tmp_num_states, NUM_STATES);
+    fprintf(stderr, "Model loading may fail or produce incorrect results. "
+                    "Please retrain the model.\n");
   }
 
   if (model->num_features > MAX_NUM_FEATURES)
@@ -4148,9 +3860,11 @@ static void predict_sequence_worker(void* arg) {
     int state = states[i];
     bool exon_state = is_exon_state(state);
     bool intron_state = (state == STATE_INTRON);
+    bool start_codon_state = (state == STATE_START_CODON);
+    bool stop_codon_state = (state == STATE_STOP_CODON);
 
     if (!gene_active) {
-      if (exon_state) {
+      if (exon_state || start_codon_state) {
         gene_active = true;
         gene_seq_start = i;
         gene_seq_end = i;
@@ -4160,10 +3874,109 @@ static void predict_sequence_worker(void* arg) {
       continue;
     }
 
-    if (exon_state) {
+    if (exon_state || start_codon_state || stop_codon_state) {
       if (current_exon_start == -1)
         current_exon_start = i;
       gene_seq_end = i;
+      
+      // If we hit a stop codon, this should end the gene
+      if (stop_codon_state) {
+        // Close current exon including the stop codon
+        if (current_exon_start != -1) {
+          int exon_end = i;
+          
+          if (exon_count >= exon_capacity) {
+            size_t new_capacity = exon_capacity * 2;
+            PredictedExon* tmp = (PredictedExon*)realloc(
+                exon_buffer, new_capacity * sizeof(PredictedExon));
+            if (!tmp) {
+              fprintf(stderr,
+                      "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                      seq_id, task->strand);
+              goto cleanup;
+            }
+            exon_buffer = tmp;
+            exon_capacity = new_capacity;
+          }
+
+          exon_buffer[exon_count].start = current_exon_start;
+          exon_buffer[exon_count].end = exon_end;
+          // Find the first exon frame state for phase calculation
+          int phase = 0;
+          for (int p = current_exon_start; p <= exon_end; p++) {
+            if (is_exon_state(states[p])) {
+              phase = exon_state_to_phase(states[p]);
+              break;
+            }
+          }
+          exon_buffer[exon_count].phase = phase;
+          exon_count++;
+          current_exon_start = -1;
+        }
+        
+        // Output the gene
+        if (exon_count > 0 && gene_seq_start >= 0 &&
+            gene_seq_end >= gene_seq_start) {
+          // Assemble CDS sequence from exons for validation
+          size_t cds_len = 0;
+          for (size_t e = 0; e < exon_count; e++) {
+            cds_len += (exon_buffer[e].end - exon_buffer[e].start + 1);
+          }
+
+          char* cds_seq = (char*)malloc(cds_len + 1);
+          if (cds_seq) {
+            size_t pos = 0;
+            for (size_t e = 0; e < exon_count; e++) {
+              int exon_len = exon_buffer[e].end - exon_buffer[e].start + 1;
+              memcpy(cds_seq + pos, task->sequence + exon_buffer[e].start,
+                     exon_len);
+              pos += exon_len;
+            }
+            cds_seq[cds_len] = '\0';
+
+            // Validate ORF before outputting
+            int global_gene_start = gene_seq_start + chunk_offset;
+            int global_gene_end = gene_seq_end + chunk_offset;
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start += chunk_offset;
+              exon_buffer[e].end += chunk_offset;
+            }
+
+            if (is_valid_orf(cds_seq)) {
+              output_predicted_gene(task, exon_buffer, exon_count,
+                                    global_gene_start, global_gene_end,
+                                    prediction_score, original_length);
+            }
+
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start -= chunk_offset;
+              exon_buffer[e].end -= chunk_offset;
+            }
+            free(cds_seq);
+          } else {
+            // Memory allocation failed, output without validation
+            int global_gene_start = gene_seq_start + chunk_offset;
+            int global_gene_end = gene_seq_end + chunk_offset;
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start += chunk_offset;
+              exon_buffer[e].end += chunk_offset;
+            }
+            output_predicted_gene(task, exon_buffer, exon_count,
+                                  global_gene_start, global_gene_end,
+                                  prediction_score, original_length);
+            for (size_t e = 0; e < exon_count; e++) {
+              exon_buffer[e].start -= chunk_offset;
+              exon_buffer[e].end -= chunk_offset;
+            }
+          }
+        }
+        
+        // Reset for next gene
+        gene_active = false;
+        exon_count = 0;
+        gene_seq_start = -1;
+        gene_seq_end = -1;
+      }
       continue;
     }
 
@@ -4188,8 +4001,15 @@ static void predict_sequence_worker(void* arg) {
 
       exon_buffer[exon_count].start = current_exon_start;
       exon_buffer[exon_count].end = exon_end;
-      exon_buffer[exon_count].phase =
-          exon_state_to_phase(states[current_exon_start]);
+      // Find the first exon frame state for phase calculation
+      int phase = 0;
+      for (int p = current_exon_start; p <= exon_end && p < seq_len; p++) {
+        if (is_exon_state(states[p])) {
+          phase = exon_state_to_phase(states[p]);
+          break;
+        }
+      }
+      exon_buffer[exon_count].phase = phase;
       exon_count++;
 
       current_exon_start = -1;
@@ -4279,8 +4099,15 @@ static void predict_sequence_worker(void* arg) {
 
     exon_buffer[exon_count].start = current_exon_start;
     exon_buffer[exon_count].end = exon_end;
-    exon_buffer[exon_count].phase =
-        exon_state_to_phase(states[current_exon_start]);
+    // Find the first exon frame state for phase calculation
+    int phase = 0;
+    for (int p = current_exon_start; p <= exon_end && p < seq_len; p++) {
+      if (is_exon_state(states[p])) {
+        phase = exon_state_to_phase(states[p]);
+        break;
+      }
+    }
+    exon_buffer[exon_count].phase = phase;
     exon_count++;
     gene_seq_end = exon_end;
     current_exon_start = -1;
@@ -4497,7 +4324,28 @@ static void label_forward_states(const CdsGroup* groups, int group_count,
 
       int phase = normalize_phase(exon->phase);
 
-      for (int pos = start; pos < end_exclusive; pos++) {
+      // Mark the first 3 bases as START_CODON if this is the first exon
+      int label_start = start;
+      if (e == 0 && (end_exclusive - start) >= 3) {
+        // First exon: mark first 3 bp as start codon
+        for (int pos = start; pos < start + 3 && pos < end_exclusive; pos++) {
+          state_labels[pos] = STATE_START_CODON;
+        }
+        label_start = start + 3;
+      }
+
+      // Mark the last 3 bases as STOP_CODON if this is the last exon
+      int label_end = end_exclusive;
+      if (e == group->exon_count - 1 && (end_exclusive - start) >= 3) {
+        // Last exon: mark last 3 bp as stop codon
+        label_end = end_exclusive - 3;
+        for (int pos = label_end; pos < end_exclusive; pos++) {
+          state_labels[pos] = STATE_STOP_CODON;
+        }
+      }
+
+      // Label the remaining positions with frame states
+      for (int pos = label_start; pos < label_end; pos++) {
         int offset = pos - start;
         HMMState state = frame_to_state(phase + offset);
         state_labels[pos] = state;
@@ -4590,7 +4438,32 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
 
     for (int e = 0; e < valid_count; e++) {
       RcExon* rc = &rc_exons[e];
-      for (int pos = rc->start; pos <= rc->end && pos < seq_len; pos++) {
+      
+      // Mark the first 3 bases as START_CODON if this is the first rc exon
+      int label_start = rc->start;
+      int label_end = rc->end + 1; // +1 because the loop uses <=
+      
+      if (e == 0 && (rc->end - rc->start + 1) >= 3) {
+        // First exon in RC: mark first 3 bp as start codon
+        for (int pos = rc->start; pos < rc->start + 3 && pos <= rc->end && pos < seq_len; pos++) {
+          if (pos >= 0)
+            state_labels[pos] = STATE_START_CODON;
+        }
+        label_start = rc->start + 3;
+      }
+      
+      // Mark the last 3 bases as STOP_CODON if this is the last rc exon
+      if (e == valid_count - 1 && (rc->end - rc->start + 1) >= 3) {
+        // Last exon in RC: mark last 3 bp as stop codon
+        label_end = rc->end - 2; // -2 to leave 3 bp for stop codon
+        for (int pos = rc->end - 2; pos <= rc->end && pos < seq_len; pos++) {
+          if (pos >= 0)
+            state_labels[pos] = STATE_STOP_CODON;
+        }
+      }
+      
+      // Label the remaining positions with frame states
+      for (int pos = label_start; pos < label_end && pos < seq_len; pos++) {
         if (pos < 0)
           continue;
         int offset = rc->end - pos;
@@ -4663,7 +4536,11 @@ static void accumulate_statistics_for_segment(
     double emission_sum[NUM_STATES][MAX_NUM_FEATURES],
     double emission_sum_sq[NUM_STATES][MAX_NUM_FEATURES],
     long long state_observation_counts[NUM_STATES],
-    long long initial_counts[NUM_STATES]) {
+    long long initial_counts[NUM_STATES],
+    /* component-level accumulators for GMM supervised initialization */
+    double component_weight_acc[NUM_STATES][GMM_COMPONENTS],
+    double emission_mean_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES],
+    double emission_var_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES]) {
   if (!model || !observations || !state_labels || obs_len <= 0)
     return;
 
@@ -4695,6 +4572,50 @@ static void accumulate_statistics_for_segment(
       emission_sum[state][f] += normalized_val;
       emission_sum_sq[state][f] += normalized_val * normalized_val;
     }
+
+    /* Compute soft responsibilities for each GMM component within this state */
+    double comp_lp[GMM_COMPONENTS];
+    double comp_w[GMM_COMPONENTS];
+    double maxc = -INFINITY;
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      double w = model->emission[state].weight[k];
+      if (w <= 0.0 || !isfinite(w)) {
+        comp_lp[k] = -INFINITY;
+      } else {
+        comp_lp[k] = log(w) + diag_gaussian_logpdf(
+                                  feature_vec, model->emission[state].mean[k],
+                                  model->emission[state].variance[k],
+                                  model->emission[state].num_features);
+      }
+      if (comp_lp[k] > maxc)
+        maxc = comp_lp[k];
+    }
+    double compsum = 0.0;
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      if (!isfinite(comp_lp[k])) {
+        comp_w[k] = 0.0;
+      } else {
+        comp_w[k] = exp(comp_lp[k] - maxc);
+      }
+      compsum += comp_w[k];
+    }
+    if (compsum <= 0.0) {
+      /* fallback: assign equally */
+      for (int k = 0; k < GMM_COMPONENTS; k++)
+        comp_w[k] = 1.0 / (double)GMM_COMPONENTS;
+      compsum = 1.0;
+    }
+
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      double r = comp_w[k] / compsum; /* responsibility for this observation */
+      component_weight_acc[state][k] += r;
+      for (int f = 0; f < num_features; f++) {
+        double v = feature_vec[f];
+        emission_mean_acc[state][k][f] += r * v;
+        emission_var_acc[state][k][f] += r * v * v;
+      }
+    }
+
     state_observation_counts[state]++;
   }
 }
@@ -4771,6 +4692,7 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
   const HMMState exon_cycle[] = {STATE_EXON_F0, STATE_EXON_F1, STATE_EXON_F2};
   const size_t exon_cycle_len = sizeof(exon_cycle) / sizeof(exon_cycle[0]);
 
+  // Enforce cyclic transitions within exon frame states
   for (size_t idx = 0; idx < exon_cycle_len; idx++) {
     HMMState state = exon_cycle[idx];
     HMMState expected_next = exon_cycle[(idx + 1) % exon_cycle_len];
@@ -4814,6 +4736,61 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
 
     for (int col = 0; col < NUM_STATES; col++) {
       model->transition[row][col] /= row_sum;
+    }
+  }
+  
+  // Enforce constraints for START_CODON state
+  // START_CODON should primarily transition to EXON_F0 (after 3 bp of start codon)
+  int start_row = STATE_START_CODON;
+  double start_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    start_sum += model->transition[start_row][col];
+  }
+  if (start_sum < 1e-10) {
+    // If no transitions, set default: mostly to EXON_F0
+    model->transition[start_row][STATE_EXON_F0] = 0.9;
+    model->transition[start_row][STATE_START_CODON] = 0.09; // self-loop for 3bp
+    for (int col = 0; col < NUM_STATES; col++) {
+      if (col != STATE_EXON_F0 && col != STATE_START_CODON)
+        model->transition[start_row][col] = 0.01 / (NUM_STATES - 2);
+    }
+  }
+  // Normalize START_CODON transitions
+  start_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    start_sum += model->transition[start_row][col];
+  }
+  if (start_sum > 0.0) {
+    for (int col = 0; col < NUM_STATES; col++) {
+      model->transition[start_row][col] /= start_sum;
+    }
+  }
+  
+  // Enforce constraints for STOP_CODON state
+  // STOP_CODON should primarily transition to INTERGENIC or INTRON
+  int stop_row = STATE_STOP_CODON;
+  double stop_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    stop_sum += model->transition[stop_row][col];
+  }
+  if (stop_sum < 1e-10) {
+    // If no transitions, set default: mostly to INTERGENIC
+    model->transition[stop_row][STATE_INTERGENIC] = 0.8;
+    model->transition[stop_row][STATE_INTRON] = 0.1;
+    model->transition[stop_row][STATE_STOP_CODON] = 0.09; // self-loop for 3bp
+    for (int col = 0; col < NUM_STATES; col++) {
+      if (col != STATE_INTERGENIC && col != STATE_INTRON && col != STATE_STOP_CODON)
+        model->transition[stop_row][col] = 0.01 / (NUM_STATES - 3);
+    }
+  }
+  // Normalize STOP_CODON transitions
+  stop_sum = 0.0;
+  for (int col = 0; col < NUM_STATES; col++) {
+    stop_sum += model->transition[stop_row][col];
+  }
+  if (stop_sum > 0.0) {
+    for (int col = 0; col < NUM_STATES; col++) {
+      model->transition[stop_row][col] /= stop_sum;
     }
   }
 }
@@ -5705,6 +5682,20 @@ static void handle_train(int argc, char* argv[]) {
   double emission_sum_sq[NUM_STATES][MAX_NUM_FEATURES] = {{0}};
   long long state_observation_counts[NUM_STATES] = {0};
   long long initial_counts[NUM_STATES] = {0};
+  /* GMM component-level accumulators for supervised init */
+  double component_weight_acc[NUM_STATES][GMM_COMPONENTS];
+  double emission_mean_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
+  double emission_var_acc[NUM_STATES][GMM_COMPONENTS][MAX_NUM_FEATURES];
+  /* initialize */
+  for (int i = 0; i < NUM_STATES; i++) {
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      component_weight_acc[i][k] = 0.0;
+      for (int f = 0; f < MAX_NUM_FEATURES; f++) {
+        emission_mean_acc[i][k][f] = 0.0;
+        emission_var_acc[i][k][f] = 0.0;
+      }
+    }
+  }
 
   // Process each sequence to accumulate statistics
   for (int seq_idx = 0; seq_idx < genome->count; seq_idx++) {
@@ -5757,7 +5748,8 @@ static void handle_train(int argc, char* argv[]) {
         accumulate_statistics_for_segment(
             &model, observations[seg_index], seq_lengths[seg_index], labels_ptr,
             transition_counts, emission_sum, emission_sum_sq,
-            state_observation_counts, initial_counts);
+            state_observation_counts, initial_counts, component_weight_acc,
+            emission_mean_acc, emission_var_acc);
       }
     }
 
@@ -5793,7 +5785,8 @@ static void handle_train(int argc, char* argv[]) {
         accumulate_statistics_for_segment(
             &model, observations[seg_index], seq_lengths[seg_index], labels_ptr,
             transition_counts, emission_sum, emission_sum_sq,
-            state_observation_counts, initial_counts);
+            state_observation_counts, initial_counts, component_weight_acc,
+            emission_mean_acc, emission_var_acc);
       }
     }
 
@@ -5846,29 +5839,65 @@ static void handle_train(int argc, char* argv[]) {
   for (int i = 0; i < NUM_STATES; i++) {
     model.emission[i].num_features = num_features;
 
-    for (int f = 0; f < num_features; f++) {
-      if (state_observation_counts[i] > 0) {
-        double mean = emission_sum[i][f] / state_observation_counts[i];
-        double mean_sq = emission_sum_sq[i][f] / state_observation_counts[i];
-        double variance = mean_sq - mean * mean;
-
-        /* Assign to component 0 and create a small perturbed component 1 */
-        model.emission[i].mean[0][f] = mean;
-        model.emission[i].variance[0][f] = (variance > 1e-6) ? variance : 1e-6;
-        model.emission[i].mean[1][f] = mean + 0.1;
-        model.emission[i].variance[1][f] =
-            model.emission[i].variance[0][f] + 0.1;
-        model.emission[i].weight[0] = 0.5;
-        model.emission[i].weight[1] = 0.5;
-      } else {
-        /* Defaults for both components */
-        model.emission[i].mean[0][f] = 0.0;
-        model.emission[i].variance[0][f] = 1.0;
-        model.emission[i].mean[1][f] = 0.1;
-        model.emission[i].variance[1][f] = 1.1;
-        model.emission[i].weight[0] = 0.5;
-        model.emission[i].weight[1] = 0.5;
+    /* If component-level responsibilities were recorded, use them */
+    bool has_component_data = false;
+    for (int k = 0; k < GMM_COMPONENTS; k++) {
+      if (component_weight_acc[i][k] > 0.0) {
+        has_component_data = true;
+        break;
       }
+    }
+
+    if (has_component_data) {
+      double weight_sum = 0.0;
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        weight_sum += component_weight_acc[i][k];
+      }
+      for (int k = 0; k < GMM_COMPONENTS; k++) {
+        double comp_w = component_weight_acc[i][k];
+        if (comp_w > 0.0) {
+          for (int f = 0; f < num_features; f++) {
+            double mean = emission_mean_acc[i][k][f] / comp_w;
+            double mean_sq = emission_var_acc[i][k][f] / comp_w;
+            double var = mean_sq - mean * mean;
+            if (!isfinite(var) || var < 1e-6)
+              var = 1e-6;
+            model.emission[i].mean[k][f] = mean;
+            model.emission[i].variance[k][f] = var;
+          }
+        } else {
+          for (int f = 0; f < num_features; f++) {
+            model.emission[i].mean[k][f] = 0.0;
+            model.emission[i].variance[k][f] = 1.0;
+          }
+        }
+        model.emission[i].weight[k] = (weight_sum > 0.0)
+                                          ? (comp_w / weight_sum)
+                                          : (1.0 / (double)GMM_COMPONENTS);
+      }
+    } else {
+      /* Fallback: use aggregate stats and create a perturbed second component
+       */
+      for (int f = 0; f < num_features; f++) {
+        if (state_observation_counts[i] > 0) {
+          double mean = emission_sum[i][f] / state_observation_counts[i];
+          double mean_sq = emission_sum_sq[i][f] / state_observation_counts[i];
+          double variance = mean_sq - mean * mean;
+          model.emission[i].mean[0][f] = mean;
+          model.emission[i].variance[0][f] =
+              (variance > 1e-6) ? variance : 1e-6;
+          model.emission[i].mean[1][f] = mean + 0.1;
+          model.emission[i].variance[1][f] =
+              model.emission[i].variance[0][f] + 0.1;
+        } else {
+          model.emission[i].mean[0][f] = 0.0;
+          model.emission[i].variance[0][f] = 1.0;
+          model.emission[i].mean[1][f] = 0.1;
+          model.emission[i].variance[1][f] = 1.1;
+        }
+      }
+      model.emission[i].weight[0] = 0.5;
+      model.emission[i].weight[1] = 0.5;
     }
 
     fprintf(stderr, "State %d: %lld observations\n", i,
@@ -6789,3 +6818,406 @@ char* reverse_complement(const char* sequence) {
   rc[len] = '\0';
 
   return rc;
+
+==> include/cwt.h <==
+#ifndef CWT_H
+#define CWT_H
+
+#include <complex.h>
+#include <stdbool.h>
+
+#include "fft.h"
+
+/**
+ * Convert DNA base to complex number on the complex plane.
+ * A -> (1+1i), T -> (1-1i), G -> (-1+1i), C -> (-1-1i)
+ * @param base DNA base character
+ * @return Complex number representation
+ */
+cplx dna_to_complex(char base);
+
+/**
+ * Convert DNA sequence to numerical signal (complex array).
+ * @param sequence DNA sequence string
+ * @param length Length of sequence
+ * @param output Output array (must be pre-allocated)
+ */
+void dna_to_signal(const char* sequence, int length, cplx* output);
+
+/**
+ * Generate Morlet wavelet for a given scale parameter.
+ * Formula: ψ(t) = (1/√(s·π^(1/4))) * exp(-1/2 * (t/s)^2) * exp(-j*2π*t/s)
+ * @param scale Scale parameter s
+ * @param length Length of the wavelet (should be centered at length/2)
+ * @param output Output array (must be pre-allocated)
+ */
+void generate_morlet_wavelet(double scale, int length, cplx* output);
+
+/**
+ * Perform convolution using FFT.
+ * @param signal Input signal
+ * @param signal_len Length of signal
+ * @param wavelet Wavelet kernel
+ * @param wavelet_len Length of wavelet
+ * @param output Output array (must be pre-allocated, size signal_len)
+ * @return true on success, false on error
+ */
+bool convolve_with_wavelet(const cplx* signal, int signal_len,
+                           const cplx* wavelet, int wavelet_len,
+                           cplx* output);
+
+/**
+ * Compute CWT features for a DNA sequence at multiple scales.
+ * @param sequence DNA sequence
+ * @param seq_len Length of sequence
+ * @param scales Array of scale parameters
+ * @param num_scales Number of scales
+ * @param features Output 2D array [num_scales][seq_len] (must be pre-allocated)
+ * @return true on success, false on error
+ */
+bool compute_cwt_features(const char* sequence, int seq_len,
+                          const double* scales, int num_scales,
+                          double** features);
+
+
+==> include/fasta_parser.h <==
+#ifndef FASTA_PARSER_H
+#define FASTA_PARSER_H
+
+// Data Structures
+typedef struct {
+  char* id;
+  char* sequence;
+} FastaRecord;
+
+typedef struct {
+  FastaRecord* records;
+  int count;
+} FastaData;
+
+void free_fasta_data(FastaData* data);
+FastaData* parse_fasta(const char* path);
+
+
+==> include/fft.h <==
+#ifndef FFT_H
+#define FFT_H
+
+#include <complex.h>
+#include <stdbool.h>
+
+// Type alias for convenience
+typedef double complex cplx;
+
+/**
+ * Compute the Fast Fourier Transform (FFT) using Cooley-Tukey algorithm.
+ * @param x Input/output array of complex numbers
+ * @param N Length of array (must be power of 2)
+ * @param inverse If true, compute inverse FFT
+ */
+void fft(cplx* x, int N, bool inverse);
+
+/**
+ * Compute inverse FFT with proper normalization.
+ * @param x Input/output array of complex numbers
+ * @param N Length of array (must be power of 2)
+ */
+void ifft(cplx* x, int N);
+
+/**
+ * Check if a number is a power of 2.
+ * @param n Number to check
+ * @return true if n is a power of 2, false otherwise
+ */
+bool is_power_of_2(int n);
+
+/**
+ * Find next power of 2 greater than or equal to n.
+ * @param n Input number
+ * @return Next power of 2
+ */
+int next_power_of_2(int n);
+
+
+==> include/gff_parser.h <==
+#ifndef GFF_PARSER_H
+#define GFF_PARSER_H
+
+// Data Structures
+typedef struct {
+  char* seqid;
+  int start;
+  int end;
+  char strand;
+  int phase;
+} Exon;
+
+typedef struct {
+  char* parent_id;
+  Exon* exons;
+  int exon_count;
+} CdsGroup;
+
+void free_cds_groups(CdsGroup* groups, int count);
+CdsGroup* parse_gff_for_cds(const char* path, int* group_count);
+
+
+==> include/hmm.h <==
+#ifndef HMM_H
+#define HMM_H
+
+#include <stdbool.h>
+
+// HMM states
+typedef enum {
+  STATE_EXON_F0 = 0,
+  STATE_EXON_F1 = 1,
+  STATE_EXON_F2 = 2,
+  STATE_INTRON = 3,
+  STATE_INTERGENIC = 4,
+  STATE_START_CODON = 5,
+  STATE_STOP_CODON = 6,
+  NUM_STATES = 7
+} HMMState;
+
+// Maximum number of wavelet scales (features)
+// Increased to support user-specified ranges up to 100 scales.
+#define MAX_NUM_WAVELETS 100
+
+// Maximum dimensionality of feature vectors (wavelet)
+#define MAX_NUM_FEATURES 8192
+
+// Number of GMM components per state (fixed)
+#define GMM_COMPONENTS 2
+
+// Mixture-of-Gaussians emission (fixed K=2)
+typedef struct {
+  double weight[GMM_COMPONENTS];
+  double mean[GMM_COMPONENTS][MAX_NUM_FEATURES];
+  double variance[GMM_COMPONENTS][MAX_NUM_FEATURES];
+  int num_features;
+} MixtureEmission;
+
+// PWM structures for splice site scoring
+#define DONOR_MOTIF_SIZE 9
+#define ACCEPTOR_MOTIF_SIZE 15
+#define NUM_NUCLEOTIDES 4
+
+typedef struct {
+  double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
+  double acceptor_pwm[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
+  double min_donor_score;
+  double min_acceptor_score;
+  int has_donor;
+  int has_acceptor;
+  double pwm_weight;
+} PWMModel;
+
+// Duration distribution parameters for HSMM
+typedef struct {
+  double mean_log_duration;   // mean of log(duration)
+  double stddev_log_duration; // standard deviation of log(duration)
+} StateDuration;
+
+// HMM model structure
+typedef struct {
+  // Transition probabilities: transition[i][j] = P(state_j | state_i)
+  double transition[NUM_STATES][NUM_STATES];
+
+  // Initial state probabilities
+  double initial[NUM_STATES];
+
+  // Emission parameters for each state (mixture of diagonal Gaussians)
+  MixtureEmission emission[NUM_STATES];
+
+  int num_features;
+  int wavelet_feature_count;
+  int num_wavelet_scales;
+  double wavelet_scales[MAX_NUM_WAVELETS];
+
+  // Global feature statistics for Z-score normalization
+  double global_feature_mean[MAX_NUM_FEATURES];
+  double global_feature_stddev[MAX_NUM_FEATURES];
+
+  // PWM model for splice site scoring
+  PWMModel pwm;
+
+  // Duration distribution parameters for HSMM (log-normal distribution)
+  StateDuration duration[NUM_STATES];
+
+  // Chunking configuration stored with the model so prediction can reuse
+  // the chunk size and overlap that were used during training.
+  int chunk_size;    // recommended chunk size in bases (0 = unspecified)
+  int chunk_overlap; // recommended chunk overlap in bases
+  int use_chunking; // boolean (0/1) whether chunking was enabled when model was
+                    // trained
+} HMMModel;
+
+/**
+ * Initialize HMM with default/random parameters.
+ * @param model HMM model to initialize
+ * @param num_features Number of CWT features (wavelet scales)
+ */
+void hmm_init(HMMModel* model, int num_features);
+
+/**
+ * Compute Gaussian probability density function (PDF) for diagonal covariance.
+ * @param observation Feature vector
+ * @param mean Mean vector
+ * @param variance Variance vector (diagonal of covariance matrix)
+ * @param num_features Dimension of vectors
+ * @return Log probability
+ */
+/* Diagonal Gaussian log-PDF used internally by GMM routines */
+double diag_gaussian_logpdf(const double* observation, const double* mean,
+                            const double* variance, int num_features);
+
+/* Mixture log-PDF for emission models */
+double mixture_log_pdf(const MixtureEmission* emission,
+                       const double* observation);
+
+/**
+ * Train HMM using Baum-Welch algorithm.
+ * @param model HMM model to train
+ * @param observations Array of observation sequences (2D:
+ * [num_sequences][seq_len][num_features])
+ * @param seq_lengths Length of each sequence
+ * @param num_sequences Number of training sequences
+ * @param max_iterations Maximum number of EM iterations
+ * @param convergence_threshold Convergence threshold for log-likelihood change
+ * @return true on success, false on error
+ */
+bool hmm_train_baum_welch(HMMModel* model, double*** observations,
+                          int* seq_lengths, int num_sequences,
+                          int max_iterations, double convergence_threshold);
+
+/**
+ * Predict state sequence using Viterbi algorithm.
+ * @param model HMM model
+ * @param observations Observation sequence [seq_len][num_features]
+ * @param seq_len Length of sequence
+ * @param states Output state sequence (must be pre-allocated)
+ * @return Log probability of most likely path
+ */
+double hmm_viterbi(const HMMModel* model, double** observations,
+                   const char* sequence, int seq_len, int* states);
+
+/**
+ * Save HMM model to file.
+ * @param model HMM model
+ * @param filename Output filename
+ * @return true on success, false on error
+ */
+bool hmm_save_model(const HMMModel* model, const char* filename);
+
+/**
+ * Load HMM model from file.
+ * @param model HMM model to load into
+ * @param filename Input filename
+ * @return true on success, false on error
+ */
+bool hmm_load_model(HMMModel* model, const char* filename);
+
+
+==> include/sunfish.h <==
+#ifndef SUNFISH_H
+#define SUNFISH_H
+
+#include <stdbool.h>
+
+#include "fasta_parser.h"
+#include "gff_parser.h"
+#include "hmm.h"
+
+// Line and buffer sizes
+enum { MAX_LINE_LEN = 50000, MAX_PEPTIDE_LEN = 100000, MAX_DNA_LEN = 1000000 };
+
+// Amino acids
+enum { NUM_AMINO_ACIDS = 20 };
+
+typedef struct {
+  char* sequence;
+  int counts[NUM_AMINO_ACIDS];
+  int exon_count;
+  int cds_length_nt;
+} PeptideInfo;
+
+// PWM Structures
+typedef struct {
+  double donor_pwm[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
+  double acceptor_pwm[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
+  double min_donor_score;
+  double min_acceptor_score;
+} SplicePWM;
+
+typedef struct {
+  int donor_counts[NUM_NUCLEOTIDES][DONOR_MOTIF_SIZE];
+  int acceptor_counts[NUM_NUCLEOTIDES][ACCEPTOR_MOTIF_SIZE];
+  int total_donor_sites;
+  int total_acceptor_sites;
+} SpliceCounts;
+
+char* reverse_complement(const char* sequence);
+
+
+==> include/thread_pool.h <==
+#ifndef THREAD_POOL_H
+#define THREAD_POOL_H
+
+#include <pthread.h>
+#include <stdbool.h>
+
+// Task function signature
+typedef void (*task_func_t)(void* arg);
+
+// Task structure
+typedef struct task_t {
+  task_func_t function;
+  void* argument;
+  struct task_t* next;
+} task_t;
+
+// Thread pool structure
+typedef struct {
+  pthread_t* threads;
+  int thread_count;
+  
+  task_t* task_queue_head;
+  task_t* task_queue_tail;
+  
+  pthread_mutex_t queue_mutex;
+  pthread_cond_t queue_cond;
+  pthread_cond_t done_cond;
+  
+  int active_tasks;
+  bool shutdown;
+} thread_pool_t;
+
+/**
+ * Create a thread pool with specified number of worker threads.
+ * @param num_threads Number of worker threads to create
+ * @return Pointer to thread pool, or NULL on error
+ */
+thread_pool_t* thread_pool_create(int num_threads);
+
+/**
+ * Add a task to the thread pool's queue.
+ * @param pool Thread pool
+ * @param function Function to execute
+ * @param arg Argument to pass to function
+ * @return true on success, false on error
+ */
+bool thread_pool_add_task(thread_pool_t* pool, task_func_t function, void* arg);
+
+/**
+ * Wait for all tasks to complete.
+ * @param pool Thread pool
+ */
+void thread_pool_wait(thread_pool_t* pool);
+
+/**
+ * Destroy the thread pool and free all resources.
+ * @param pool Thread pool to destroy
+ */
+void thread_pool_destroy(thread_pool_t* pool);
+

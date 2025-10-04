@@ -1432,21 +1432,22 @@ static void predict_sequence_worker(void* arg) {
       if (current_exon_start == -1)
         current_exon_start = i;
       gene_seq_end = i;
-      
+
       // If we hit a stop codon, this should end the gene
       if (stop_codon_state) {
         // Close current exon including the stop codon
         if (current_exon_start != -1) {
           int exon_end = i;
-          
+
           if (exon_count >= exon_capacity) {
             size_t new_capacity = exon_capacity * 2;
             PredictedExon* tmp = (PredictedExon*)realloc(
                 exon_buffer, new_capacity * sizeof(PredictedExon));
             if (!tmp) {
-              fprintf(stderr,
-                      "Warning: Failed to expand exon buffer for %s (%c strand)\n",
-                      seq_id, task->strand);
+              fprintf(
+                  stderr,
+                  "Warning: Failed to expand exon buffer for %s (%c strand)\n",
+                  seq_id, task->strand);
               goto cleanup;
             }
             exon_buffer = tmp;
@@ -1467,7 +1468,7 @@ static void predict_sequence_worker(void* arg) {
           exon_count++;
           current_exon_start = -1;
         }
-        
+
         // Output the gene
         if (exon_count > 0 && gene_seq_start >= 0 &&
             gene_seq_end >= gene_seq_start) {
@@ -1524,7 +1525,7 @@ static void predict_sequence_worker(void* arg) {
             }
           }
         }
-        
+
         // Reset for next gene
         gene_active = false;
         exon_count = 0;
@@ -1992,20 +1993,21 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
 
     for (int e = 0; e < valid_count; e++) {
       RcExon* rc = &rc_exons[e];
-      
+
       // Mark the first 3 bases as START_CODON if this is the first rc exon
       int label_start = rc->start;
       int label_end = rc->end + 1; // +1 because the loop uses <=
-      
+
       if (e == 0 && (rc->end - rc->start + 1) >= 3) {
         // First exon in RC: mark first 3 bp as start codon
-        for (int pos = rc->start; pos < rc->start + 3 && pos <= rc->end && pos < seq_len; pos++) {
+        for (int pos = rc->start;
+             pos < rc->start + 3 && pos <= rc->end && pos < seq_len; pos++) {
           if (pos >= 0)
             state_labels[pos] = STATE_START_CODON;
         }
         label_start = rc->start + 3;
       }
-      
+
       // Mark the last 3 bases as STOP_CODON if this is the last rc exon
       if (e == valid_count - 1 && (rc->end - rc->start + 1) >= 3) {
         // Last exon in RC: mark last 3 bp as stop codon
@@ -2015,7 +2017,7 @@ static void label_reverse_states(const CdsGroup* groups, int group_count,
             state_labels[pos] = STATE_STOP_CODON;
         }
       }
-      
+
       // Label the remaining positions with frame states
       for (int pos = label_start; pos < label_end && pos < seq_len; pos++) {
         if (pos < 0)
@@ -2292,9 +2294,10 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
       model->transition[row][col] /= row_sum;
     }
   }
-  
+
   // Enforce constraints for START_CODON state
-  // START_CODON should primarily transition to EXON_F0 (after 3 bp of start codon)
+  // START_CODON should primarily transition to EXON_F0 (after 3 bp of start
+  // codon)
   int start_row = STATE_START_CODON;
   double start_sum = 0.0;
   for (int col = 0; col < NUM_STATES; col++) {
@@ -2319,7 +2322,7 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
       model->transition[start_row][col] /= start_sum;
     }
   }
-  
+
   // Enforce constraints for STOP_CODON state
   // STOP_CODON should primarily transition to INTERGENIC or INTRON
   int stop_row = STATE_STOP_CODON;
@@ -2333,7 +2336,8 @@ static void enforce_exon_cycle_constraints(HMMModel* model) {
     model->transition[stop_row][STATE_INTRON] = 0.1;
     model->transition[stop_row][STATE_STOP_CODON] = 0.09; // self-loop for 3bp
     for (int col = 0; col < NUM_STATES; col++) {
-      if (col != STATE_INTERGENIC && col != STATE_INTRON && col != STATE_STOP_CODON)
+      if (col != STATE_INTERGENIC && col != STATE_INTRON &&
+          col != STATE_STOP_CODON)
         model->transition[stop_row][col] = 0.01 / (NUM_STATES - 3);
     }
   }
@@ -3721,7 +3725,7 @@ static void handle_train(int argc, char* argv[]) {
     fprintf(stderr, "Warning: Failed to train splice PWM model\n");
   }
 
-  const int kBaumWelchMaxIterations = 50; // FIXME
+  const int kBaumWelchMaxIterations = 5; // FIXME
   const double kBaumWelchThreshold = 10.0;
 
   fprintf(

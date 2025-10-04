@@ -991,7 +991,7 @@ static double lognormal_log_pdf(int duration, double mean_log_duration,
 double hmm_viterbi(const HMMModel* model, double** observations,
                    const char* sequence, int seq_len, int* states) {
   // HSMM Viterbi with segment-based processing
-  const int MAX_DURATION = 2000; // Maximum segment duration to consider
+  const int MAX_DURATION = 10000; // Maximum segment duration to consider
 
   // Allocate Viterbi matrices
   // delta[t][j] = max log-probability of path ending at position t in state j
@@ -1130,12 +1130,72 @@ double hmm_viterbi(const HMMModel* model, double** observations,
             if (delta[prev_pos][i] <= -INFINITY)
               continue;
 
+            // Compute base transition log
             double transition_log =
                 hmm_safe_log(model->transition[i][segment_entry_state]);
+
+            /*
+             * Enforce exact start/stop codon checks by directly examining the
+             * nucleotide sequence at the transition position (start_pos).
+             * If entering START_CODON or STOP_CODON, require the underlying
+             * 3-nt codon to match the expected motif(s). On match, provide a
+             * very large bonus (large positive log-probability). On mismatch,
+             * set the transition probability to zero (log = -INFINITY).
+             */
+            const double kHugeBonus = 1e1; // very large log-probability bonus
+            int codon_pos = start_pos;     // transition occurs at segment start
+
+            if (segment_entry_state == STATE_START_CODON) {
+              // Need 3 bases starting at codon_pos
+              if (codon_pos + 3 <= seq_len) {
+                char b0 = normalize_base(sequence[codon_pos]);
+                char b1 = normalize_base(sequence[codon_pos + 1]);
+                char b2 = normalize_base(sequence[codon_pos + 2]);
+                if (is_strict_dna_base(b0) && is_strict_dna_base(b1) &&
+                    is_strict_dna_base(b2) && b0 == 'A' && b1 == 'T' &&
+                    b2 == 'G') {
+                  transition_log =
+                      hmm_safe_log(model->transition[i][segment_entry_state]) +
+                      kHugeBonus;
+                } else {
+                  transition_log = -INFINITY; // hard penalty for mismatch
+                }
+              } else {
+                transition_log =
+                    -INFINITY; // out-of-bounds -> treat as mismatch
+              }
+            } else if (segment_entry_state == STATE_STOP_CODON) {
+              if (codon_pos + 3 <= seq_len) {
+                char b0 = normalize_base(sequence[codon_pos]);
+                char b1 = normalize_base(sequence[codon_pos + 1]);
+                char b2 = normalize_base(sequence[codon_pos + 2]);
+                if (is_strict_dna_base(b0) && is_strict_dna_base(b1) &&
+                    is_strict_dna_base(b2)) {
+                  // Check for TAA, TAG, or TGA
+                  if ((b0 == 'T' && b1 == 'A' && b2 == 'A') ||
+                      (b0 == 'T' && b1 == 'A' && b2 == 'G') ||
+                      (b0 == 'T' && b1 == 'G' && b2 == 'A')) {
+                    transition_log =
+                        hmm_safe_log(
+                            model->transition[i][segment_entry_state]) +
+                        kHugeBonus;
+                  } else {
+                    transition_log = -INFINITY;
+                  }
+                } else {
+                  transition_log = -INFINITY;
+                }
+              } else {
+                transition_log = -INFINITY;
+              }
+            }
+
             // Add splice signal adjustment at the transition point (t-d+1)
-            transition_log += splice_signal_adjustment(sequence, seq_len, i,
-                                                       segment_entry_state,
-                                                       t - d + 1, &model->pwm);
+            if (isfinite(transition_log) && transition_log > -INFINITY / 2.0) {
+              transition_log += splice_signal_adjustment(
+                  sequence, seq_len, i, segment_entry_state, t - d + 1,
+                  &model->pwm);
+            }
 
             double score = delta[prev_pos][i] + transition_log +
                            segment_log_prob + duration_prob;
