@@ -16,7 +16,6 @@ cat > test_integration.toml << 'EOF'
 [model]
 d_model = 32
 num_encoder_layers = 1
-num_decoder_layers = 1
 num_heads = 2
 d_ff = 64
 

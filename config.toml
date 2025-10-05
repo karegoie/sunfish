@@ -2,17 +2,16 @@
 
 [model]
 # Model dimension - must be divisible by num_heads
-d_model = 512
+d_model = 64
 
 # Number of encoder and decoder layers
-num_encoder_layers = 6
-num_decoder_layers = 6
+num_encoder_layers = 4
 
 # Number of attention heads
-num_heads = 8
+num_heads = 2
 
 # Feed-forward network dimension
-d_ff = 2048
+d_ff = 64
 
 [training]
 # Dropout rate for regularization
@@ -33,11 +32,11 @@ weight_decay = 0.0
 
 [parallel]
 # Number of threads for parallel computation
-num_threads = 4
+num_threads = 96
 
 [cwt]
 # CWT scales for wavelet feature extraction
-scales = [2.0, 4.0, 8.0, 16.0, 32.0]
+scales = [3.0, 4.0, 5.0, 10.0, 27.0, 81.0, 100.0]
 
 [sliding_window]
 # Sliding window configuration for training and prediction
