@@ -8,7 +8,7 @@ d_model = 64
 num_encoder_layers = 4
 
 # Number of attention heads
-num_heads = 2
+num_heads = 3
 
 # Feed-forward network dimension
 d_ff = 64
@@ -40,8 +40,8 @@ scales = [3.0, 4.0, 5.0, 10.0, 27.0, 81.0, 100.0]
 
 [sliding_window]
 # Sliding window configuration for training and prediction
-window_size = 5000
-window_overlap = 1000
+window_size = 500
+window_overlap = 100
 
 [paths]
 # Input/output file paths
