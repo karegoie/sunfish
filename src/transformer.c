@@ -2512,8 +2512,9 @@ static double process_sequence_window(TransformerModel* model,
     matrix_free(grad_current);
     free(grad_logits_data);
 
-    adam_optimizer_step(model->optimizer, model->config->learning_rate, 0.9,
-                        0.999, 1e-8, model->training_step);
+    adam_optimizer_step(model->optimizer, model->config->learning_rate, 
+                        model->config->adam_beta1, model->config->adam_beta2, 
+                        model->config->adam_epsilon, model->training_step);
     model->training_step++;
   } else {
     // Inference: convert logits to probabilities (softmax in-place)

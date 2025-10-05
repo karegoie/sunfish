@@ -17,6 +17,11 @@ typedef struct {
   // (Removed deprecated max_seq_length; sliding window fields below replace it)
   int batch_size; // Batch size for training
   int num_epochs; // Number of training epochs
+  
+  // Adam optimizer parameters
+  double adam_beta1;   // Adam optimizer beta1 (first moment decay)
+  double adam_beta2;   // Adam optimizer beta2 (second moment decay)
+  double adam_epsilon; // Adam optimizer epsilon (numerical stability)
 
   // Parallelization
   int num_threads; // Number of threads for parallel computation

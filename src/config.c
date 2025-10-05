@@ -17,6 +17,11 @@ void config_init_defaults(TransformerConfig* config) {
   config->num_threads = 4;
   config->num_labels = 3; // exon, intron, intergenic
 
+  // Adam optimizer defaults
+  config->adam_beta1 = 0.9;
+  config->adam_beta2 = 0.999;
+  config->adam_epsilon = 1e-8;
+
   // Sliding window defaults
   config->window_size = 5000;
   config->window_overlap = 1000;
@@ -100,6 +105,19 @@ bool config_load(const char* filename, TransformerConfig* config) {
     d = toml_int_in(training, "num_epochs");
     if (d.ok)
       config->num_epochs = d.u.i;
+    
+    // Parse Adam optimizer parameters
+    d = toml_double_in(training, "adam_beta1");
+    if (d.ok)
+      config->adam_beta1 = d.u.d;
+    
+    d = toml_double_in(training, "adam_beta2");
+    if (d.ok)
+      config->adam_beta2 = d.u.d;
+    
+    d = toml_double_in(training, "adam_epsilon");
+    if (d.ok)
+      config->adam_epsilon = d.u.d;
   }
 
   // Parse parallel section
