@@ -19,12 +19,10 @@ num_encoder_layers = 1
 num_decoder_layers = 1
 num_heads = 2
 d_ff = 64
-vocab_size = 4
-max_seq_length = 500
 
 [training]
 dropout_rate = 0.1
-learning_rate = 0.001
+learning_rate = 0.01
 batch_size = 4
 num_epochs = 10
 
@@ -32,7 +30,7 @@ num_epochs = 10
 num_threads = 2
 
 [cwt]
-scales = [2.0, 4.0]
+scales = [3.0, 4.0, 5.0, 10.0, 100.0]
 
 [sliding_window]
 window_size = 200
