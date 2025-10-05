@@ -22,8 +22,8 @@ typedef struct {
   // Parallelization
   int num_threads;       // Number of threads for parallel computation
   
-  // Input/Output
-  int vocab_size;        // Vocabulary size (e.g., 4 for DNA bases)
+  // Classification
+  int num_labels;        // Number of output labels (3 for exon/intron/intergenic)
   
   // CWT Feature Extraction
   int num_cwt_scales;    // Number of wavelet scales

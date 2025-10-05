@@ -14,9 +14,6 @@ num_heads = 8
 # Feed-forward network dimension
 d_ff = 2048
 
-# Vocabulary size (4 for DNA: A, C, G, T)
-vocab_size = 4
-
 # Maximum sequence length (deprecated, use sliding window instead)
 max_seq_length = 5000
 

@@ -17,7 +17,7 @@ void config_init_defaults(TransformerConfig* config) {
   config->batch_size = 32;
   config->num_epochs = 10;
   config->num_threads = 4;
-  config->vocab_size = 4; // A, C, G, T
+  config->num_labels = 3; // exon, intron, intergenic
   
   // Sliding window defaults
   config->window_size = 5000;
@@ -79,9 +79,6 @@ bool config_load(const char* filename, TransformerConfig* config) {
     
     d = toml_int_in(model, "d_ff");
     if (d.ok) config->d_ff = d.u.i;
-    
-    d = toml_int_in(model, "vocab_size");
-    if (d.ok) config->vocab_size = d.u.i;
     
     d = toml_int_in(model, "max_seq_length");
     if (d.ok) config->max_seq_length = d.u.i;

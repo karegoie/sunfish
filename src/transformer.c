@@ -8,6 +8,7 @@
 #include "../include/transformer.h"
 #include "../include/cwt.h"
 #include "../include/fasta_parser.h"
+#include "../include/gff_parser.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -766,12 +767,10 @@ TransformerModel* transformer_create(const TransformerConfig* config) {
   memcpy(&model->config, config, sizeof(TransformerConfig));
   model->num_threads = config->num_threads;
   
-  // Initialize embeddings
-  double emb_scale = sqrt(2.0 / config->d_model);
-  model->src_embedding = matrix_create(config->vocab_size, config->d_model);
-  model->tgt_embedding = matrix_create(config->vocab_size, config->d_model);
-  matrix_random_init(model->src_embedding, emb_scale);
-  matrix_random_init(model->tgt_embedding, emb_scale);
+  // We no longer use src_embedding and tgt_embedding
+  // The model works directly with CWT features
+  model->src_embedding = NULL;
+  model->tgt_embedding = NULL;
   
   // Initialize CWT projection
   int cwt_dim = config->num_cwt_scales * 2;
@@ -799,9 +798,9 @@ TransformerModel* transformer_create(const TransformerConfig* config) {
         config->d_model, config->num_heads, config->d_ff, config->dropout_rate);
   }
   
-  // Final layer norm and output projection
+  // Final layer norm and output projection (for token classification)
   model->final_norm = layer_norm_create(config->d_model);
-  model->output_projection = matrix_create(config->d_model, config->vocab_size);
+  model->output_projection = matrix_create(config->d_model, config->num_labels);
   matrix_random_init(model->output_projection, sqrt(2.0 / config->d_model));
   
   model->threads = NULL;
@@ -812,6 +811,7 @@ TransformerModel* transformer_create(const TransformerConfig* config) {
 void transformer_free(TransformerModel* model) {
   if (!model) return;
   
+  // src_embedding and tgt_embedding are now NULL, but check anyway
   matrix_free(model->src_embedding);
   matrix_free(model->tgt_embedding);
   matrix_free(model->cwt_projection);
@@ -1013,26 +1013,26 @@ void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
 // ============================================================================
 
 double cross_entropy_loss(const Matrix* predictions, const int* targets, 
-                         int batch_size, int vocab_size) {
+                         int batch_size, int num_labels) {
   double total_loss = 0.0;
 
   for (int b = 0; b < batch_size; b++) {
     int target = targets[b];
-    if (target < 0 || target >= vocab_size) continue;
+    if (target < 0 || target >= num_labels) continue;
 
     // Get prediction for target class
-    double pred = predictions->data[b * vocab_size + target];
+    double pred = predictions->data[b * num_labels + target];
     
     // Apply log-softmax for numerical stability
     double max_pred = -1e9;
-    for (int v = 0; v < vocab_size; v++) {
-      double val = predictions->data[b * vocab_size + v];
+    for (int v = 0; v < num_labels; v++) {
+      double val = predictions->data[b * num_labels + v];
       if (val > max_pred) max_pred = val;
     }
 
     double sum_exp = 0.0;
-    for (int v = 0; v < vocab_size; v++) {
-      sum_exp += exp(predictions->data[b * vocab_size + v] - max_pred);
+    for (int v = 0; v < num_labels; v++) {
+      sum_exp += exp(predictions->data[b * num_labels + v] - max_pred);
     }
 
     double log_softmax = pred - max_pred - log(sum_exp);
@@ -1048,139 +1048,232 @@ double cross_entropy_loss(const Matrix* predictions, const int* targets,
 
 bool transformer_train(TransformerModel* model, const char* train_fasta,
                       const char* train_gff) {
-  fprintf(stderr, "=== Transformer Training ===\n");
+  fprintf(stderr, "=== Transformer Training with Token Classification ===\n");
   fprintf(stderr, "Training data: %s, %s\n", train_fasta, train_gff);
-  fprintf(stderr, "Model: d_model=%d, heads=%d, layers=%d/%d\n",
+  fprintf(stderr, "Model: d_model=%d, heads=%d, layers=%d\n",
           model->config.d_model, model->config.num_heads,
-          model->config.num_encoder_layers, model->config.num_decoder_layers);
+          model->config.num_encoder_layers);
+  fprintf(stderr, "Labels: %d classes (intergenic=0, intron=1, exon=2)\n", model->config.num_labels);
   fprintf(stderr, "CWT: %d scales\n", model->config.num_cwt_scales);
   fprintf(stderr, "Learning rate: %.6f, Epochs: %d\n",
           model->config.learning_rate, model->config.num_epochs);
   fprintf(stderr, "Sliding window: size=%d, overlap=%d\n",
           model->config.window_size, model->config.window_overlap);
 
-  // Parse FASTA file
+  // Parse FASTA and GFF files
   FastaData* fasta = parse_fasta(train_fasta);
   if (!fasta) {
     fprintf(stderr, "Error: Failed to parse FASTA file\n");
     return false;
   }
-
   fprintf(stderr, "Loaded %d sequences from FASTA\n", fasta->count);
 
-  // Create optimizers for learnable parameters
-  // For simplicity, we'll track total parameter count
-  int cwt_proj_params = (model->config.num_cwt_scales * 2) * model->config.d_model;
+  GFFData* gff = parse_gff(train_gff);
+  if (!gff) {
+    fprintf(stderr, "Error: Failed to parse GFF file\n");
+    free_fasta_data(fasta);
+    return false;
+  }
 
-  // For each epoch
+  // Training loop
   for (int epoch = 0; epoch < model->config.num_epochs; epoch++) {
     fprintf(stderr, "\n=== Epoch %d/%d ===\n", epoch + 1, model->config.num_epochs);
     double epoch_loss = 0.0;
     int num_windows = 0;
+    int num_exon_tokens = 0;
+    int num_intron_tokens = 0;
+    int num_intergenic_tokens = 0;
 
     // Process each sequence with sliding window
     for (int seq_idx = 0; seq_idx < fasta->count; seq_idx++) {
+      const char* seq_id = fasta->records[seq_idx].id;
       const char* sequence = fasta->records[seq_idx].sequence;
       int seq_len = strlen(sequence);
 
-      if (seq_len < 10) continue;  // Skip very short sequences
+      if (seq_len < 10) continue;
 
-      fprintf(stderr, "Processing sequence %d/%d (length=%d)...\r",
-              seq_idx + 1, fasta->count, seq_len);
+      fprintf(stderr, "Seq %d/%d: %s (len=%d)...\r",
+              seq_idx + 1, fasta->count, seq_id, seq_len);
 
-      // Use sliding window approach
-      int window_size = model->config.window_size;
-      int window_overlap = model->config.window_overlap;
-      int step = window_size - window_overlap;
-      
-      if (step <= 0) {
-        step = window_size; // No overlap if invalid configuration
+      // Process forward strand
+      int* labels = (int*)malloc(seq_len * sizeof(int));
+      if (!create_labels_from_gff(gff, seq_id, seq_len, '+', labels)) {
+        fprintf(stderr, "Warning: Failed to create labels for %s (+)\n", seq_id);
+        free(labels);
+        continue;
       }
 
-      // Process windows
+      // Process windows for forward strand
+      double fwd_loss = 0.0;
+      int fwd_windows = 0;
+      int window_size = model->config.window_size;
+      int window_overlap = model->config.window_overlap;
+      int step = (window_overlap > 0 && window_overlap < window_size) ? 
+                 (window_size - window_overlap) : window_size;
+
       for (int window_start = 0; window_start < seq_len; window_start += step) {
         int window_end = window_start + window_size;
-        if (window_end > seq_len) {
-          window_end = seq_len;
-        }
-        
+        if (window_end > seq_len) window_end = seq_len;
         int window_len = window_end - window_start;
-        if (window_len < 10) continue;  // Skip very short windows
+        if (window_len < 10) continue;
 
-        // Extract subsequence for this window
+        // Extract window
         char* window_seq = (char*)malloc((window_len + 1) * sizeof(char));
         strncpy(window_seq, sequence + window_start, window_len);
         window_seq[window_len] = '\0';
 
-        // Extract CWT features for the window
+        // Extract CWT features
         Matrix* features = NULL;
         if (!extract_cwt_features(window_seq, window_len, &model->config, &features)) {
           free(window_seq);
           continue;
         }
 
-        // Project CWT features to d_model dimension
-        Matrix* projected_features = matrix_create(window_len, model->config.d_model);
-        matrix_multiply_parallel(projected_features, features, model->cwt_projection,
-                                model->num_threads);
+        // Project features to d_model
+        Matrix* projected = matrix_create(window_len, model->config.d_model);
+        matrix_multiply_parallel(projected, features, model->cwt_projection, model->num_threads);
 
-        // Add positional encoding (wrap around if window is larger than max_seq_length)
+        // Add positional encoding
         for (int t = 0; t < window_len; t++) {
           int pos = t % model->config.max_seq_length;
           for (int d = 0; d < model->config.d_model; d++) {
-            projected_features->data[t * model->config.d_model + d] +=
+            projected->data[t * model->config.d_model + d] +=
                 model->pos_encoding->data[pos * model->config.d_model + d];
           }
         }
 
-        // Forward pass through encoder
-        Matrix* encoder_output = matrix_create(window_len, model->config.d_model);
-        matrix_copy(encoder_output, projected_features);
-
+        // Encode through encoder layers
+        Matrix* encoder_out = matrix_create(window_len, model->config.d_model);
+        matrix_copy(encoder_out, projected);
         for (int i = 0; i < model->config.num_encoder_layers; i++) {
-          Matrix* layer_output = matrix_create(window_len, model->config.d_model);
-          encoder_layer_forward(model->encoder_layers[i], layer_output,
-                               encoder_output, NULL, model->num_threads);
-          matrix_free(encoder_output);
-          encoder_output = layer_output;
+          Matrix* layer_out = matrix_create(window_len, model->config.d_model);
+          encoder_layer_forward(model->encoder_layers[i], layer_out, encoder_out, NULL, model->num_threads);
+          matrix_free(encoder_out);
+          encoder_out = layer_out;
         }
 
-        // Compute loss (simplified: measure norm of output as proxy)
-        // In a full implementation, this would compare to ground truth from GFF
-        double window_loss = 0.0;
+        // Project to label space
+        Matrix* logits = matrix_create(window_len, model->config.num_labels);
+        matrix_multiply_parallel(logits, encoder_out, model->output_projection, model->num_threads);
+
+        // Compute loss using cross-entropy
+        int* window_labels = &labels[window_start];
+        double window_loss = cross_entropy_loss(logits, window_labels, window_len, model->config.num_labels);
+        fwd_loss += window_loss;
+        fwd_windows++;
+
+        // Count label distribution
         for (int t = 0; t < window_len; t++) {
-          double sum = 0.0;
-          for (int d = 0; d < model->config.d_model; d++) {
-            double val = encoder_output->data[t * model->config.d_model + d];
-            sum += val * val;
-          }
-          window_loss += sqrt(sum) / window_len;
+          if (window_labels[t] == LABEL_EXON) num_exon_tokens++;
+          else if (window_labels[t] == LABEL_INTRON) num_intron_tokens++;
+          else num_intergenic_tokens++;
         }
-        
-        // Normalize loss to reasonable range
-        window_loss = window_loss / model->config.d_model;
-        
-        epoch_loss += window_loss;
-        num_windows++;
 
         free(window_seq);
         matrix_free(features);
-        matrix_free(projected_features);
-        matrix_free(encoder_output);
-        
-        // Break if this was the last window covering the end
+        matrix_free(projected);
+        matrix_free(encoder_out);
+        matrix_free(logits);
+
         if (window_end >= seq_len) break;
       }
+
+      epoch_loss += fwd_loss;
+      num_windows += fwd_windows;
+
+      // Generate reverse complement and process
+      char* rc_seq = reverse_complement(sequence);
+      if (rc_seq) {
+        int* rc_labels = (int*)malloc(seq_len * sizeof(int));
+        if (create_labels_from_gff(gff, seq_id, seq_len, '-', rc_labels)) {
+          // Reverse the labels to match reverse complement sequence
+          for (int i = 0; i < seq_len / 2; i++) {
+            int tmp = rc_labels[i];
+            rc_labels[i] = rc_labels[seq_len - 1 - i];
+            rc_labels[seq_len - 1 - i] = tmp;
+          }
+
+          // Process windows for reverse complement
+          double rc_loss = 0.0;
+          int rc_windows = 0;
+          for (int window_start = 0; window_start < seq_len; window_start += step) {
+            int window_end = window_start + window_size;
+            if (window_end > seq_len) window_end = seq_len;
+            int window_len = window_end - window_start;
+            if (window_len < 10) continue;
+
+            char* window_seq = (char*)malloc((window_len + 1) * sizeof(char));
+            strncpy(window_seq, rc_seq + window_start, window_len);
+            window_seq[window_len] = '\0';
+
+            Matrix* features = NULL;
+            if (!extract_cwt_features(window_seq, window_len, &model->config, &features)) {
+              free(window_seq);
+              continue;
+            }
+
+            Matrix* projected = matrix_create(window_len, model->config.d_model);
+            matrix_multiply_parallel(projected, features, model->cwt_projection, model->num_threads);
+
+            for (int t = 0; t < window_len; t++) {
+              int pos = t % model->config.max_seq_length;
+              for (int d = 0; d < model->config.d_model; d++) {
+                projected->data[t * model->config.d_model + d] +=
+                    model->pos_encoding->data[pos * model->config.d_model + d];
+              }
+            }
+
+            Matrix* encoder_out = matrix_create(window_len, model->config.d_model);
+            matrix_copy(encoder_out, projected);
+            for (int i = 0; i < model->config.num_encoder_layers; i++) {
+              Matrix* layer_out = matrix_create(window_len, model->config.d_model);
+              encoder_layer_forward(model->encoder_layers[i], layer_out, encoder_out, NULL, model->num_threads);
+              matrix_free(encoder_out);
+              encoder_out = layer_out;
+            }
+
+            Matrix* logits = matrix_create(window_len, model->config.num_labels);
+            matrix_multiply_parallel(logits, encoder_out, model->output_projection, model->num_threads);
+
+            int* window_labels = &rc_labels[window_start];
+            double window_loss = cross_entropy_loss(logits, window_labels, window_len, model->config.num_labels);
+            rc_loss += window_loss;
+            rc_windows++;
+
+            for (int t = 0; t < window_len; t++) {
+              if (window_labels[t] == LABEL_EXON) num_exon_tokens++;
+              else if (window_labels[t] == LABEL_INTRON) num_intron_tokens++;
+              else num_intergenic_tokens++;
+            }
+
+            free(window_seq);
+            matrix_free(features);
+            matrix_free(projected);
+            matrix_free(encoder_out);
+            matrix_free(logits);
+
+            if (window_end >= seq_len) break;
+          }
+
+          epoch_loss += rc_loss;
+          num_windows += rc_windows;
+        }
+        free(rc_labels);
+        free(rc_seq);
+      }
+
+      free(labels);
     }
 
     double avg_loss = num_windows > 0 ? epoch_loss / num_windows : 0.0;
-    fprintf(stderr, "\nEpoch %d: Average Loss = %.6f (%d windows)\n", 
-            epoch + 1, avg_loss, num_windows);
+    fprintf(stderr, "\nEpoch %d: Avg Loss=%.6f (%d windows)\n", epoch + 1, avg_loss, num_windows);
+    fprintf(stderr, "  Label distribution: exon=%d, intron=%d, intergenic=%d\n",
+            num_exon_tokens, num_intron_tokens, num_intergenic_tokens);
   }
 
+  free_gff_data(gff);
   free_fasta_data(fasta);
   fprintf(stderr, "\n=== Training completed! ===\n");
-  fprintf(stderr, "Model parameters: CWT projection (%d params)\n", cwt_proj_params);
   return true;
 }
 
@@ -1192,44 +1285,37 @@ void transformer_predict(TransformerModel* model, const char* input_file,
     return;
   }
   
-  fprintf(stderr, "=== Transformer Prediction ===\n");
+  fprintf(stderr, "=== Transformer Prediction with Token Classification ===\n");
   fprintf(stderr, "Input FASTA: %s\n", input_file);
   fprintf(stderr, "Output GFF: %s\n", output_file);
-  fprintf(stderr, "Sliding window: size=%d, overlap=%d\n",
-          model->config.window_size, model->config.window_overlap);
+  if (model->config.output_bedgraph) {
+    fprintf(stderr, "Output Bedgraph: %s\n", model->config.output_bedgraph);
+  }
   
-  // Parse FASTA file
   FastaData* fasta = parse_fasta(input_file);
   if (!fasta) {
     fprintf(stderr, "Error: Failed to parse FASTA file\n");
     return;
   }
-  
   fprintf(stderr, "Loaded %d sequences from FASTA\n", fasta->count);
   
-  // Open output files
   FILE* gff_fp = fopen(output_file, "w");
   if (!gff_fp) {
-    fprintf(stderr, "Error: Cannot open output GFF file '%s'\n", output_file);
+    fprintf(stderr, "Error: Cannot open output GFF file\n");
     free_fasta_data(fasta);
     return;
   }
-  
-  // Write GFF header
   fprintf(gff_fp, "##gff-version 3\n");
   
   FILE* bedgraph_fp = NULL;
   if (model->config.output_bedgraph) {
     bedgraph_fp = fopen(model->config.output_bedgraph, "w");
-    if (!bedgraph_fp) {
-      fprintf(stderr, "Warning: Cannot open output bedgraph file '%s'\n", 
-              model->config.output_bedgraph);
-    } else {
+    if (bedgraph_fp) {
       fprintf(bedgraph_fp, "track type=bedGraph name=\"Exon_Probability\"\n");
     }
   }
   
-  int gene_counter = 1;
+  int total_genes = 0;
   
   // Process each sequence
   for (int seq_idx = 0; seq_idx < fasta->count; seq_idx++) {
@@ -1237,164 +1323,362 @@ void transformer_predict(TransformerModel* model, const char* input_file,
     const char* sequence = fasta->records[seq_idx].sequence;
     int seq_len = strlen(sequence);
     
-    if (seq_len < 10) continue;  // Skip very short sequences
+    if (seq_len < 10) continue;
     
-    fprintf(stderr, "Predicting on sequence %d/%d: %s (length=%d)...\n",
+    fprintf(stderr, "Predicting %d/%d: %s (len=%d)...\n",
             seq_idx + 1, fasta->count, seq_id, seq_len);
     
-    // Allocate array to store exon probabilities for each position
-    double* exon_probs = (double*)calloc(seq_len, sizeof(double));
-    int* coverage = (int*)calloc(seq_len, sizeof(int));  // Track how many windows covered each position
+    // Compute exon probabilities for forward strand
+    double* fwd_exon_probs = (double*)calloc(seq_len, sizeof(double));
+    int* fwd_coverage = (int*)calloc(seq_len, sizeof(int));
     
-    // Use sliding window approach
     int window_size = model->config.window_size;
     int window_overlap = model->config.window_overlap;
-    int step = window_size - window_overlap;
+    int step = (window_overlap > 0 && window_overlap < window_size) ?
+               (window_size - window_overlap) : window_size;
     
-    if (step <= 0) {
-      step = window_size;
-    }
-    
-    // Process windows
-    int num_windows = 0;
     for (int window_start = 0; window_start < seq_len; window_start += step) {
       int window_end = window_start + window_size;
-      if (window_end > seq_len) {
-        window_end = seq_len;
-      }
-      
+      if (window_end > seq_len) window_end = seq_len;
       int window_len = window_end - window_start;
       if (window_len < 10) continue;
       
-      // Extract subsequence for this window
       char* window_seq = (char*)malloc((window_len + 1) * sizeof(char));
       strncpy(window_seq, sequence + window_start, window_len);
       window_seq[window_len] = '\0';
       
-      // Extract CWT features for the window
       Matrix* features = NULL;
       if (!extract_cwt_features(window_seq, window_len, &model->config, &features)) {
         free(window_seq);
         continue;
       }
       
-      // Project CWT features to d_model dimension
-      Matrix* projected_features = matrix_create(window_len, model->config.d_model);
-      matrix_multiply_parallel(projected_features, features, model->cwt_projection,
-                              model->num_threads);
+      Matrix* projected = matrix_create(window_len, model->config.d_model);
+      matrix_multiply_parallel(projected, features, model->cwt_projection, model->num_threads);
       
-      // Add positional encoding
       for (int t = 0; t < window_len; t++) {
         int pos = t % model->config.max_seq_length;
         for (int d = 0; d < model->config.d_model; d++) {
-          projected_features->data[t * model->config.d_model + d] +=
+          projected->data[t * model->config.d_model + d] +=
               model->pos_encoding->data[pos * model->config.d_model + d];
         }
       }
       
-      // Forward pass through encoder
-      Matrix* encoder_output = matrix_create(window_len, model->config.d_model);
-      matrix_copy(encoder_output, projected_features);
-      
+      Matrix* encoder_out = matrix_create(window_len, model->config.d_model);
+      matrix_copy(encoder_out, projected);
       for (int i = 0; i < model->config.num_encoder_layers; i++) {
-        Matrix* layer_output = matrix_create(window_len, model->config.d_model);
-        encoder_layer_forward(model->encoder_layers[i], layer_output,
-                             encoder_output, NULL, model->num_threads);
-        matrix_free(encoder_output);
-        encoder_output = layer_output;
+        Matrix* layer_out = matrix_create(window_len, model->config.d_model);
+        encoder_layer_forward(model->encoder_layers[i], layer_out, encoder_out, NULL, model->num_threads);
+        matrix_free(encoder_out);
+        encoder_out = layer_out;
       }
       
-      // Compute exon probability for each position in the window
-      // Use the encoder output norm as a proxy for exon probability
+      Matrix* logits = matrix_create(window_len, model->config.num_labels);
+      matrix_multiply_parallel(logits, encoder_out, model->output_projection, model->num_threads);
+      
+      // Compute exon probability using softmax
       for (int t = 0; t < window_len; t++) {
-        double sum = 0.0;
-        for (int d = 0; d < model->config.d_model; d++) {
-          double val = encoder_output->data[t * model->config.d_model + d];
-          sum += val * val;
+        double max_logit = logits->data[t * model->config.num_labels];
+        for (int c = 1; c < model->config.num_labels; c++) {
+          if (logits->data[t * model->config.num_labels + c] > max_logit) {
+            max_logit = logits->data[t * model->config.num_labels + c];
+          }
         }
         
-        // Normalize to [0, 1] range using sigmoid-like function
-        double norm = sqrt(sum) / model->config.d_model;
-        double prob = 1.0 / (1.0 + exp(-norm));
+        double sum_exp = 0.0;
+        for (int c = 0; c < model->config.num_labels; c++) {
+          sum_exp += exp(logits->data[t * model->config.num_labels + c] - max_logit);
+        }
+        
+        double exon_prob = exp(logits->data[t * model->config.num_labels + LABEL_EXON] - max_logit) / sum_exp;
         
         int global_pos = window_start + t;
         if (global_pos < seq_len) {
-          exon_probs[global_pos] += prob;
-          coverage[global_pos]++;
+          fwd_exon_probs[global_pos] += exon_prob;
+          fwd_coverage[global_pos]++;
         }
       }
       
-      num_windows++;
       free(window_seq);
       matrix_free(features);
-      matrix_free(projected_features);
-      matrix_free(encoder_output);
+      matrix_free(projected);
+      matrix_free(encoder_out);
+      matrix_free(logits);
       
       if (window_end >= seq_len) break;
     }
     
-    // Average probabilities across overlapping windows
+    // Average probabilities
     for (int i = 0; i < seq_len; i++) {
-      if (coverage[i] > 0) {
-        exon_probs[i] /= coverage[i];
+      if (fwd_coverage[i] > 0) {
+        fwd_exon_probs[i] /= fwd_coverage[i];
       }
     }
     
-    fprintf(stderr, "  Processed %d windows\n", num_windows);
+    // Compute exon probabilities for reverse complement
+    char* rc_seq = reverse_complement(sequence);
+    double* rc_exon_probs = (double*)calloc(seq_len, sizeof(double));
+    int* rc_coverage = (int*)calloc(seq_len, sizeof(int));
     
-    // Write bedgraph output if enabled
+    if (rc_seq) {
+      for (int window_start = 0; window_start < seq_len; window_start += step) {
+        int window_end = window_start + window_size;
+        if (window_end > seq_len) window_end = seq_len;
+        int window_len = window_end - window_start;
+        if (window_len < 10) continue;
+        
+        char* window_seq = (char*)malloc((window_len + 1) * sizeof(char));
+        strncpy(window_seq, rc_seq + window_start, window_len);
+        window_seq[window_len] = '\0';
+        
+        Matrix* features = NULL;
+        if (!extract_cwt_features(window_seq, window_len, &model->config, &features)) {
+          free(window_seq);
+          continue;
+        }
+        
+        Matrix* projected = matrix_create(window_len, model->config.d_model);
+        matrix_multiply_parallel(projected, features, model->cwt_projection, model->num_threads);
+        
+        for (int t = 0; t < window_len; t++) {
+          int pos = t % model->config.max_seq_length;
+          for (int d = 0; d < model->config.d_model; d++) {
+            projected->data[t * model->config.d_model + d] +=
+                model->pos_encoding->data[pos * model->config.d_model + d];
+          }
+        }
+        
+        Matrix* encoder_out = matrix_create(window_len, model->config.d_model);
+        matrix_copy(encoder_out, projected);
+        for (int i = 0; i < model->config.num_encoder_layers; i++) {
+          Matrix* layer_out = matrix_create(window_len, model->config.d_model);
+          encoder_layer_forward(model->encoder_layers[i], layer_out, encoder_out, NULL, model->num_threads);
+          matrix_free(encoder_out);
+          encoder_out = layer_out;
+        }
+        
+        Matrix* logits = matrix_create(window_len, model->config.num_labels);
+        matrix_multiply_parallel(logits, encoder_out, model->output_projection, model->num_threads);
+        
+        for (int t = 0; t < window_len; t++) {
+          double max_logit = logits->data[t * model->config.num_labels];
+          for (int c = 1; c < model->config.num_labels; c++) {
+            if (logits->data[t * model->config.num_labels + c] > max_logit) {
+              max_logit = logits->data[t * model->config.num_labels + c];
+            }
+          }
+          
+          double sum_exp = 0.0;
+          for (int c = 0; c < model->config.num_labels; c++) {
+            sum_exp += exp(logits->data[t * model->config.num_labels + c] - max_logit);
+          }
+          
+          double exon_prob = exp(logits->data[t * model->config.num_labels + LABEL_EXON] - max_logit) / sum_exp;
+          
+          // Map back to original sequence coordinates (reverse)
+          int global_pos = seq_len - 1 - (window_start + t);
+          if (global_pos >= 0 && global_pos < seq_len) {
+            rc_exon_probs[global_pos] += exon_prob;
+            rc_coverage[global_pos]++;
+          }
+        }
+        
+        free(window_seq);
+        matrix_free(features);
+        matrix_free(projected);
+        matrix_free(encoder_out);
+        matrix_free(logits);
+        
+        if (window_end >= seq_len) break;
+      }
+      
+      for (int i = 0; i < seq_len; i++) {
+        if (rc_coverage[i] > 0) {
+          rc_exon_probs[i] /= rc_coverage[i];
+        }
+      }
+      
+      free(rc_seq);
+    }
+    
+    // Write bedgraph for forward strand exon probabilities
     if (bedgraph_fp) {
       for (int i = 0; i < seq_len; i++) {
-        fprintf(bedgraph_fp, "%s\t%d\t%d\t%.6f\n", 
-                seq_id, i, i + 1, exon_probs[i]);
+        fprintf(bedgraph_fp, "%s\t%d\t%d\t%.6f\n", seq_id, i, i + 1, fwd_exon_probs[i]);
       }
     }
     
-    // Find exon regions (simple thresholding at 0.5)
+    // Identify genes from exon predictions (forward strand)
+    // Gene structure: consecutive exons form a gene (mRNA)
     double threshold = 0.5;
-    int in_exon = 0;
-    int exon_start = 0;
-    int exon_count = 0;
+    typedef struct {
+      int start, end;
+      double score;
+      char strand;
+    } Exon;
     
+    Exon* fwd_exons = (Exon*)malloc(seq_len * sizeof(Exon));
+    int fwd_exon_count = 0;
+    
+    int in_exon = 0, exon_start = 0;
     for (int i = 0; i <= seq_len; i++) {
-      int is_exon = (i < seq_len && exon_probs[i] >= threshold);
+      int is_exon = (i < seq_len && fwd_exon_probs[i] >= threshold);
       
       if (is_exon && !in_exon) {
-        // Start of new exon
         exon_start = i;
         in_exon = 1;
       } else if (!is_exon && in_exon) {
-        // End of exon
-        int exon_end = i - 1;
-        
-        // Write GFF entry (1-based coordinates)
-        fprintf(gff_fp, "%s\tsunfish\tgene\t%d\t%d\t%.2f\t+\t.\tID=gene%d\n",
-                seq_id, exon_start + 1, exon_end + 1, 
-                exon_probs[exon_start], gene_counter);
-        fprintf(gff_fp, "%s\tsunfish\texon\t%d\t%d\t%.2f\t+\t.\tID=gene%d.exon%d;Parent=gene%d\n",
-                seq_id, exon_start + 1, exon_end + 1,
-                exon_probs[exon_start], gene_counter, exon_count + 1, gene_counter);
-        
-        exon_count++;
+        fwd_exons[fwd_exon_count].start = exon_start;
+        fwd_exons[fwd_exon_count].end = i - 1;
+        fwd_exons[fwd_exon_count].strand = '+';
+        // Compute average score
+        double sum = 0;
+        for (int j = exon_start; j < i; j++) sum += fwd_exon_probs[j];
+        fwd_exons[fwd_exon_count].score = sum / (i - exon_start);
+        fwd_exon_count++;
         in_exon = 0;
       }
     }
     
-    if (exon_count > 0) {
-      gene_counter++;
+    // Identify genes from reverse complement
+    Exon* rc_exons = (Exon*)malloc(seq_len * sizeof(Exon));
+    int rc_exon_count = 0;
+    
+    in_exon = 0;
+    for (int i = 0; i <= seq_len; i++) {
+      int is_exon = (i < seq_len && rc_exon_probs[i] >= threshold);
+      
+      if (is_exon && !in_exon) {
+        exon_start = i;
+        in_exon = 1;
+      } else if (!is_exon && in_exon) {
+        rc_exons[rc_exon_count].start = exon_start;
+        rc_exons[rc_exon_count].end = i - 1;
+        rc_exons[rc_exon_count].strand = '-';
+        double sum = 0;
+        for (int j = exon_start; j < i; j++) sum += rc_exon_probs[j];
+        rc_exons[rc_exon_count].score = sum / (i - exon_start);
+        rc_exon_count++;
+        in_exon = 0;
+      }
     }
     
-    free(exon_probs);
-    free(coverage);
+    // Group consecutive exons into genes and resolve conflicts
+    typedef struct {
+      int start, end;
+      double score;
+      char strand;
+      int num_exons;
+    } Gene;
+    
+    Gene* genes = (Gene*)malloc((fwd_exon_count + rc_exon_count) * sizeof(Gene));
+    int gene_count = 0;
+    
+    // Forward strand genes
+    if (fwd_exon_count > 0) {
+      int gene_start = fwd_exons[0].start;
+      int gene_end = fwd_exons[0].end;
+      double gene_score_sum = fwd_exons[0].score * (fwd_exons[0].end - fwd_exons[0].start + 1);
+      int gene_exon_count = 1;
+      
+      for (int i = 1; i < fwd_exon_count; i++) {
+        gene_end = fwd_exons[i].end;
+        gene_score_sum += fwd_exons[i].score * (fwd_exons[i].end - fwd_exons[i].start + 1);
+        gene_exon_count++;
+      }
+      
+      genes[gene_count].start = gene_start;
+      genes[gene_count].end = gene_end;
+      genes[gene_count].score = gene_score_sum / (gene_end - gene_start + 1);
+      genes[gene_count].strand = '+';
+      genes[gene_count].num_exons = gene_exon_count;
+      gene_count++;
+    }
+    
+    // Reverse strand genes
+    if (rc_exon_count > 0) {
+      int gene_start = rc_exons[0].start;
+      int gene_end = rc_exons[0].end;
+      double gene_score_sum = rc_exons[0].score * (rc_exons[0].end - rc_exons[0].start + 1);
+      int gene_exon_count = 1;
+      
+      for (int i = 1; i < rc_exon_count; i++) {
+        gene_end = rc_exons[i].end;
+        gene_score_sum += rc_exons[i].score * (rc_exons[i].end - rc_exons[i].start + 1);
+        gene_exon_count++;
+      }
+      
+      genes[gene_count].start = gene_start;
+      genes[gene_count].end = gene_end;
+      genes[gene_count].score = gene_score_sum / (gene_end - gene_start + 1);
+      genes[gene_count].strand = '-';
+      genes[gene_count].num_exons = gene_exon_count;
+      gene_count++;
+    }
+    
+    // Resolve overlaps: keep gene with higher probability * length
+    for (int i = 0; i < gene_count; i++) {
+      if (genes[i].start < 0) continue;  // Already removed
+      
+      for (int j = i + 1; j < gene_count; j++) {
+        if (genes[j].start < 0) continue;
+        
+        // Check for overlap
+        if (!(genes[i].end < genes[j].start || genes[j].end < genes[i].start)) {
+          // Compute scores
+          double score_i = genes[i].score * (genes[i].end - genes[i].start + 1);
+          double score_j = genes[j].score * (genes[j].end - genes[j].start + 1);
+          
+          if (score_i > score_j) {
+            genes[j].start = -1;  // Mark for removal
+          } else {
+            genes[i].start = -1;
+            break;
+          }
+        }
+      }
+    }
+    
+    // Write genes to GFF
+    for (int i = 0; i < gene_count; i++) {
+      if (genes[i].start < 0) continue;
+      
+      int gene_id = total_genes + 1;
+      fprintf(gff_fp, "%s\tsunfish\tmRNA\t%d\t%d\t%.4f\t%c\t.\tID=gene%d\n",
+              seq_id, genes[i].start + 1, genes[i].end + 1,
+              genes[i].score, genes[i].strand, gene_id);
+      
+      // Write exons
+      Exon* exons = (genes[i].strand == '+') ? fwd_exons : rc_exons;
+      int exon_count = (genes[i].strand == '+') ? fwd_exon_count : rc_exon_count;
+      
+      int exon_num = 1;
+      for (int j = 0; j < exon_count; j++) {
+        if (exons[j].start >= genes[i].start && exons[j].end <= genes[i].end) {
+          fprintf(gff_fp, "%s\tsunfish\texon\t%d\t%d\t%.4f\t%c\t.\tID=gene%d.exon%d;Parent=gene%d\n",
+                  seq_id, exons[j].start + 1, exons[j].end + 1,
+                  exons[j].score, genes[i].strand, gene_id, exon_num, gene_id);
+          exon_num++;
+        }
+      }
+      
+      total_genes++;
+    }
+    
+    free(fwd_exons);
+    free(rc_exons);
+    free(genes);
+    free(fwd_exon_probs);
+    free(fwd_coverage);
+    free(rc_exon_probs);
+    free(rc_coverage);
   }
   
   fclose(gff_fp);
-  if (bedgraph_fp) {
-    fclose(bedgraph_fp);
-  }
-  
+  if (bedgraph_fp) fclose(bedgraph_fp);
   free_fasta_data(fasta);
-  fprintf(stderr, "Prediction completed! Predicted %d genes\n", gene_counter - 1);
+  
+  fprintf(stderr, "Prediction completed! Predicted %d genes\n", total_genes);
 }
 
 bool transformer_save(const TransformerModel* model, const char* filename) {
@@ -1421,7 +1705,7 @@ bool transformer_save(const TransformerModel* model, const char* filename) {
   fwrite(&model->config.num_decoder_layers, sizeof(int), 1, fp);
   fwrite(&model->config.num_heads, sizeof(int), 1, fp);
   fwrite(&model->config.d_ff, sizeof(int), 1, fp);
-  fwrite(&model->config.vocab_size, sizeof(int), 1, fp);
+  fwrite(&model->config.num_labels, sizeof(int), 1, fp);
   fwrite(&model->config.num_cwt_scales, sizeof(int), 1, fp);
   fwrite(model->config.cwt_scales, sizeof(double), model->config.num_cwt_scales, fp);
   
@@ -1432,9 +1716,7 @@ bool transformer_save(const TransformerModel* model, const char* filename) {
     fwrite((mat)->data, sizeof(double), (mat)->rows * (mat)->cols, fp); \
   } while(0)
   
-  // Write embeddings
-  WRITE_MATRIX(model->src_embedding);
-  WRITE_MATRIX(model->tgt_embedding);
+  // Write CWT projection and positional encoding (skip embeddings as they are NULL)
   WRITE_MATRIX(model->cwt_projection);
   WRITE_MATRIX(model->pos_encoding);
   
@@ -1527,13 +1809,13 @@ bool transformer_load(TransformerModel* model, const char* filename) {
   }
   
   // Read configuration
-  int d_model, num_encoder_layers, num_decoder_layers, num_heads, d_ff, vocab_size, num_cwt_scales;
+  int d_model, num_encoder_layers, num_decoder_layers, num_heads, d_ff, num_labels, num_cwt_scales;
   fread(&d_model, sizeof(int), 1, fp);
   fread(&num_encoder_layers, sizeof(int), 1, fp);
   fread(&num_decoder_layers, sizeof(int), 1, fp);
   fread(&num_heads, sizeof(int), 1, fp);
   fread(&d_ff, sizeof(int), 1, fp);
-  fread(&vocab_size, sizeof(int), 1, fp);
+  fread(&num_labels, sizeof(int), 1, fp);
   fread(&num_cwt_scales, sizeof(int), 1, fp);
   
   // Verify configuration matches
@@ -1542,16 +1824,16 @@ bool transformer_load(TransformerModel* model, const char* filename) {
       num_decoder_layers != model->config.num_decoder_layers ||
       num_heads != model->config.num_heads ||
       d_ff != model->config.d_ff ||
-      vocab_size != model->config.vocab_size ||
+      num_labels != model->config.num_labels ||
       num_cwt_scales != model->config.num_cwt_scales) {
     fprintf(stderr, "Error: Model configuration mismatch\n");
-    fprintf(stderr, "  Expected: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, vocab=%d, cwt=%d\n",
+    fprintf(stderr, "  Expected: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, labels=%d, cwt=%d\n",
             model->config.d_model, model->config.num_encoder_layers,
             model->config.num_decoder_layers, model->config.num_heads,
-            model->config.d_ff, model->config.vocab_size, model->config.num_cwt_scales);
-    fprintf(stderr, "  Got: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, vocab=%d, cwt=%d\n",
+            model->config.d_ff, model->config.num_labels, model->config.num_cwt_scales);
+    fprintf(stderr, "  Got: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, labels=%d, cwt=%d\n",
             d_model, num_encoder_layers, num_decoder_layers, num_heads,
-            d_ff, vocab_size, num_cwt_scales);
+            d_ff, num_labels, num_cwt_scales);
     fclose(fp);
     return false;
   }
@@ -1574,9 +1856,7 @@ bool transformer_load(TransformerModel* model, const char* filename) {
     fread((mat)->data, sizeof(double), rows * cols, fp); \
   } while(0)
   
-  // Read embeddings
-  READ_MATRIX(model->src_embedding);
-  READ_MATRIX(model->tgt_embedding);
+  // Read CWT projection and positional encoding (skip embeddings)
   READ_MATRIX(model->cwt_projection);
   READ_MATRIX(model->pos_encoding);
   
