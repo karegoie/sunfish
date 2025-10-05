@@ -957,6 +957,21 @@ void multihead_attention_backward(
   matrix_zero(grad_Q);
   matrix_zero(grad_K);
   matrix_zero(grad_V);
+  
+  // Temporary matrices for per-head gradients in head space
+  Matrix* grad_Q_head = matrix_create(seq_len, d_k);
+  Matrix* grad_K_head = matrix_create(seq_len, d_k);
+  Matrix* grad_V_head = matrix_create(seq_len, d_k);
+  if (!grad_Q_head || !grad_K_head || !grad_V_head) {
+    matrix_free(grad_Q_head);
+    matrix_free(grad_K_head);
+    matrix_free(grad_V_head);
+    matrix_free(grad_Q);
+    matrix_free(grad_K);
+    matrix_free(grad_V);
+    matrix_free(grad_concat);
+    return;
+  }
 
   for (int h = 0; h < num_heads; h++) {
     int head_offset = h * d_k;
@@ -968,14 +983,20 @@ void multihead_attention_backward(
       free(grad_scores);
       continue;
     }
+    
+    // Zero out per-head gradient matrices
+    matrix_zero(grad_Q_head);
+    matrix_zero(grad_K_head);
+    matrix_zero(grad_V_head);
 
+    // Compute grad_V for this head
     for (int i = 0; i < seq_len; i++) {
       const double* grad_out_row =
           &grad_concat->data[i * d_model + head_offset];
       for (int j = 0; j < seq_len; j++) {
         const double* v_row = &cache->V->data[j * d_model + head_offset];
         double prob = head_probs[i * seq_len + j];
-        double* grad_v_row = &grad_V->data[j * d_model + head_offset];
+        double* grad_v_row = &grad_V_head->data[j * d_k];
         double dot = 0.0;
         for (int k = 0; k < d_k; k++) {
           grad_v_row[k] += prob * grad_out_row[k];
@@ -985,6 +1006,7 @@ void multihead_attention_backward(
       }
     }
 
+    // Compute grad_scores from grad_probs (softmax backward)
     for (int i = 0; i < seq_len; i++) {
       const double* prob_row = &head_probs[i * seq_len];
       const double* grad_prob_row = &grad_probs[i * seq_len];
@@ -998,23 +1020,49 @@ void multihead_attention_backward(
       }
     }
 
+    // Compute grad_Q and grad_K for this head
     for (int i = 0; i < seq_len; i++) {
-      double* grad_q_row = &grad_Q->data[i * d_model + head_offset];
+      double* grad_q_row = &grad_Q_head->data[i * d_k];
       const double* q_row = &cache->Q->data[i * d_model + head_offset];
       for (int j = 0; j < seq_len; j++) {
         double g = grad_scores[i * seq_len + j];
         const double* k_row = &cache->K->data[j * d_model + head_offset];
-        double* grad_k_row = &grad_K->data[j * d_model + head_offset];
+        double* grad_k_row = &grad_K_head->data[j * d_k];
         for (int k = 0; k < d_k; k++) {
           grad_q_row[k] += g * k_row[k];
           grad_k_row[k] += g * q_row[k];
         }
       }
     }
+    
+    // Transform per-head gradients back and accumulate
+    // grad_Q += grad_Q_head * W_q_head^T (where W_q_head is the columns for this head)
+    // Since W_q is d_model x d_model, we extract the relevant d_k columns for each head
+    for (int i = 0; i < seq_len; i++) {
+      for (int j = 0; j < d_model; j++) {
+        double sum_q = 0.0, sum_k = 0.0, sum_v = 0.0;
+        for (int k = 0; k < d_k; k++) {
+          // W_q[j, head_offset + k] * grad_Q_head[i, k]
+          sum_q += mha->W_q->data[j * d_model + head_offset + k] * 
+                   grad_Q_head->data[i * d_k + k];
+          sum_k += mha->W_k->data[j * d_model + head_offset + k] * 
+                   grad_K_head->data[i * d_k + k];
+          sum_v += mha->W_v->data[j * d_model + head_offset + k] * 
+                   grad_V_head->data[i * d_k + k];
+        }
+        grad_Q->data[i * d_model + j] += sum_q;
+        grad_K->data[i * d_model + j] += sum_k;
+        grad_V->data[i * d_model + j] += sum_v;
+      }
+    }
 
     free(grad_probs);
     free(grad_scores);
   }
+  
+  matrix_free(grad_Q_head);
+  matrix_free(grad_K_head);
+  matrix_free(grad_V_head);
 
   if (opt) {
     if (mha->grad_offset_W_q >= 0)
@@ -1028,20 +1076,12 @@ void multihead_attention_backward(
                               grad_V);
   }
 
-  Matrix* W_q_T = matrix_create(d_model, d_model);
-  Matrix* W_k_T = matrix_create(d_model, d_model);
-  Matrix* W_v_T = matrix_create(d_model, d_model);
-  matrix_transpose(W_q_T, mha->W_q);
-  matrix_transpose(W_k_T, mha->W_k);
-  matrix_transpose(W_v_T, mha->W_v);
+  // Gradients have already been transformed back through W_q^T, W_k^T, W_v^T
+  // in the per-head loop above, so just copy them to the output
+  matrix_copy(grad_query, grad_Q);
+  matrix_copy(grad_key, grad_K);
+  matrix_copy(grad_value, grad_V);
 
-  matrix_multiply_parallel(grad_query, grad_Q, W_q_T, num_threads);
-  matrix_multiply_parallel(grad_key, grad_K, W_k_T, num_threads);
-  matrix_multiply_parallel(grad_value, grad_V, W_v_T, num_threads);
-
-  matrix_free(W_q_T);
-  matrix_free(W_k_T);
-  matrix_free(W_v_T);
   matrix_free(grad_concat);
   matrix_free(grad_Q);
   matrix_free(grad_K);
