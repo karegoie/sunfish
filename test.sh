@@ -22,9 +22,15 @@ d_ff = 64
 
 [training]
 dropout_rate = 0.1
-learning_rate = 0.001
 batch_size = 4
 num_epochs = 200
+
+[adam]
+learning_rate = 0.001
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1e-08
+weight_decay = 0.0
 
 [parallel]
 num_threads = 2

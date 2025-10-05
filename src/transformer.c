@@ -1839,7 +1839,7 @@ bool transformer_train(TransformerModel* model, const char* train_fasta,
           model->config->num_labels);
   fprintf(stderr, "CWT: %d scales\n", model->config->num_cwt_scales);
   fprintf(stderr, "Learning rate: %.6f, Epochs: %d\n",
-          model->config->learning_rate, model->config->num_epochs);
+          model->config->adam_learning_rate, model->config->num_epochs);
   fprintf(stderr, "Sliding window: size=%d, overlap=%d\n",
           model->config->window_size, model->config->window_overlap);
 
@@ -2515,7 +2515,7 @@ static double process_sequence_window(TransformerModel* model,
     matrix_free(grad_current);
     free(grad_logits_data);
 
-    adam_optimizer_step(model->optimizer, model->config->learning_rate,
+    adam_optimizer_step(model->optimizer, model->config->adam_learning_rate,
                         model->config->adam_beta1, model->config->adam_beta2,
                         model->config->adam_epsilon, model->training_step);
     model->training_step++;

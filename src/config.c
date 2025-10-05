@@ -11,7 +11,7 @@ void config_init_defaults(TransformerConfig* config) {
   config->num_heads = 8;
   config->d_ff = 2048;
   config->dropout_rate = 0.1;
-  config->learning_rate = 0.0001;
+  config->adam_learning_rate = 0.0001;
   config->batch_size = 32;
   config->num_epochs = 10;
   config->num_threads = 4;
@@ -21,6 +21,7 @@ void config_init_defaults(TransformerConfig* config) {
   config->adam_beta1 = 0.9;
   config->adam_beta2 = 0.999;
   config->adam_epsilon = 1e-8;
+  config->adam_weight_decay = 0.0;
 
   // Sliding window defaults
   config->window_size = 5000;
@@ -85,7 +86,8 @@ bool config_load(const char* filename, TransformerConfig* config) {
       config->d_ff = d.u.i;
   }
 
-  // Parse training section
+  // Parse training section (only training-related params; learning rate moved
+  // to [adam])
   toml_table_t* training = toml_table_in(conf, "training");
   if (training) {
     toml_datum_t d;
@@ -94,10 +96,6 @@ bool config_load(const char* filename, TransformerConfig* config) {
     if (d.ok)
       config->dropout_rate = d.u.d;
 
-    d = toml_double_in(training, "learning_rate");
-    if (d.ok)
-      config->learning_rate = d.u.d;
-
     d = toml_int_in(training, "batch_size");
     if (d.ok)
       config->batch_size = d.u.i;
@@ -105,16 +103,16 @@ bool config_load(const char* filename, TransformerConfig* config) {
     d = toml_int_in(training, "num_epochs");
     if (d.ok)
       config->num_epochs = d.u.i;
-    
-    // Parse Adam optimizer parameters
+
+    // Legacy support: if users put adam_* inside training, still read them
     d = toml_double_in(training, "adam_beta1");
     if (d.ok)
       config->adam_beta1 = d.u.d;
-    
+
     d = toml_double_in(training, "adam_beta2");
     if (d.ok)
       config->adam_beta2 = d.u.d;
-    
+
     d = toml_double_in(training, "adam_epsilon");
     if (d.ok)
       config->adam_epsilon = d.u.d;
@@ -194,6 +192,32 @@ bool config_load(const char* filename, TransformerConfig* config) {
     d = toml_string_in(paths, "model_path");
     if (d.ok)
       config->model_path = strdup(d.u.s);
+  }
+
+  // Parse adam section (optimizer-specific settings)
+  toml_table_t* adam = toml_table_in(conf, "adam");
+  if (adam) {
+    toml_datum_t d;
+
+    d = toml_double_in(adam, "learning_rate");
+    if (d.ok)
+      config->adam_learning_rate = d.u.d;
+
+    d = toml_double_in(adam, "beta1");
+    if (d.ok)
+      config->adam_beta1 = d.u.d;
+
+    d = toml_double_in(adam, "beta2");
+    if (d.ok)
+      config->adam_beta2 = d.u.d;
+
+    d = toml_double_in(adam, "epsilon");
+    if (d.ok)
+      config->adam_epsilon = d.u.d;
+
+    d = toml_double_in(adam, "weight_decay");
+    if (d.ok)
+      config->adam_weight_decay = d.u.d;
   }
 
   toml_free(conf);

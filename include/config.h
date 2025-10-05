@@ -12,16 +12,18 @@ typedef struct {
   int d_ff;               // Feed-forward dimension
 
   // Training parameters
-  double dropout_rate;  // Dropout rate
-  double learning_rate; // Learning rate
+  double dropout_rate; // Dropout rate
+  // Learning rate is now part of Adam optimizer settings
+  double adam_learning_rate; // Adam optimizer learning rate
   // (Removed deprecated max_seq_length; sliding window fields below replace it)
   int batch_size; // Batch size for training
   int num_epochs; // Number of training epochs
-  
+
   // Adam optimizer parameters
-  double adam_beta1;   // Adam optimizer beta1 (first moment decay)
-  double adam_beta2;   // Adam optimizer beta2 (second moment decay)
-  double adam_epsilon; // Adam optimizer epsilon (numerical stability)
+  double adam_beta1;        // Adam optimizer beta1 (first moment decay)
+  double adam_beta2;        // Adam optimizer beta2 (second moment decay)
+  double adam_epsilon;      // Adam optimizer epsilon (numerical stability)
+  double adam_weight_decay; // Optional weight decay (parsed from [adam])
 
   // Parallelization
   int num_threads; // Number of threads for parallel computation

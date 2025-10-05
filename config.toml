@@ -14,21 +14,22 @@ num_heads = 8
 # Feed-forward network dimension
 d_ff = 2048
 
-# Maximum sequence length (deprecated, use sliding window instead)
-max_seq_length = 5000
-
 [training]
 # Dropout rate for regularization
 dropout_rate = 0.1
-
-# Learning rate
-learning_rate = 0.0001
 
 # Batch size
 batch_size = 32
 
 # Number of training epochs
 num_epochs = 10
+
+[adam]
+learning_rate = 0.0001
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1e-08
+weight_decay = 0.0
 
 [parallel]
 # Number of threads for parallel computation
