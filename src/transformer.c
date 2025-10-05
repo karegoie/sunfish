@@ -9,6 +9,7 @@
 #include "../include/cwt.h"
 #include "../include/fasta_parser.h"
 #include "../include/gff_parser.h"
+#include "../include/thread_pool.h"
 #include "../include/transformer.h"
 
 #ifndef M_PI
@@ -240,7 +241,7 @@ typedef struct {
   int end_row;
 } MatMulThreadData;
 
-static void* matrix_multiply_thread(void* arg) {
+static void matrix_multiply_task(void* arg) {
   MatMulThreadData* data = (MatMulThreadData*)arg;
 
   for (int i = data->start_row; i < data->end_row; i++) {
@@ -253,8 +254,6 @@ static void* matrix_multiply_thread(void* arg) {
       data->result->data[i * data->result->cols + j] = sum;
     }
   }
-
-  return NULL;
 }
 
 void matrix_multiply_parallel(Matrix* result, const Matrix* a, const Matrix* b,
@@ -279,9 +278,18 @@ void matrix_multiply_parallel(Matrix* result, const Matrix* a, const Matrix* b,
     return;
   }
 
-  pthread_t* threads = (pthread_t*)malloc(num_threads * sizeof(pthread_t));
+  thread_pool_t* pool = thread_pool_create(num_threads);
+  if (!pool) {
+    fprintf(stderr, "Error: Failed to create thread pool\n");
+    return;
+  }
+
   MatMulThreadData* thread_data =
       (MatMulThreadData*)malloc(num_threads * sizeof(MatMulThreadData));
+  if (!thread_data) {
+    thread_pool_destroy(pool);
+    return;
+  }
 
   int rows_per_thread = a->rows / num_threads;
   int remaining_rows = a->rows % num_threads;
@@ -296,14 +304,11 @@ void matrix_multiply_parallel(Matrix* result, const Matrix* a, const Matrix* b,
         current_row + rows_per_thread + (t < remaining_rows ? 1 : 0);
     current_row = thread_data[t].end_row;
 
-    pthread_create(&threads[t], NULL, matrix_multiply_thread, &thread_data[t]);
+    thread_pool_add_task(pool, matrix_multiply_task, &thread_data[t]);
   }
 
-  for (int t = 0; t < num_threads; t++) {
-    pthread_join(threads[t], NULL);
-  }
-
-  free(threads);
+  thread_pool_wait(pool);
+  thread_pool_destroy(pool);
   free(thread_data);
 }
 
@@ -387,7 +392,7 @@ typedef struct {
   int end_row;
 } LayerNormThreadData;
 
-static void* layer_norm_thread(void* arg) {
+static void layer_norm_task(void* arg) {
   LayerNormThreadData* data = (LayerNormThreadData*)arg;
   const LayerNorm* ln = data->ln;
   Matrix* output = data->output;
@@ -416,8 +421,6 @@ static void* layer_norm_thread(void* arg) {
       out_row[j] = ln->gamma[j] * normalized + ln->beta[j];
     }
   }
-
-  return NULL;
 }
 
 void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input) {
@@ -432,22 +435,31 @@ void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input) {
                                 .input = input,
                                 .start_row = 0,
                                 .end_row = rows};
-    layer_norm_thread(&data);
+    layer_norm_task(&data);
     return;
   }
 
-  pthread_t* workers = (pthread_t*)malloc(threads * sizeof(pthread_t));
-  LayerNormThreadData* tdata =
-      (LayerNormThreadData*)malloc(threads * sizeof(LayerNormThreadData));
-  if (!workers || !tdata) {
-    free(workers);
-    free(tdata);
+  thread_pool_t* pool = thread_pool_create(threads);
+  if (!pool) {
     LayerNormThreadData data = {.ln = ln,
                                 .output = output,
                                 .input = input,
                                 .start_row = 0,
                                 .end_row = rows};
-    layer_norm_thread(&data);
+    layer_norm_task(&data);
+    return;
+  }
+
+  LayerNormThreadData* tdata =
+      (LayerNormThreadData*)malloc(threads * sizeof(LayerNormThreadData));
+  if (!tdata) {
+    thread_pool_destroy(pool);
+    LayerNormThreadData data = {.ln = ln,
+                                .output = output,
+                                .input = input,
+                                .start_row = 0,
+                                .end_row = rows};
+    layer_norm_task(&data);
     return;
   }
 
@@ -465,17 +477,13 @@ void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input) {
     tdata[active_threads].input = input;
     tdata[active_threads].start_row = start;
     tdata[active_threads].end_row = start + count;
-    pthread_create(&workers[active_threads], NULL, layer_norm_thread,
-                   &tdata[active_threads]);
+    thread_pool_add_task(pool, layer_norm_task, &tdata[active_threads]);
     start += count;
     active_threads++;
   }
 
-  for (int t = 0; t < active_threads; t++) {
-    pthread_join(workers[t], NULL);
-  }
-
-  free(workers);
+  thread_pool_wait(pool);
+  thread_pool_destroy(pool);
   free(tdata);
 }
 
@@ -563,7 +571,7 @@ typedef struct {
   double scale;
 } AttentionThreadData;
 
-static void* attention_compute_thread(void* arg) {
+static void attention_compute_task(void* arg) {
   AttentionThreadData* data = (AttentionThreadData*)arg;
 
   // Compute attention scores: Q * K^T
@@ -577,8 +585,6 @@ static void* attention_compute_thread(void* arg) {
       data->scores->data[i * data->scores->cols + j] = sum * data->scale;
     }
   }
-
-  return NULL;
 }
 
 void scaled_dot_product_attention(Matrix* output, const Matrix* Q,
@@ -604,37 +610,60 @@ void scaled_dot_product_attention(Matrix* output, const Matrix* Q,
     }
   } else {
     // Parallel computation
-    pthread_t* threads = (pthread_t*)malloc(num_threads * sizeof(pthread_t));
-    AttentionThreadData* thread_data =
-        (AttentionThreadData*)malloc(num_threads * sizeof(AttentionThreadData));
+    thread_pool_t* pool = thread_pool_create(num_threads);
+    if (!pool) {
+      // Fallback to single-threaded if pool creation fails
+      for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < K->rows; j++) {
+          double sum = 0.0;
+          for (int k = 0; k < d_k; k++) {
+            sum += Q->data[i * d_k + k] * K->data[j * d_k + k];
+          }
+          scores->data[i * K->rows + j] = sum * scale;
+        }
+      }
+    } else {
+      AttentionThreadData* thread_data =
+          (AttentionThreadData*)malloc(num_threads * sizeof(AttentionThreadData));
 
-    int rows_per_thread = seq_len / num_threads;
-    int remaining = seq_len % num_threads;
-    int current = 0;
+      if (!thread_data) {
+        thread_pool_destroy(pool);
+        // Fallback to single-threaded
+        for (int i = 0; i < seq_len; i++) {
+          for (int j = 0; j < K->rows; j++) {
+            double sum = 0.0;
+            for (int k = 0; k < d_k; k++) {
+              sum += Q->data[i * d_k + k] * K->data[j * d_k + k];
+            }
+            scores->data[i * K->rows + j] = sum * scale;
+          }
+        }
+      } else {
+        int rows_per_thread = seq_len / num_threads;
+        int remaining = seq_len % num_threads;
+        int current = 0;
 
-    for (int t = 0; t < num_threads; t++) {
-      thread_data[t].Q = Q;
-      thread_data[t].K = K;
-      thread_data[t].V = V;
-      thread_data[t].scores = scores;
-      thread_data[t].output = output;
-      thread_data[t].mask = mask;
-      thread_data[t].scale = scale;
-      thread_data[t].start_row = current;
-      thread_data[t].end_row =
-          current + rows_per_thread + (t < remaining ? 1 : 0);
-      current = thread_data[t].end_row;
+        for (int t = 0; t < num_threads; t++) {
+          thread_data[t].Q = Q;
+          thread_data[t].K = K;
+          thread_data[t].V = V;
+          thread_data[t].scores = scores;
+          thread_data[t].output = output;
+          thread_data[t].mask = mask;
+          thread_data[t].scale = scale;
+          thread_data[t].start_row = current;
+          thread_data[t].end_row =
+              current + rows_per_thread + (t < remaining ? 1 : 0);
+          current = thread_data[t].end_row;
 
-      pthread_create(&threads[t], NULL, attention_compute_thread,
-                     &thread_data[t]);
+          thread_pool_add_task(pool, attention_compute_task, &thread_data[t]);
+        }
+
+        thread_pool_wait(pool);
+        thread_pool_destroy(pool);
+        free(thread_data);
+      }
     }
-
-    for (int t = 0; t < num_threads; t++) {
-      pthread_join(threads[t], NULL);
-    }
-
-    free(threads);
-    free(thread_data);
   }
 
   // Apply mask if provided
