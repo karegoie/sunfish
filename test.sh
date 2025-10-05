@@ -8,11 +8,11 @@ echo ""
 
 # Create small test data
 echo "Creating test data..."
-cp data/NC_001133.9.first5kb.fasta /tmp/test_tiny.fasta
-cp data/NC_001133.9.first5kb.gff /tmp/test_tiny.gff
+cp data/NC_001133.9.first5kb.fasta test_tiny.fasta
+cp data/NC_001133.9.first5kb.gff test_tiny.gff
 
 # Create test configuration
-cat > /tmp/test_integration.toml << 'EOF'
+cat > test_integration.toml << 'EOF'
 [model]
 d_model = 32
 num_encoder_layers = 1
@@ -39,12 +39,12 @@ window_size = 200
 window_overlap = 40
 
 [paths]
-train_fasta = "/tmp/test_tiny.fasta"
-train_gff = "/tmp/test_tiny.gff"
-predict_fasta = "/tmp/test_tiny.fasta"
-output_gff = "/tmp/test_output.gff"
-output_bedgraph = "/tmp/test_output.bedgraph"
-model_path = "/tmp/test_model.bin"
+train_fasta = "test_tiny.fasta"
+train_gff = "test_tiny.gff"
+predict_fasta = "test_tiny.fasta"
+output_gff = "test_output.gff"
+output_bedgraph = "test_output.bedgraph"
+model_path = "test_model.bin"
 EOF
 
 echo "Test configuration created"
@@ -52,13 +52,13 @@ echo ""
 
 # Run training
 echo "=== Testing Training ==="
-./bin/sunfish train -c /tmp/test_integration.toml
+./bin/sunfish train -c test_integration.toml
 echo ""
 
 # Check if model was saved
-if [ -f /tmp/test_model.bin ]; then
+if [ -f test_model.bin ]; then
     echo "✓ Model file created successfully"
-    ls -lh /tmp/test_model.bin
+    ls -lh test_model.bin
 else
     echo "✗ Model file not found"
     exit 1
@@ -67,25 +67,25 @@ echo ""
 
 # Run prediction
 echo "=== Testing Prediction ==="
-./bin/sunfish predict -c /tmp/test_integration.toml
+./bin/sunfish predict -c test_integration.toml
 echo ""
 
 # Check outputs
 echo "=== Checking Outputs ==="
-if [ -f /tmp/test_output.gff ]; then
+if [ -f test_output.gff ]; then
     echo "✓ GFF output created"
-    echo "  GFF lines: $(wc -l < /tmp/test_output.gff)"
-    head -5 /tmp/test_output.gff
+    echo "  GFF lines: $(wc -l < test_output.gff)"
+    head -5 test_output.gff
 else
     echo "✗ GFF output not found"
     exit 1
 fi
 echo ""
 
-if [ -f /tmp/test_output.bedgraph ]; then
+if [ -f test_output.bedgraph ]; then
     echo "✓ Bedgraph output created"
-    echo "  Bedgraph lines: $(wc -l < /tmp/test_output.bedgraph)"
-    head -5 /tmp/test_output.bedgraph
+    echo "  Bedgraph lines: $(wc -l < test_output.bedgraph)"
+    head -5 test_output.bedgraph
 else
     echo "✗ Bedgraph output not found"
     exit 1
@@ -95,7 +95,7 @@ echo ""
 # Verify bedgraph format
 echo "=== Verifying Bedgraph Format ==="
 # Check that bedgraph has 4 columns: chr, start, end, score
-if head -2 /tmp/test_output.bedgraph | tail -1 | awk '{print NF}' | grep -q '^4$'; then
+if head -2 test_output.bedgraph | tail -1 | awk '{print NF}' | grep -q '^4$'; then
     echo "✓ Bedgraph has correct format (4 columns: chr, start, end, score)"
 else
     echo "✗ Bedgraph format incorrect"
@@ -103,8 +103,8 @@ else
 fi
 
 # Check that scores are probabilities (0-1)
-max_score=$(tail -n +2 /tmp/test_output.bedgraph | awk '{print $4}' | sort -rn | head -1)
-min_score=$(tail -n +2 /tmp/test_output.bedgraph | awk '{print $4}' | sort -n | head -1)
+max_score=$(tail -n +2 test_output.bedgraph | awk '{print $4}' | sort -rn | head -1)
+min_score=$(tail -n +2 test_output.bedgraph | awk '{print $4}' | sort -n | head -1)
 echo "  Score range: $min_score to $max_score"
 
 if awk -v max="$max_score" -v min="$min_score" 'BEGIN { exit (max <= 1.0000000001 && min >= -0.0000000001 ? 0 : 1) }'; then
@@ -116,12 +116,12 @@ fi
 echo ""
 
 # Clean up
-echo "=== Cleaning Up ==="
-rm -f /tmp/test_tiny.fasta /tmp/test_tiny.gff
-rm -f /tmp/test_integration.toml
-rm -f /tmp/test_model.bin
-rm -f /tmp/test_output.gff /tmp/test_output.bedgraph
-echo "Test files cleaned up"
+#echo "=== Cleaning Up ==="
+#rm -f test_tiny.fasta test_tiny.gff
+#rm -f test_integration.toml
+#rm -f test_model.bin
+#rm -f test_output.gff test_output.bedgraph
+#echo "Test files cleaned up"
 echo ""
 
 echo "=== All Tests Passed! ==="
