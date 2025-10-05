@@ -17,7 +17,7 @@ d_ff = 2048
 # Vocabulary size (4 for DNA: A, C, G, T)
 vocab_size = 4
 
-# Maximum sequence length
+# Maximum sequence length (deprecated, use sliding window instead)
 max_seq_length = 5000
 
 [training]
@@ -40,3 +40,17 @@ num_threads = 4
 [cwt]
 # CWT scales for wavelet feature extraction
 scales = [2.0, 4.0, 8.0, 16.0, 32.0]
+
+[sliding_window]
+# Sliding window configuration for training and prediction
+window_size = 5000
+window_overlap = 1000
+
+[paths]
+# Input/output file paths
+train_fasta = "data/NC_001133.9.fasta"
+train_gff = "data/NC_001133.9.gff"
+predict_fasta = "data/NC_001133.9.fasta"
+output_gff = "output.gff"
+output_bedgraph = "output.bedgraph"
+model_path = "sunfish.model"

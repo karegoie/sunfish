@@ -15,7 +15,7 @@ typedef struct {
   // Training parameters
   double dropout_rate;   // Dropout rate
   double learning_rate;  // Learning rate
-  int max_seq_length;    // Maximum sequence length
+  int max_seq_length;    // Maximum sequence length (deprecated, use sliding window)
   int batch_size;        // Batch size for training
   int num_epochs;        // Number of training epochs
   
@@ -28,6 +28,18 @@ typedef struct {
   // CWT Feature Extraction
   int num_cwt_scales;    // Number of wavelet scales
   double* cwt_scales;    // Array of scale values (dynamically allocated)
+  
+  // Sliding window configuration
+  int window_size;       // Window size for sliding window approach
+  int window_overlap;    // Overlap between consecutive windows
+  
+  // File paths
+  char* train_fasta;     // Training FASTA file path
+  char* train_gff;       // Training GFF file path
+  char* predict_fasta;   // Prediction FASTA file path
+  char* output_gff;      // Output GFF file path
+  char* output_bedgraph; // Output bedgraph file path
+  char* model_path;      // Model save/load path
   
 } TransformerConfig;
 
