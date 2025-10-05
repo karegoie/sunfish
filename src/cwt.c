@@ -48,15 +48,24 @@ static void wavelet_cache_destroy(void) {
 static const cplx* wavelet_cache_get(double scale, int length) {
   const double eps = 1e-9;
   pthread_mutex_lock(&g_wavelet_cache.mutex);
+  
+  // Search for existing entry
   for (int i = 0; i < g_wavelet_cache.count; i++) {
     WaveletCacheEntry* entry = &g_wavelet_cache.entries[i];
     if (entry->length == length && fabs(entry->scale - scale) < eps) {
-      const cplx* result = entry->values;
+      // Copy data while holding mutex to prevent race condition
+      cplx* result = (cplx*)malloc(length * sizeof(cplx));
+      if (!result) {
+        pthread_mutex_unlock(&g_wavelet_cache.mutex);
+        return NULL;
+      }
+      memcpy(result, entry->values, length * sizeof(cplx));
       pthread_mutex_unlock(&g_wavelet_cache.mutex);
       return result;
     }
   }
 
+  // Expand cache if needed
   if (g_wavelet_cache.count == g_wavelet_cache.capacity) {
     int new_capacity =
         (g_wavelet_cache.capacity == 0) ? 8 : g_wavelet_cache.capacity * 2;
@@ -70,6 +79,7 @@ static const cplx* wavelet_cache_get(double scale, int length) {
     g_wavelet_cache.capacity = new_capacity;
   }
 
+  // Generate new wavelet
   cplx* values = (cplx*)malloc(length * sizeof(cplx));
   if (!values) {
     pthread_mutex_unlock(&g_wavelet_cache.mutex);
@@ -77,12 +87,20 @@ static const cplx* wavelet_cache_get(double scale, int length) {
   }
   generate_morlet_wavelet(scale, length, values);
 
+  // Store in cache
   WaveletCacheEntry* new_entry =
       &g_wavelet_cache.entries[g_wavelet_cache.count++];
   new_entry->scale = scale;
   new_entry->length = length;
   new_entry->values = values;
-  const cplx* result = new_entry->values;
+  
+  // Return copy to caller
+  cplx* result = (cplx*)malloc(length * sizeof(cplx));
+  if (!result) {
+    pthread_mutex_unlock(&g_wavelet_cache.mutex);
+    return NULL;
+  }
+  memcpy(result, values, length * sizeof(cplx));
   pthread_mutex_unlock(&g_wavelet_cache.mutex);
   return result;
 }
@@ -214,6 +232,7 @@ bool compute_cwt_features(const char* sequence, int seq_len,
 
     if (!convolve_with_wavelet(signal, seq_len, wavelet, wavelet_len,
                                cwt_result)) {
+      free((void*)wavelet);
       free(signal);
       free(cwt_result);
       return false;
@@ -225,6 +244,8 @@ bool compute_cwt_features(const char* sequence, int seq_len,
       features[real_idx][i] = creal(cwt_result[i]);
       features[imag_idx][i] = cimag(cwt_result[i]);
     }
+    
+    free((void*)wavelet);
   }
 
   free(signal);
