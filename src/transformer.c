@@ -147,6 +147,65 @@ void matrix_copy(Matrix* dst, const Matrix* src) {
   memcpy(dst->data, src->data, src->rows * src->cols * sizeof(double));
 }
 
+static Matrix* matrix_clone(const Matrix* src) {
+  Matrix* dst = matrix_create(src->rows, src->cols);
+  if (!dst)
+    return NULL;
+  matrix_copy(dst, src);
+  return dst;
+}
+
+static Matrix* ensure_cache_matrix(Matrix** slot, int rows, int cols) {
+  if (!slot)
+    return NULL;
+  if (*slot && ((*slot)->rows != rows || (*slot)->cols != cols)) {
+    matrix_free(*slot);
+    *slot = NULL;
+  }
+  if (!*slot)
+    *slot = matrix_create(rows, cols);
+  return *slot;
+}
+
+static int register_matrix_param(AdamOptimizer* opt, Matrix* mat) {
+  if (!mat)
+    return -1;
+  return adam_optimizer_register_param(opt, mat->data, mat->rows * mat->cols);
+}
+
+static int register_vector_param(AdamOptimizer* opt, double* vec, int length) {
+  if (!vec || length <= 0)
+    return -1;
+  return adam_optimizer_register_param(opt, vec, length);
+}
+
+static void encoder_layer_cache_free(EncoderLayerCache* cache) {
+  if (!cache)
+    return;
+  matrix_free(cache->input);
+  matrix_free(cache->attn_pre_dropout);
+  matrix_free(cache->attn_dropout_mask);
+  if (cache->attn_cache.Q)
+    matrix_free(cache->attn_cache.Q);
+  if (cache->attn_cache.K)
+    matrix_free(cache->attn_cache.K);
+  if (cache->attn_cache.V)
+    matrix_free(cache->attn_cache.V);
+  if (cache->attn_cache.concat_output)
+    matrix_free(cache->attn_cache.concat_output);
+  free(cache->attn_cache.attn_probs);
+  cache->attn_cache.attn_probs = NULL;
+  matrix_free(cache->resid1);
+  matrix_free(cache->norm1_output);
+  matrix_free(cache->ff_cache.linear1);
+  matrix_free(cache->ff_cache.activation);
+  matrix_free(cache->ff_output_pre_dropout);
+  matrix_free(cache->ff_dropout_mask);
+  matrix_free(cache->resid2);
+  matrix_free(cache->output);
+  memset(cache, 0, sizeof(*cache));
+}
+
 void matrix_add(Matrix* result, const Matrix* a, const Matrix* b) {
   if (a->rows != b->rows || a->cols != b->cols || result->rows != a->rows ||
       result->cols != a->cols) {
@@ -306,6 +365,9 @@ LayerNorm* layer_norm_create(int d_model, int num_threads) {
     ln->beta[i] = 0.0;
   }
 
+  ln->grad_offset_gamma = -1;
+  ln->grad_offset_beta = -1;
+
   return ln;
 }
 
@@ -419,10 +481,18 @@ void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input) {
 
 void layer_norm_backward(LayerNorm* ln, Matrix* grad_input,
                          const Matrix* grad_output, const Matrix* input,
-                         const Matrix* output __attribute__((unused))) {
+                         const Matrix* output __attribute__((unused)),
+                         AdamOptimizer* opt) {
   int rows = input->rows;
   int d_model = ln->d_model;
   const double eps = 1e-6;
+
+  double* grad_gamma = (opt && ln->grad_offset_gamma >= 0)
+                           ? opt->gradients + ln->grad_offset_gamma
+                           : NULL;
+  double* grad_beta = (opt && ln->grad_offset_beta >= 0)
+                          ? opt->gradients + ln->grad_offset_beta
+                          : NULL;
 
   for (int i = 0; i < rows; i++) {
     const double* x_row = &input->data[i * d_model];
@@ -453,6 +523,10 @@ void layer_norm_backward(LayerNorm* ln, Matrix* grad_input,
       grad_norm[j] = grad_y[j] * ln->gamma[j];
       double x_centered = x_row[j] - mean;
       grad_var += grad_norm[j] * x_centered * (-0.5) * pow(std, -3.0);
+      if (grad_gamma)
+        grad_gamma[j] += grad_y[j] * (x_centered / std);
+      if (grad_beta)
+        grad_beta[j] += grad_y[j];
     }
 
     for (int j = 0; j < d_model; j++) {
@@ -635,6 +709,11 @@ MultiHeadAttention* multihead_attention_create(int d_model, int num_heads) {
   matrix_random_init(mha->W_v, scale);
   matrix_random_init(mha->W_o, scale);
 
+  mha->grad_offset_W_q = -1;
+  mha->grad_offset_W_k = -1;
+  mha->grad_offset_W_v = -1;
+  mha->grad_offset_W_o = -1;
+
   return mha;
 }
 
@@ -648,203 +727,220 @@ void multihead_attention_free(MultiHeadAttention* mha) {
   }
 }
 
-// Thread data for multi-head attention
-typedef struct {
-  MultiHeadAttention* mha;
-  Matrix* output;
-  const Matrix* query;
-  const Matrix* key;
-  const Matrix* value;
-  const Matrix* mask;
-  int head_id;
-} MHAThreadData;
-
-static void* multihead_attention_head_thread(void* arg) {
-  MHAThreadData* data = (MHAThreadData*)arg;
-  int seq_len = data->query->rows;
-  int d_k = data->mha->d_k;
-
-  int head_offset = data->head_id * d_k;
-  double scale = 1.0 / sqrt((double)d_k);
-  double* scores = (double*)malloc(seq_len * sizeof(double));
-  double* probs = (double*)malloc(seq_len * sizeof(double));
-  if (!scores || !probs) {
-    free(scores);
-    free(probs);
-    return NULL;
-  }
-
-  for (int i = 0; i < seq_len; i++) {
-    const double* q_row =
-        &data->query->data[i * data->mha->d_model + head_offset];
-    for (int j = 0; j < seq_len; j++) {
-      const double* k_row =
-          &data->key->data[j * data->mha->d_model + head_offset];
-      double sum = 0.0;
-      for (int k = 0; k < d_k; k++) {
-        sum += q_row[k] * k_row[k];
-      }
-      scores[j] = sum * scale;
-      if (data->mask) {
-        double mask_val = data->mask->data[i * data->mask->cols + j];
-        if (mask_val == 0.0)
-          scores[j] = -1e9;
-      }
-    }
-
-    double max_score = scores[0];
-    for (int j = 1; j < seq_len; j++) {
-      if (scores[j] > max_score)
-        max_score = scores[j];
-    }
-
-    double sum_exp = 0.0;
-    for (int j = 0; j < seq_len; j++) {
-      double val = exp(scores[j] - max_score);
-      probs[j] = val;
-      sum_exp += val;
-    }
-    for (int j = 0; j < seq_len; j++) {
-      probs[j] /= sum_exp;
-    }
-
-    double* out_row = &data->output->data[i * data->mha->d_model + head_offset];
-    memset(out_row, 0, d_k * sizeof(double));
-    for (int j = 0; j < seq_len; j++) {
-      const double* v_row =
-          &data->value->data[j * data->mha->d_model + head_offset];
-      double weight = probs[j];
-      for (int k = 0; k < d_k; k++) {
-        out_row[k] += weight * v_row[k];
-      }
-    }
-  }
-
-  free(scores);
-  free(probs);
-
-  return NULL;
-}
-
 void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
                                  const Matrix* query, const Matrix* key,
                                  const Matrix* value, const Matrix* mask,
-                                 int num_threads) {
+                                 int num_threads,
+                                 MultiHeadAttentionCache* cache) {
   int seq_len = query->rows;
+  int d_model = mha->d_model;
+  int d_k = mha->d_k;
+  int num_heads = mha->num_heads;
+  double scale = 1.0 / sqrt((double)d_k);
 
-  // Project inputs
-  Matrix* Q = matrix_create(seq_len, mha->d_model);
-  Matrix* K = matrix_create(seq_len, mha->d_model);
-  Matrix* V = matrix_create(seq_len, mha->d_model);
+  Matrix* Q = matrix_create(seq_len, d_model);
+  Matrix* K = matrix_create(seq_len, d_model);
+  Matrix* V = matrix_create(seq_len, d_model);
+  if (!Q || !K || !V) {
+    matrix_free(Q);
+    matrix_free(K);
+    matrix_free(V);
+    matrix_zero(output);
+    return;
+  }
 
   matrix_multiply_parallel(Q, query, mha->W_q, num_threads);
   matrix_multiply_parallel(K, key, mha->W_k, num_threads);
   matrix_multiply_parallel(V, value, mha->W_v, num_threads);
 
-  // Compute attention for each head in parallel
-  Matrix* concat_output = matrix_create(seq_len, mha->d_model);
+  Matrix* concat_output = matrix_create(seq_len, d_model);
   if (!concat_output) {
     matrix_free(Q);
     matrix_free(K);
     matrix_free(V);
+    matrix_zero(output);
     return;
   }
   matrix_zero(concat_output);
 
-  if (num_threads >= mha->num_heads) {
-    // Parallelize across heads
-    pthread_t* threads = (pthread_t*)malloc(mha->num_heads * sizeof(pthread_t));
-    MHAThreadData* thread_data =
-        (MHAThreadData*)malloc(mha->num_heads * sizeof(MHAThreadData));
-
-    if (!threads || !thread_data) {
-      free(threads);
-      free(thread_data);
-      for (int h = 0; h < mha->num_heads; h++) {
-        MHAThreadData data;
-        data.mha = mha;
-        data.output = concat_output;
-        data.query = Q;
-        data.key = K;
-        data.value = V;
-        data.mask = mask;
-        data.head_id = h;
-        multihead_attention_head_thread(&data);
-      }
-    } else {
-
-      for (int h = 0; h < mha->num_heads; h++) {
-        thread_data[h].mha = mha;
-        thread_data[h].output = concat_output;
-        thread_data[h].query = Q;
-        thread_data[h].key = K;
-        thread_data[h].value = V;
-        thread_data[h].mask = mask;
-        thread_data[h].head_id = h;
-
-        pthread_create(&threads[h], NULL, multihead_attention_head_thread,
-                       &thread_data[h]);
-      }
-
-      for (int h = 0; h < mha->num_heads; h++) {
-        pthread_join(threads[h], NULL);
-      }
-
-      free(threads);
-      free(thread_data);
+  if (cache) {
+    cache->Q = Q;
+    cache->K = K;
+    cache->V = V;
+    cache->concat_output = concat_output;
+    size_t prob_count = (size_t)num_heads * seq_len * seq_len;
+    cache->attn_probs = (double*)malloc(prob_count * sizeof(double));
+    if (!cache->attn_probs) {
+      fprintf(stderr,
+              "Error: Unable to allocate attention probability cache\n");
+      cache->Q = cache->K = cache->V = cache->concat_output = NULL;
+      matrix_free(Q);
+      matrix_free(K);
+      matrix_free(V);
+      matrix_free(concat_output);
+      matrix_zero(output);
+      return;
     }
-  } else {
-    // Sequential computation of heads
-    for (int h = 0; h < mha->num_heads; h++) {
-      MHAThreadData data;
-      data.mha = mha;
-      data.output = concat_output;
-      data.query = Q;
-      data.key = K;
-      data.value = V;
-      data.mask = mask;
-      data.head_id = h;
-
-      multihead_attention_head_thread(&data);
-    }
+    memset(cache->attn_probs, 0, prob_count * sizeof(double));
   }
 
-  // Final linear projection
+  double* prob_buffer = (double*)malloc(seq_len * sizeof(double));
+  if (!prob_buffer) {
+    if (cache) {
+      free(cache->attn_probs);
+      cache->attn_probs = NULL;
+      cache->Q = cache->K = cache->V = cache->concat_output = NULL;
+    }
+    matrix_free(Q);
+    matrix_free(K);
+    matrix_free(V);
+    matrix_free(concat_output);
+    matrix_zero(output);
+    return;
+  }
+
+  for (int h = 0; h < num_heads; h++) {
+    int head_offset = h * d_k;
+    Matrix* Q_head = matrix_create(seq_len, d_k);
+    Matrix* K_head = matrix_create(seq_len, d_k);
+    Matrix* V_head = matrix_create(seq_len, d_k);
+    if (!Q_head || !K_head || !V_head) {
+      matrix_free(Q_head);
+      matrix_free(K_head);
+      matrix_free(V_head);
+      continue;
+    }
+
+    for (int i = 0; i < seq_len; i++) {
+      memcpy(&Q_head->data[i * d_k], &Q->data[i * d_model + head_offset],
+             d_k * sizeof(double));
+      memcpy(&K_head->data[i * d_k], &K->data[i * d_model + head_offset],
+             d_k * sizeof(double));
+      memcpy(&V_head->data[i * d_k], &V->data[i * d_model + head_offset],
+             d_k * sizeof(double));
+    }
+
+    Matrix* K_head_T = matrix_create(d_k, seq_len);
+    Matrix* scores = matrix_create(seq_len, seq_len);
+    if (!K_head_T || !scores) {
+      matrix_free(Q_head);
+      matrix_free(K_head);
+      matrix_free(V_head);
+      matrix_free(K_head_T);
+      matrix_free(scores);
+      continue;
+    }
+
+    matrix_transpose(K_head_T, K_head);
+    matrix_multiply_parallel(scores, Q_head, K_head_T, num_threads);
+
+    double* head_probs =
+        cache ? &cache->attn_probs[h * seq_len * seq_len] : NULL;
+
+    for (int i = 0; i < seq_len; i++) {
+      double* score_row = &scores->data[i * seq_len];
+      double max_val = -1e9;
+      for (int j = 0; j < seq_len; j++) {
+        double val = score_row[j] * scale;
+        if (mask) {
+          double mask_val = mask->data[i * mask->cols + j];
+          if (mask_val == 0.0)
+            val = -1e9;
+        }
+        score_row[j] = val;
+        if (val > max_val)
+          max_val = val;
+      }
+
+      double sum_exp = 0.0;
+      for (int j = 0; j < seq_len; j++) {
+        double exp_val = exp(score_row[j] - max_val);
+        prob_buffer[j] = exp_val;
+        sum_exp += exp_val;
+      }
+      if (sum_exp <= 0.0)
+        sum_exp = 1.0;
+
+      double* out_row = &concat_output->data[i * d_model + head_offset];
+      memset(out_row, 0, sizeof(double) * d_k);
+
+      for (int j = 0; j < seq_len; j++) {
+        double prob = prob_buffer[j] / sum_exp;
+        if (head_probs)
+          head_probs[i * seq_len + j] = prob;
+        const double* v_row = &V_head->data[j * d_k];
+        for (int k = 0; k < d_k; k++) {
+          out_row[k] += prob * v_row[k];
+        }
+      }
+    }
+
+    matrix_free(Q_head);
+    matrix_free(K_head);
+    matrix_free(V_head);
+    matrix_free(K_head_T);
+    matrix_free(scores);
+  }
+
+  free(prob_buffer);
+
   matrix_multiply_parallel(output, concat_output, mha->W_o, num_threads);
 
-  matrix_free(Q);
-  matrix_free(K);
-  matrix_free(V);
-  matrix_free(concat_output);
+  if (!cache) {
+    matrix_free(Q);
+    matrix_free(K);
+    matrix_free(V);
+    matrix_free(concat_output);
+  }
 }
 
-void multihead_attention_backward(MultiHeadAttention* mha, Matrix* grad_query,
-                                  Matrix* grad_key, Matrix* grad_value,
-                                  const Matrix* grad_output,
-                                  const Matrix* query, const Matrix* key,
-                                  const Matrix* value, const Matrix* mask,
-                                  int num_threads) {
+static void accumulate_weight_gradient(double* grad_buffer, const Matrix* a,
+                                       const Matrix* b) {
+  // grad = a^T @ b
+  int rows = a->rows;
+  int a_cols = a->cols;
+  int b_cols = b->cols;
+  for (int i = 0; i < a_cols; i++) {
+    for (int j = 0; j < b_cols; j++) {
+      double sum = 0.0;
+      for (int r = 0; r < rows; r++) {
+        sum += a->data[r * a_cols + i] * b->data[r * b_cols + j];
+      }
+      grad_buffer[i * b_cols + j] += sum;
+    }
+  }
+}
+
+void multihead_attention_backward(
+    MultiHeadAttention* mha, Matrix* grad_query, Matrix* grad_key,
+    Matrix* grad_value, const Matrix* grad_output, const Matrix* query,
+    const Matrix* key, const Matrix* value, const Matrix* mask, int num_threads,
+    const MultiHeadAttentionCache* cache, AdamOptimizer* opt) {
+  (void)mask;
+  if (!cache || !cache->Q || !cache->K || !cache->V || !cache->concat_output ||
+      !cache->attn_probs)
+    return;
+
   int seq_len = query->rows;
   int d_model = mha->d_model;
+  int d_k = mha->d_k;
+  int num_heads = mha->num_heads;
+  double scale = 1.0 / sqrt((double)d_k);
 
-  // Forward pass to compute Q, K, V (needed for backward)
-  Matrix* Q = matrix_create(seq_len, d_model);
-  Matrix* K = matrix_create(seq_len, d_model);
-  Matrix* V = matrix_create(seq_len, d_model);
-  matrix_multiply_parallel(Q, query, mha->W_q, num_threads);
-  matrix_multiply_parallel(K, key, mha->W_k, num_threads);
-  matrix_multiply_parallel(V, value, mha->W_v, num_threads);
-
-  // Backward through output projection (concat @ W_o)
-  // grad_W_o = concat^T @ grad_output (accumulated in optimizer)
-  // grad_concat = grad_output @ W_o^T
   Matrix* grad_concat = matrix_create(seq_len, d_model);
-  Matrix* W_o_T = matrix_create(mha->W_o->cols, mha->W_o->rows);
+  if (!grad_concat)
+    return;
+
+  Matrix* W_o_T = matrix_create(d_model, d_model);
   matrix_transpose(W_o_T, mha->W_o);
   matrix_multiply_parallel(grad_concat, grad_output, W_o_T, num_threads);
   matrix_free(W_o_T);
 
-  // Initialize gradients for Q, K, V
+  if (opt && mha->grad_offset_W_o >= 0) {
+    double* grad_W_o = opt->gradients + mha->grad_offset_W_o;
+    accumulate_weight_gradient(grad_W_o, cache->concat_output, grad_output);
+  }
+
   Matrix* grad_Q = matrix_create(seq_len, d_model);
   Matrix* grad_K = matrix_create(seq_len, d_model);
   Matrix* grad_V = matrix_create(seq_len, d_model);
@@ -852,108 +948,78 @@ void multihead_attention_backward(MultiHeadAttention* mha, Matrix* grad_query,
   matrix_zero(grad_K);
   matrix_zero(grad_V);
 
-  // Backward through each attention head
-  int d_k = d_model / mha->num_heads;
-  double scale = 1.0 / sqrt((double)d_k);
-
-  for (int h = 0; h < mha->num_heads; h++) {
+  for (int h = 0; h < num_heads; h++) {
     int head_offset = h * d_k;
-
-    // For each position in sequence
-    for (int i = 0; i < seq_len; i++) {
-      // Compute attention scores and probabilities (forward pass needed)
-      double* scores = (double*)malloc(seq_len * sizeof(double));
-      double* probs = (double*)malloc(seq_len * sizeof(double));
-
-      for (int j = 0; j < seq_len; j++) {
-        const double* q_row = &Q->data[i * d_model + head_offset];
-        const double* k_row = &K->data[j * d_model + head_offset];
-        double sum = 0.0;
-        for (int k = 0; k < d_k; k++) {
-          sum += q_row[k] * k_row[k];
-        }
-        scores[j] = sum * scale;
-        if (mask) {
-          double mask_val = mask->data[i * mask->cols + j];
-          if (mask_val == 0.0)
-            scores[j] = -1e9;
-        }
-      }
-
-      // Softmax
-      double max_score = scores[0];
-      for (int j = 1; j < seq_len; j++) {
-        if (scores[j] > max_score)
-          max_score = scores[j];
-      }
-      double sum_exp = 0.0;
-      for (int j = 0; j < seq_len; j++) {
-        probs[j] = exp(scores[j] - max_score);
-        sum_exp += probs[j];
-      }
-      for (int j = 0; j < seq_len; j++) {
-        probs[j] /= sum_exp;
-      }
-
-      // Backward through attention
-      const double* grad_out = &grad_concat->data[i * d_model + head_offset];
-
-      // grad_V: sum over all positions that attended to this value
-      for (int j = 0; j < seq_len; j++) {
-        double* grad_v_row = &grad_V->data[j * d_model + head_offset];
-        for (int k = 0; k < d_k; k++) {
-          grad_v_row[k] += probs[j] * grad_out[k];
-        }
-      }
-
-      // grad_probs = grad_output @ V^T
-      double* grad_probs = (double*)calloc(seq_len, sizeof(double));
-      for (int j = 0; j < seq_len; j++) {
-        const double* v_row = &V->data[j * d_model + head_offset];
-        for (int k = 0; k < d_k; k++) {
-          grad_probs[j] += grad_out[k] * v_row[k];
-        }
-      }
-
-      // Backward through softmax
-      double* grad_scores = (double*)calloc(seq_len, sizeof(double));
-      for (int j = 0; j < seq_len; j++) {
-        for (int k = 0; k < seq_len; k++) {
-          double indicator = (j == k) ? 1.0 : 0.0;
-          grad_scores[j] += grad_probs[k] * probs[k] * (indicator - probs[j]);
-        }
-      }
-
-      // Backward through scaled dot product
-      for (int j = 0; j < seq_len; j++) {
-        grad_scores[j] *= scale;
-      }
-
-      // grad_Q and grad_K
-      double* grad_q_row = &grad_Q->data[i * d_model + head_offset];
-      for (int j = 0; j < seq_len; j++) {
-        const double* k_row = &K->data[j * d_model + head_offset];
-        double* grad_k_row = &grad_K->data[j * d_model + head_offset];
-        for (int k = 0; k < d_k; k++) {
-          grad_q_row[k] += grad_scores[j] * k_row[k];
-          grad_k_row[k] += grad_scores[j] *
-                           Q->data[i * d_model + head_offset + k];
-        }
-      }
-
-      free(scores);
-      free(probs);
+    const double* head_probs = &cache->attn_probs[h * seq_len * seq_len];
+    double* grad_probs = (double*)calloc(seq_len * seq_len, sizeof(double));
+    double* grad_scores = (double*)calloc(seq_len * seq_len, sizeof(double));
+    if (!grad_probs || !grad_scores) {
       free(grad_probs);
       free(grad_scores);
+      continue;
     }
+
+    for (int i = 0; i < seq_len; i++) {
+      const double* grad_out_row =
+          &grad_concat->data[i * d_model + head_offset];
+      for (int j = 0; j < seq_len; j++) {
+        const double* v_row = &cache->V->data[j * d_model + head_offset];
+        double prob = head_probs[i * seq_len + j];
+        double* grad_v_row = &grad_V->data[j * d_model + head_offset];
+        double dot = 0.0;
+        for (int k = 0; k < d_k; k++) {
+          grad_v_row[k] += prob * grad_out_row[k];
+          dot += grad_out_row[k] * v_row[k];
+        }
+        grad_probs[i * seq_len + j] += dot;
+      }
+    }
+
+    for (int i = 0; i < seq_len; i++) {
+      double row_sum = 0.0;
+      for (int j = 0; j < seq_len; j++) {
+        row_sum += grad_probs[i * seq_len + j] * head_probs[i * seq_len + j];
+      }
+      for (int j = 0; j < seq_len; j++) {
+        double p = head_probs[i * seq_len + j];
+        grad_scores[i * seq_len + j] =
+            (grad_probs[i * seq_len + j] - row_sum) * p * scale;
+      }
+    }
+
+    for (int i = 0; i < seq_len; i++) {
+      double* grad_q_row = &grad_Q->data[i * d_model + head_offset];
+      const double* q_row = &cache->Q->data[i * d_model + head_offset];
+      for (int j = 0; j < seq_len; j++) {
+        double g = grad_scores[i * seq_len + j];
+        const double* k_row = &cache->K->data[j * d_model + head_offset];
+        double* grad_k_row = &grad_K->data[j * d_model + head_offset];
+        for (int k = 0; k < d_k; k++) {
+          grad_q_row[k] += g * k_row[k];
+          grad_k_row[k] += g * q_row[k];
+        }
+      }
+    }
+
+    free(grad_probs);
+    free(grad_scores);
   }
 
-  // Backward through input projections
-  // grad_W_q = query^T @ grad_Q
-  // grad_query = grad_Q @ W_q^T
-  Matrix* W_q_T = matrix_create(mha->W_q->cols, mha->W_q->rows);
-  Matrix* W_k_T = matrix_create(mha->W_k->cols, mha->W_k->rows);
-  Matrix* W_v_T = matrix_create(mha->W_v->cols, mha->W_v->rows);
+  if (opt) {
+    if (mha->grad_offset_W_q >= 0)
+      accumulate_weight_gradient(opt->gradients + mha->grad_offset_W_q, query,
+                                 grad_Q);
+    if (mha->grad_offset_W_k >= 0)
+      accumulate_weight_gradient(opt->gradients + mha->grad_offset_W_k, key,
+                                 grad_K);
+    if (mha->grad_offset_W_v >= 0)
+      accumulate_weight_gradient(opt->gradients + mha->grad_offset_W_v, value,
+                                 grad_V);
+  }
+
+  Matrix* W_q_T = matrix_create(d_model, d_model);
+  Matrix* W_k_T = matrix_create(d_model, d_model);
+  Matrix* W_v_T = matrix_create(d_model, d_model);
   matrix_transpose(W_q_T, mha->W_q);
   matrix_transpose(W_k_T, mha->W_k);
   matrix_transpose(W_v_T, mha->W_v);
@@ -962,16 +1028,13 @@ void multihead_attention_backward(MultiHeadAttention* mha, Matrix* grad_query,
   matrix_multiply_parallel(grad_key, grad_K, W_k_T, num_threads);
   matrix_multiply_parallel(grad_value, grad_V, W_v_T, num_threads);
 
-  matrix_free(Q);
-  matrix_free(K);
-  matrix_free(V);
+  matrix_free(W_q_T);
+  matrix_free(W_k_T);
+  matrix_free(W_v_T);
   matrix_free(grad_concat);
   matrix_free(grad_Q);
   matrix_free(grad_K);
   matrix_free(grad_V);
-  matrix_free(W_q_T);
-  matrix_free(W_k_T);
-  matrix_free(W_v_T);
 }
 
 // ============================================================================
@@ -1003,6 +1066,11 @@ FeedForward* feedforward_create(int d_model, int d_ff) {
   matrix_random_init(ff->W2, scale);
   matrix_zero(ff->b2);
 
+  ff->grad_offset_W1 = -1;
+  ff->grad_offset_b1 = -1;
+  ff->grad_offset_W2 = -1;
+  ff->grad_offset_b2 = -1;
+
   return ff;
 }
 
@@ -1025,105 +1093,185 @@ static void relu(Matrix* m) {
   }
 }
 
-static void apply_dropout(double* data, int count, double rate, bool training) {
-  if (!training || rate <= 0.0)
+static void apply_dropout(double* data, double* mask, int count, double rate,
+                          bool training) {
+  if (!training || rate <= 0.0) {
+    if (mask) {
+      for (int i = 0; i < count; i++)
+        mask[i] = 1.0;
+    }
     return;
+  }
 
   const double keep_prob = 1.0 - rate;
-  if (keep_prob <= 0.0)
+  if (keep_prob <= 0.0) {
+    if (mask)
+      memset(mask, 0, sizeof(double) * count);
+    memset(data, 0, sizeof(double) * count);
     return;
+  }
   const double scale = 1.0 / keep_prob;
 
   for (int i = 0; i < count; i++) {
     double r = (double)rand() / (double)RAND_MAX;
     if (r < rate) {
       data[i] = 0.0;
+      if (mask)
+        mask[i] = 0.0;
     } else {
       data[i] *= scale;
+      if (mask)
+        mask[i] = scale;
     }
   }
 }
 
+static void apply_dropout_backward(double* grad, const double* mask,
+                                   int count) {
+  if (!mask)
+    return;
+  for (int i = 0; i < count; i++) {
+    grad[i] *= mask[i];
+  }
+}
+
 void feedforward_forward(FeedForward* ff, Matrix* output, const Matrix* input,
-                         int num_threads) {
+                         int num_threads, FeedForwardCache* cache) {
   int seq_len = input->rows;
+  int d_ff = ff->d_ff;
 
-  // First layer: input * W1 + b1
-  Matrix* hidden = matrix_create(seq_len, ff->d_ff);
-  matrix_multiply_parallel(hidden, input, ff->W1, num_threads);
-
-  // Add bias
+  Matrix* linear1 = matrix_create(seq_len, d_ff);
+  if (!linear1) {
+    matrix_zero(output);
+    return;
+  }
+  matrix_multiply_parallel(linear1, input, ff->W1, num_threads);
   for (int i = 0; i < seq_len; i++) {
-    for (int j = 0; j < ff->d_ff; j++) {
-      hidden->data[i * ff->d_ff + j] += ff->b1->data[j];
+    for (int j = 0; j < d_ff; j++) {
+      linear1->data[i * d_ff + j] += ff->b1->data[j];
     }
   }
 
-  // ReLU activation
-  relu(hidden);
+  if (cache) {
+    Matrix* cache_linear1 = ensure_cache_matrix(&cache->linear1, seq_len, d_ff);
+    if (cache_linear1)
+      matrix_copy(cache_linear1, linear1);
+  }
 
-  // Second layer: hidden * W2 + b2
-  matrix_multiply_parallel(output, hidden, ff->W2, num_threads);
+  Matrix* activation = matrix_clone(linear1);
+  if (!activation) {
+    matrix_free(linear1);
+    matrix_zero(output);
+    return;
+  }
+  relu(activation);
 
-  // Add bias
+  if (cache) {
+    Matrix* cache_activation =
+        ensure_cache_matrix(&cache->activation, seq_len, d_ff);
+    if (cache_activation)
+      matrix_copy(cache_activation, activation);
+  }
+
+  matrix_multiply_parallel(output, activation, ff->W2, num_threads);
   for (int i = 0; i < seq_len; i++) {
     for (int j = 0; j < ff->d_model; j++) {
       output->data[i * ff->d_model + j] += ff->b2->data[j];
     }
   }
 
-  matrix_free(hidden);
+  matrix_free(linear1);
+  matrix_free(activation);
 }
 
 void feedforward_backward(FeedForward* ff, Matrix* grad_input,
                           const Matrix* grad_output, const Matrix* input,
-                          int num_threads) {
+                          int num_threads, const FeedForwardCache* cache,
+                          AdamOptimizer* opt) {
   int seq_len = input->rows;
   int d_ff = ff->d_ff;
 
-  // Forward pass to get hidden states (needed for ReLU backward)
-  Matrix* hidden = matrix_create(seq_len, d_ff);
-  matrix_multiply_parallel(hidden, input, ff->W1, num_threads);
-  for (int i = 0; i < seq_len; i++) {
-    for (int j = 0; j < d_ff; j++) {
-      hidden->data[i * d_ff + j] += ff->b1->data[j];
+  const Matrix* linear1 = cache ? cache->linear1 : NULL;
+  const Matrix* activation = cache ? cache->activation : NULL;
+  Matrix* linear1_local = NULL;
+  Matrix* activation_local = NULL;
+
+  if (!linear1) {
+    linear1_local = matrix_create(seq_len, d_ff);
+    if (!linear1_local)
+      return;
+    matrix_multiply_parallel(linear1_local, input, ff->W1, num_threads);
+    for (int i = 0; i < seq_len; i++) {
+      for (int j = 0; j < d_ff; j++) {
+        linear1_local->data[i * d_ff + j] += ff->b1->data[j];
+      }
+    }
+    linear1 = linear1_local;
+  }
+
+  if (!activation) {
+    activation_local = matrix_clone(linear1);
+    if (!activation_local) {
+      matrix_free(linear1_local);
+      return;
+    }
+    relu(activation_local);
+    activation = activation_local;
+  }
+
+  if (opt) {
+    if (ff->grad_offset_W2 >= 0)
+      accumulate_weight_gradient(opt->gradients + ff->grad_offset_W2,
+                                 activation, grad_output);
+    if (ff->grad_offset_b2 >= 0) {
+      double* grad_b2 = opt->gradients + ff->grad_offset_b2;
+      for (int j = 0; j < ff->d_model; j++) {
+        double sum = 0.0;
+        for (int i = 0; i < seq_len; i++) {
+          sum += grad_output->data[i * ff->d_model + j];
+        }
+        grad_b2[j] += sum;
+      }
     }
   }
 
-  // Create a copy before ReLU for gradient computation
-  Matrix* hidden_pre_relu = matrix_create(seq_len, d_ff);
-  matrix_copy(hidden_pre_relu, hidden);
-  relu(hidden);
-
-  // Backward through second layer (output = hidden @ W2 + b2)
-  // grad_W2 = hidden^T @ grad_output (accumulated in optimizer)
-  // grad_b2 = sum(grad_output, axis=0) (accumulated in optimizer)
-  // grad_hidden = grad_output @ W2^T
   Matrix* grad_hidden = matrix_create(seq_len, d_ff);
   Matrix* W2_T = matrix_create(ff->W2->cols, ff->W2->rows);
   matrix_transpose(W2_T, ff->W2);
   matrix_multiply_parallel(grad_hidden, grad_output, W2_T, num_threads);
   matrix_free(W2_T);
 
-  // Backward through ReLU
   for (int i = 0; i < seq_len * d_ff; i++) {
-    if (hidden_pre_relu->data[i] <= 0.0) {
+    if (linear1->data[i] <= 0.0)
       grad_hidden->data[i] = 0.0;
+  }
+
+  if (opt) {
+    if (ff->grad_offset_W1 >= 0)
+      accumulate_weight_gradient(opt->gradients + ff->grad_offset_W1, input,
+                                 grad_hidden);
+    if (ff->grad_offset_b1 >= 0) {
+      double* grad_b1 = opt->gradients + ff->grad_offset_b1;
+      for (int j = 0; j < d_ff; j++) {
+        double sum = 0.0;
+        for (int i = 0; i < seq_len; i++) {
+          sum += grad_hidden->data[i * d_ff + j];
+        }
+        grad_b1[j] += sum;
+      }
     }
   }
 
-  // Backward through first layer (hidden = input @ W1 + b1)
-  // grad_W1 = input^T @ grad_hidden (accumulated in optimizer)
-  // grad_b1 = sum(grad_hidden, axis=0) (accumulated in optimizer)
-  // grad_input = grad_hidden @ W1^T
   Matrix* W1_T = matrix_create(ff->W1->cols, ff->W1->rows);
   matrix_transpose(W1_T, ff->W1);
   matrix_multiply_parallel(grad_input, grad_hidden, W1_T, num_threads);
   matrix_free(W1_T);
 
-  matrix_free(hidden);
-  matrix_free(hidden_pre_relu);
   matrix_free(grad_hidden);
+  if (linear1_local)
+    matrix_free(linear1_local);
+  if (activation_local)
+    matrix_free(activation_local);
 }
 
 // ============================================================================
@@ -1158,34 +1306,99 @@ void encoder_layer_free(EncoderLayer* layer) {
 
 void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
                            const Matrix* input, const Matrix* mask,
-                           int num_threads, bool training) {
+                           int num_threads, bool training,
+                           EncoderLayerCache* cache) {
   int seq_len = input->rows;
   int d_model = input->cols;
 
-  // Self-attention
-  Matrix* attn_out = matrix_create(seq_len, d_model);
-  multihead_attention_forward(layer->self_attn, attn_out, input, input, input,
-                              mask, num_threads);
-  apply_dropout(attn_out->data, seq_len * d_model, layer->dropout_rate,
-                training);
+  if (cache) {
+    if (cache->attn_cache.Q)
+      matrix_free(cache->attn_cache.Q);
+    if (cache->attn_cache.K)
+      matrix_free(cache->attn_cache.K);
+    if (cache->attn_cache.V)
+      matrix_free(cache->attn_cache.V);
+    if (cache->attn_cache.concat_output)
+      matrix_free(cache->attn_cache.concat_output);
+    if (cache->attn_cache.attn_probs) {
+      free(cache->attn_cache.attn_probs);
+      cache->attn_cache.attn_probs = NULL;
+    }
+    Matrix* cached_input = ensure_cache_matrix(&cache->input, seq_len, d_model);
+    if (cached_input)
+      matrix_copy(cached_input, input);
+  }
 
-  // Residual + Norm1
+  Matrix* attn_out = matrix_create(seq_len, d_model);
+  MultiHeadAttentionCache* attn_cache_ptr = cache ? &cache->attn_cache : NULL;
+  multihead_attention_forward(layer->self_attn, attn_out, input, input, input,
+                              mask, num_threads, attn_cache_ptr);
+
+  if (cache) {
+    Matrix* pre_dropout =
+        ensure_cache_matrix(&cache->attn_pre_dropout, seq_len, d_model);
+    if (pre_dropout)
+      matrix_copy(pre_dropout, attn_out);
+  }
+
+  Matrix* attn_mask_matrix =
+      cache ? ensure_cache_matrix(&cache->attn_dropout_mask, seq_len, d_model)
+            : NULL;
+  apply_dropout(attn_out->data,
+                attn_mask_matrix ? attn_mask_matrix->data : NULL,
+                seq_len * d_model, layer->dropout_rate, training);
+
   Matrix* resid1 = matrix_create(seq_len, d_model);
   matrix_copy(resid1, input);
   matrix_add(resid1, resid1, attn_out);
+  if (cache) {
+    Matrix* cached_resid1 =
+        ensure_cache_matrix(&cache->resid1, seq_len, d_model);
+    if (cached_resid1)
+      matrix_copy(cached_resid1, resid1);
+  }
+
   Matrix* normed1 = matrix_create(seq_len, d_model);
   layer_norm_forward(layer->norm1, normed1, resid1);
+  if (cache) {
+    Matrix* norm_cache =
+        ensure_cache_matrix(&cache->norm1_output, seq_len, d_model);
+    if (norm_cache)
+      matrix_copy(norm_cache, normed1);
+  }
 
-  // Feed-forward
   Matrix* ff_out = matrix_create(seq_len, d_model);
-  feedforward_forward(layer->ff, ff_out, normed1, num_threads);
-  apply_dropout(ff_out->data, seq_len * d_model, layer->dropout_rate, training);
+  FeedForwardCache* ff_cache_ptr = cache ? &cache->ff_cache : NULL;
+  feedforward_forward(layer->ff, ff_out, normed1, num_threads, ff_cache_ptr);
+  if (cache) {
+    Matrix* ff_pre =
+        ensure_cache_matrix(&cache->ff_output_pre_dropout, seq_len, d_model);
+    if (ff_pre)
+      matrix_copy(ff_pre, ff_out);
+  }
 
-  // Residual + Norm2
+  Matrix* ff_mask_matrix =
+      cache ? ensure_cache_matrix(&cache->ff_dropout_mask, seq_len, d_model)
+            : NULL;
+  apply_dropout(ff_out->data, ff_mask_matrix ? ff_mask_matrix->data : NULL,
+                seq_len * d_model, layer->dropout_rate, training);
+
   Matrix* resid2 = matrix_create(seq_len, d_model);
   matrix_copy(resid2, normed1);
   matrix_add(resid2, resid2, ff_out);
+  if (cache) {
+    Matrix* resid2_cache =
+        ensure_cache_matrix(&cache->resid2, seq_len, d_model);
+    if (resid2_cache)
+      matrix_copy(resid2_cache, resid2);
+  }
+
   layer_norm_forward(layer->norm2, output, resid2);
+  if (cache) {
+    Matrix* out_cache = ensure_cache_matrix(&cache->output, seq_len, d_model);
+    if (out_cache)
+      matrix_copy(out_cache, output);
+  }
 
   matrix_free(attn_out);
   matrix_free(resid1);
@@ -1196,94 +1409,64 @@ void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
 
 void encoder_layer_backward(EncoderLayer* layer, Matrix* grad_input,
                             const Matrix* grad_output, const Matrix* input,
-                            const Matrix* mask, int num_threads) {
+                            const Matrix* mask, int num_threads,
+                            const EncoderLayerCache* cache,
+                            AdamOptimizer* opt) {
+  if (!cache)
+    return;
+
   int seq_len = input->rows;
   int d_model = input->cols;
 
-  // Recreate forward pass intermediate values (needed for backward)
-  Matrix* attn_out = matrix_create(seq_len, d_model);
-  multihead_attention_forward(layer->self_attn, attn_out, input, input, input,
-                              mask, num_threads);
-
-  Matrix* resid1 = matrix_create(seq_len, d_model);
-  matrix_copy(resid1, input);
-  matrix_add(resid1, resid1, attn_out);
-
-  Matrix* normed1 = matrix_create(seq_len, d_model);
-  layer_norm_forward(layer->norm1, normed1, resid1);
-
-  Matrix* ff_out = matrix_create(seq_len, d_model);
-  feedforward_forward(layer->ff, ff_out, normed1, num_threads);
-
-  Matrix* resid2 = matrix_create(seq_len, d_model);
-  matrix_copy(resid2, normed1);
-  matrix_add(resid2, resid2, ff_out);
-
-  // Backward pass starts here
-  // Step 1: Backward through Norm2 (output = Norm2(resid2))
   Matrix* grad_resid2 = matrix_create(seq_len, d_model);
-  Matrix* output = matrix_create(seq_len, d_model);
-  layer_norm_forward(layer->norm2, output, resid2);
-  layer_norm_backward(layer->norm2, grad_resid2, grad_output, resid2, output);
-  matrix_free(output);
+  layer_norm_backward(layer->norm2, grad_resid2, grad_output, cache->resid2,
+                      cache->output, opt);
 
-  // Step 2: Backward through residual connection (resid2 = normed1 + ff_out)
-  // Gradient flows to both normed1 and ff_out
-  Matrix* grad_ff_out = matrix_create(seq_len, d_model);
-  Matrix* grad_normed1_from_resid2 = matrix_create(seq_len, d_model);
-  matrix_copy(grad_ff_out, grad_resid2);
-  matrix_copy(grad_normed1_from_resid2, grad_resid2);
+  Matrix* grad_ff_out = matrix_clone(grad_resid2);
+  apply_dropout_backward(grad_ff_out->data,
+                         cache->ff_dropout_mask ? cache->ff_dropout_mask->data
+                                                : NULL,
+                         seq_len * d_model);
 
-  // Step 3: Backward through feedforward
   Matrix* grad_normed1_from_ff = matrix_create(seq_len, d_model);
-  feedforward_backward(layer->ff, grad_normed1_from_ff, grad_ff_out, normed1,
-                       num_threads);
+  feedforward_backward(layer->ff, grad_normed1_from_ff, grad_ff_out,
+                       cache->norm1_output, num_threads, &cache->ff_cache, opt);
 
-  // Step 4: Accumulate gradients for normed1
-  Matrix* grad_normed1 = matrix_create(seq_len, d_model);
-  matrix_copy(grad_normed1, grad_normed1_from_resid2);
+  Matrix* grad_normed1 = matrix_clone(grad_resid2);
   matrix_add_inplace(grad_normed1, grad_normed1_from_ff);
 
-  // Step 5: Backward through Norm1 (normed1 = Norm1(resid1))
   Matrix* grad_resid1 = matrix_create(seq_len, d_model);
-  layer_norm_backward(layer->norm1, grad_resid1, grad_normed1, resid1, normed1);
+  layer_norm_backward(layer->norm1, grad_resid1, grad_normed1, cache->resid1,
+                      cache->norm1_output, opt);
 
-  // Step 6: Backward through residual connection (resid1 = input + attn_out)
-  // Gradient flows to both input and attn_out
-  Matrix* grad_attn_out = matrix_create(seq_len, d_model);
+  Matrix* grad_attn = matrix_clone(grad_resid1);
+  apply_dropout_backward(
+      grad_attn->data,
+      cache->attn_dropout_mask ? cache->attn_dropout_mask->data : NULL,
+      seq_len * d_model);
+
+  Matrix* grad_from_attn_q = matrix_create(seq_len, d_model);
+  Matrix* grad_from_attn_k = matrix_create(seq_len, d_model);
+  Matrix* grad_from_attn_v = matrix_create(seq_len, d_model);
+  multihead_attention_backward(layer->self_attn, grad_from_attn_q,
+                               grad_from_attn_k, grad_from_attn_v, grad_attn,
+                               input, input, input, mask, num_threads,
+                               &cache->attn_cache, opt);
+
   matrix_copy(grad_input, grad_resid1);
-  matrix_copy(grad_attn_out, grad_resid1);
+  matrix_add_inplace(grad_input, grad_from_attn_q);
+  matrix_add_inplace(grad_input, grad_from_attn_k);
+  matrix_add_inplace(grad_input, grad_from_attn_v);
 
-  // Step 7: Backward through attention
-  Matrix* grad_input_from_attn = matrix_create(seq_len, d_model);
-  Matrix* grad_key = matrix_create(seq_len, d_model);
-  Matrix* grad_value = matrix_create(seq_len, d_model);
-  multihead_attention_backward(layer->self_attn, grad_input_from_attn, grad_key,
-                               grad_value, grad_attn_out, input, input, input,
-                               mask, num_threads);
-
-  // Step 8: Accumulate final gradient for input
-  // Since Q=K=V=input in self-attention, we need to sum all three gradients
-  matrix_add_inplace(grad_input, grad_input_from_attn);
-  matrix_add_inplace(grad_input, grad_key);
-  matrix_add_inplace(grad_input, grad_value);
-
-  // Free intermediate matrices
-  matrix_free(attn_out);
-  matrix_free(resid1);
-  matrix_free(normed1);
-  matrix_free(ff_out);
-  matrix_free(resid2);
   matrix_free(grad_resid2);
   matrix_free(grad_ff_out);
-  matrix_free(grad_normed1_from_resid2);
   matrix_free(grad_normed1_from_ff);
   matrix_free(grad_normed1);
   matrix_free(grad_resid1);
-  matrix_free(grad_attn_out);
-  matrix_free(grad_input_from_attn);
-  matrix_free(grad_key);
-  matrix_free(grad_value);
+  matrix_free(grad_attn);
+  matrix_free(grad_from_attn_q);
+  matrix_free(grad_from_attn_k);
+  matrix_free(grad_from_attn_v);
 }
 
 // ============================================================================
@@ -1317,9 +1500,80 @@ TransformerModel* transformer_create(TransformerConfig* config) {
   model->output_projection = matrix_create(config->d_model, config->num_labels);
   matrix_random_init(model->output_projection, sqrt(2.0 / config->d_model));
 
-  // Simplified parameter count for optimizer
-  int param_count = config->d_model * config->num_labels;
-  model->optimizer = adam_optimizer_create(param_count);
+  // Compute total parameter count
+  int total_params = 0;
+  total_params += model->cwt_projection->rows * model->cwt_projection->cols;
+  total_params +=
+      model->output_projection->rows * model->output_projection->cols;
+  for (int i = 0; i < config->num_encoder_layers; i++) {
+    EncoderLayer* layer = model->encoder_layers[i];
+    MultiHeadAttention* mha = layer->self_attn;
+    FeedForward* ff = layer->ff;
+    LayerNorm* norm1 = layer->norm1;
+    LayerNorm* norm2 = layer->norm2;
+
+    total_params += mha->W_q->rows * mha->W_q->cols;
+    total_params += mha->W_k->rows * mha->W_k->cols;
+    total_params += mha->W_v->rows * mha->W_v->cols;
+    total_params += mha->W_o->rows * mha->W_o->cols;
+
+    total_params += ff->W1->rows * ff->W1->cols;
+    total_params += ff->b1->rows * ff->b1->cols;
+    total_params += ff->W2->rows * ff->W2->cols;
+    total_params += ff->b2->rows * ff->b2->cols;
+
+    total_params += norm1->d_model * 2;
+    total_params += norm2->d_model * 2;
+  }
+
+  model->optimizer = adam_optimizer_create(total_params);
+  if (!model->optimizer) {
+    transformer_free(model);
+    return NULL;
+  }
+
+  model->grad_offset_cwt_projection =
+      register_matrix_param(model->optimizer, model->cwt_projection);
+
+  for (int i = 0; i < config->num_encoder_layers; i++) {
+    EncoderLayer* layer = model->encoder_layers[i];
+    MultiHeadAttention* mha = layer->self_attn;
+    FeedForward* ff = layer->ff;
+    LayerNorm* norm1 = layer->norm1;
+    LayerNorm* norm2 = layer->norm2;
+
+    mha->grad_offset_W_q = register_matrix_param(model->optimizer, mha->W_q);
+    mha->grad_offset_W_k = register_matrix_param(model->optimizer, mha->W_k);
+    mha->grad_offset_W_v = register_matrix_param(model->optimizer, mha->W_v);
+    mha->grad_offset_W_o = register_matrix_param(model->optimizer, mha->W_o);
+
+    ff->grad_offset_W1 = register_matrix_param(model->optimizer, ff->W1);
+    ff->grad_offset_b1 = register_matrix_param(model->optimizer, ff->b1);
+    ff->grad_offset_W2 = register_matrix_param(model->optimizer, ff->W2);
+    ff->grad_offset_b2 = register_matrix_param(model->optimizer, ff->b2);
+
+    norm1->grad_offset_gamma =
+        register_vector_param(model->optimizer, norm1->gamma, norm1->d_model);
+    norm1->grad_offset_beta =
+        register_vector_param(model->optimizer, norm1->beta, norm1->d_model);
+    norm2->grad_offset_gamma =
+        register_vector_param(model->optimizer, norm2->gamma, norm2->d_model);
+    norm2->grad_offset_beta =
+        register_vector_param(model->optimizer, norm2->beta, norm2->d_model);
+  }
+
+  model->grad_offset_output_projection =
+      register_matrix_param(model->optimizer, model->output_projection);
+
+  if (model->optimizer->used_params != model->optimizer->total_params) {
+    fprintf(stderr,
+            "Optimizer registration mismatch: expected %d, registered %d\n",
+            model->optimizer->total_params, model->optimizer->used_params);
+    transformer_free(model);
+    return NULL;
+  }
+
+  adam_optimizer_zero_grad(model->optimizer);
   model->training_step = 1;
 
   return model;
@@ -1372,7 +1626,7 @@ void transformer_forward(TransformerModel* model, Matrix* output,
   for (int i = 0; i < model->config->num_encoder_layers; i++) {
     Matrix* layer_output = matrix_create(seq_len, d_model);
     encoder_layer_forward(model->encoder_layers[i], layer_output,
-                          encoder_output, NULL, num_threads, false);
+                          encoder_output, NULL, num_threads, false, NULL);
     matrix_copy(encoder_output, layer_output);
     matrix_free(layer_output);
   }
@@ -1395,14 +1649,19 @@ void transformer_forward(TransformerModel* model, Matrix* output,
 // Adam Optimizer
 // ============================================================================
 
-AdamOptimizer* adam_optimizer_create(int param_count) {
+AdamOptimizer* adam_optimizer_create(int total_params) {
   AdamOptimizer* opt = (AdamOptimizer*)malloc(sizeof(AdamOptimizer));
   if (!opt)
     return NULL;
 
-  opt->gradients = (double*)calloc(param_count, sizeof(double));
-  opt->m = (double*)calloc(param_count, sizeof(double));
-  opt->v = (double*)calloc(param_count, sizeof(double));
+  opt->gradients = (double*)calloc(total_params, sizeof(double));
+  opt->m = (double*)calloc(total_params, sizeof(double));
+  opt->v = (double*)calloc(total_params, sizeof(double));
+  opt->views = NULL;
+  opt->total_params = total_params;
+  opt->used_params = 0;
+  opt->view_count = 0;
+  opt->view_capacity = 0;
 
   if (!opt->gradients || !opt->m || !opt->v) {
     adam_optimizer_free(opt);
@@ -1411,36 +1670,68 @@ AdamOptimizer* adam_optimizer_create(int param_count) {
   return opt;
 }
 
+void adam_optimizer_zero_grad(AdamOptimizer* opt) {
+  if (!opt || !opt->gradients)
+    return;
+  memset(opt->gradients, 0, sizeof(double) * opt->total_params);
+}
+
+int adam_optimizer_register_param(AdamOptimizer* opt, double* params,
+                                  int length) {
+  if (!opt || !params || length <= 0)
+    return -1;
+  if (opt->used_params + length > opt->total_params)
+    return -1;
+  if (opt->view_count == opt->view_capacity) {
+    int new_capacity = opt->view_capacity == 0 ? 16 : opt->view_capacity * 2;
+    AdamParamView* new_views = (AdamParamView*)realloc(
+        opt->views, new_capacity * sizeof(AdamParamView));
+    if (!new_views)
+      return -1;
+    opt->views = new_views;
+    opt->view_capacity = new_capacity;
+  }
+  int offset = opt->used_params;
+  opt->views[opt->view_count].params = params;
+  opt->views[opt->view_count].offset = offset;
+  opt->views[opt->view_count].length = length;
+  opt->view_count++;
+  opt->used_params += length;
+  return offset;
+}
+
 void adam_optimizer_free(AdamOptimizer* opt) {
   if (opt) {
     free(opt->gradients);
     free(opt->m);
     free(opt->v);
+    free(opt->views);
     free(opt);
   }
 }
 
-void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
-                         double learning_rate, double beta1, double beta2,
-                         double epsilon, uint64_t t) {
+void adam_optimizer_step(AdamOptimizer* opt, double learning_rate, double beta1,
+                         double beta2, double epsilon, uint64_t t) {
+  if (!opt)
+    return;
   double beta1_t = pow(beta1, (double)t);
   double beta2_t = pow(beta2, (double)t);
-  for (int i = 0; i < param_count; i++) {
-    // Update biased first moment estimate
-    opt->m[i] = beta1 * opt->m[i] + (1.0 - beta1) * opt->gradients[i];
 
-    // Update biased second raw moment estimate
-    opt->v[i] = beta2 * opt->v[i] +
-                (1.0 - beta2) * opt->gradients[i] * opt->gradients[i];
+  for (int view_idx = 0; view_idx < opt->view_count; view_idx++) {
+    AdamParamView* view = &opt->views[view_idx];
+    double* params = view->params;
+    int offset = view->offset;
+    for (int i = 0; i < view->length; i++) {
+      int idx = offset + i;
+      double grad = opt->gradients[idx];
+      opt->m[idx] = beta1 * opt->m[idx] + (1.0 - beta1) * grad;
+      opt->v[idx] = beta2 * opt->v[idx] + (1.0 - beta2) * grad * grad;
 
-    // Compute bias-corrected first moment estimate
-    double m_hat = opt->m[i] / (1.0 - beta1_t);
+      double m_hat = opt->m[idx] / (1.0 - beta1_t);
+      double v_hat = opt->v[idx] / (1.0 - beta2_t);
 
-    // Compute bias-corrected second raw moment estimate
-    double v_hat = opt->v[i] / (1.0 - beta2_t);
-
-    // Update parameters
-    params[i] -= learning_rate * m_hat / (sqrt(v_hat) + epsilon);
+      params[i] -= learning_rate * m_hat / (sqrt(v_hat) + epsilon);
+    }
   }
 }
 
@@ -2059,14 +2350,29 @@ static double process_sequence_window(TransformerModel* model,
   Matrix* encoder_out = ws->encoder_out;
   encoder_out->rows = window_len;
   matrix_copy(encoder_out, projected);
+  EncoderLayerCache* layer_caches = NULL;
+  if (is_training) {
+    layer_caches = (EncoderLayerCache*)calloc(model->config->num_encoder_layers,
+                                              sizeof(EncoderLayerCache));
+    if (!layer_caches) {
+      fprintf(stderr, "Error: Failed to allocate encoder layer caches\n");
+      return 0.0;
+    }
+  }
   for (int i = 0; i < model->config->num_encoder_layers; i++) {
     Matrix* layer_out = matrix_create(window_len, model->config->d_model);
     if (!layer_out) {
       fprintf(stderr, "Error: Allocation failure in process_sequence_window\n");
+      if (layer_caches) {
+        for (int j = 0; j < i; j++)
+          encoder_layer_cache_free(&layer_caches[j]);
+        free(layer_caches);
+      }
       return 0.0;
     }
     encoder_layer_forward(model->encoder_layers[i], layer_out, encoder_out,
-                          NULL, model->num_threads, is_training);
+                          NULL, model->num_threads, is_training,
+                          layer_caches ? &layer_caches[i] : NULL);
     matrix_copy(encoder_out, layer_out);
     matrix_free(layer_out);
   }
@@ -2081,14 +2387,19 @@ static double process_sequence_window(TransformerModel* model,
   double loss = 0.0;
 
   if (is_training && window_labels) {
-    // Cross entropy loss + gradient
+    adam_optimizer_zero_grad(model->optimizer);
     loss = cross_entropy_loss(logits, window_labels, window_len, num_labels);
 
-    // Compute stable softmax & gradient (reuse temporary buffer)
     double* grad_logits_data =
         (double*)calloc(window_len * num_labels, sizeof(double));
-    if (!grad_logits_data)
-      return loss; // best-effort
+    if (!grad_logits_data) {
+      if (layer_caches) {
+        for (int i = 0; i < model->config->num_encoder_layers; i++)
+          encoder_layer_cache_free(&layer_caches[i]);
+        free(layer_caches);
+      }
+      return loss;
+    }
     for (int t = 0; t < window_len; t++) {
       double max_v = -1e9;
       for (int c = 0; c < num_labels; c++) {
@@ -2099,100 +2410,59 @@ static double process_sequence_window(TransformerModel* model,
       double sum_exp = 0.0;
       for (int c = 0; c < num_labels; c++) {
         double e = exp(logits->data[t * num_labels + c] - max_v);
-        grad_logits_data[t * num_labels + c] = e; // store exp temporarily
+        grad_logits_data[t * num_labels + c] = e;
         sum_exp += e;
       }
       int tgt = window_labels[t];
       for (int c = 0; c < num_labels; c++) {
-        double soft = grad_logits_data[t * num_labels + c] / sum_exp; // softmax
+        double soft = grad_logits_data[t * num_labels + c] / sum_exp;
         double grad =
             soft - ((tgt >= 0 && tgt < num_labels && tgt == c) ? 1.0 : 0.0);
-        grad_logits_data[t * num_labels + c] = grad / window_len; // mean reduction
+        grad_logits_data[t * num_labels + c] = grad / window_len;
       }
     }
 
-    // ======================================================================
-    // FULL BACKPROPAGATION
-    // ======================================================================
-    int d_model = model->config->d_model;
-
-    // Step 1: Backward through output projection
-    // grad_output_projection = encoder_out^T @ grad_logits
-    // grad_encoder_out = grad_logits @ output_projection^T
     Matrix grad_logits_mat = {
         .data = grad_logits_data, .rows = window_len, .cols = num_labels};
 
-    // Compute gradient for output projection weights
-    for (int i = 0; i < d_model; i++) {
-      for (int c = 0; c < num_labels; c++) {
-        double acc = 0.0;
-        for (int t = 0; t < window_len; t++) {
-          acc += encoder_out->data[t * d_model + i] *
-                 grad_logits_data[t * num_labels + c];
-        }
-        model->optimizer->gradients[i * num_labels + c] = acc;
-      }
+    if (model->grad_offset_output_projection >= 0) {
+      double* grad_out_proj =
+          model->optimizer->gradients + model->grad_offset_output_projection;
+      accumulate_weight_gradient(grad_out_proj, encoder_out, &grad_logits_mat);
     }
 
-    // Compute gradient for encoder output
-    Matrix* grad_encoder_out = matrix_create(window_len, d_model);
-    Matrix* output_proj_T = matrix_create(num_labels, d_model);
+    Matrix* grad_encoder_out =
+        matrix_create(window_len, model->config->d_model);
+    Matrix* output_proj_T = matrix_create(model->output_projection->cols,
+                                          model->output_projection->rows);
     matrix_transpose(output_proj_T, model->output_projection);
     matrix_multiply_parallel(grad_encoder_out, &grad_logits_mat, output_proj_T,
                              model->num_threads);
     matrix_free(output_proj_T);
 
-    // Step 2: Backward through encoder layers (in reverse order)
-    // Store intermediate encoder outputs for backward pass
-    Matrix** encoder_layer_inputs =
-        (Matrix**)malloc((model->config->num_encoder_layers + 1) *
-                         sizeof(Matrix*));
-    encoder_layer_inputs[0] = matrix_create(window_len, d_model);
-    matrix_copy(encoder_layer_inputs[0], projected);
-
-    // Recompute forward pass to save intermediate values
-    for (int i = 0; i < model->config->num_encoder_layers; i++) {
-      encoder_layer_inputs[i + 1] = matrix_create(window_len, d_model);
-      encoder_layer_forward(model->encoder_layers[i], encoder_layer_inputs[i + 1],
-                            encoder_layer_inputs[i], NULL, model->num_threads,
-                            false);
-    }
-
-    // Backward through encoder layers
-    Matrix* grad_layer_out = grad_encoder_out;
+    Matrix* grad_current = grad_encoder_out;
     for (int i = model->config->num_encoder_layers - 1; i >= 0; i--) {
-      Matrix* grad_layer_in = matrix_create(window_len, d_model);
-      encoder_layer_backward(model->encoder_layers[i], grad_layer_in,
-                             grad_layer_out, encoder_layer_inputs[i], NULL,
-                             model->num_threads);
-      if (grad_layer_out != grad_encoder_out) {
-        matrix_free(grad_layer_out);
-      }
-      grad_layer_out = grad_layer_in;
+      Matrix* grad_prev = matrix_create(window_len, model->config->d_model);
+      const Matrix* layer_input =
+          (i == 0) ? projected : layer_caches[i - 1].output;
+      encoder_layer_backward(model->encoder_layers[i], grad_prev, grad_current,
+                             layer_input, NULL, model->num_threads,
+                             &layer_caches[i], model->optimizer);
+      matrix_free(grad_current);
+      grad_current = grad_prev;
     }
 
-    // grad_layer_out now contains gradient w.r.t. projected input
-    Matrix* grad_projected = grad_layer_out;
+    if (model->grad_offset_cwt_projection >= 0)
+      accumulate_weight_gradient(model->optimizer->gradients +
+                                     model->grad_offset_cwt_projection,
+                                 features, grad_current);
 
-    // Step 3: Backward through CWT projection
-    // grad_cwt_projection = features^T @ grad_projected
-    // (Not updating cwt_projection in this simplified implementation,
-    // but the gradient computation is demonstrated)
+    matrix_free(grad_current);
+    free(grad_logits_data);
 
-    // Clean up
-    for (int i = 0; i <= model->config->num_encoder_layers; i++) {
-      matrix_free(encoder_layer_inputs[i]);
-    }
-    free(encoder_layer_inputs);
-    matrix_free(grad_projected);
-
-    // Update output projection weights with optimizer
-    adam_optimizer_step(model->optimizer, model->output_projection->data,
-                        d_model * num_labels, model->config->learning_rate, 0.9,
+    adam_optimizer_step(model->optimizer, model->config->learning_rate, 0.9,
                         0.999, 1e-8, model->training_step);
     model->training_step++;
-
-    free(grad_logits_data);
   } else {
     // Inference: convert logits to probabilities (softmax in-place)
     for (int t = 0; t < window_len; t++) {
@@ -2212,6 +2482,12 @@ static double process_sequence_window(TransformerModel* model,
         logits->data[t * num_labels + c] /= sum_exp;
       }
     }
+  }
+
+  if (layer_caches) {
+    for (int i = 0; i < model->config->num_encoder_layers; i++)
+      encoder_layer_cache_free(&layer_caches[i]);
+    free(layer_caches);
   }
 
   return loss;
