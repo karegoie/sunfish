@@ -8,8 +8,8 @@ echo ""
 
 # Create small test data
 echo "Creating test data..."
-head -10 data/NC_001133.9.fasta > /tmp/test_tiny.fasta
-head -10 data/NC_001133.9.gff > /tmp/test_tiny.gff
+cp data/NC_001133.9.first5kb.fasta /tmp/test_tiny.fasta
+cp data/NC_001133.9.first5kb.gff /tmp/test_tiny.gff
 
 # Create test configuration
 cat > /tmp/test_integration.toml << 'EOF'
@@ -107,7 +107,7 @@ max_score=$(tail -n +2 /tmp/test_output.bedgraph | awk '{print $4}' | sort -rn |
 min_score=$(tail -n +2 /tmp/test_output.bedgraph | awk '{print $4}' | sort -n | head -1)
 echo "  Score range: $min_score to $max_score"
 
-if (( $(echo "$max_score <= 1.0" | bc -l) )) && (( $(echo "$min_score >= 0.0" | bc -l) )); then
+if awk -v max="$max_score" -v min="$min_score" 'BEGIN { exit (max <= 1.0000000001 && min >= -0.0000000001 ? 0 : 1) }'; then
     echo "✓ Scores are in valid probability range [0, 1]"
 else
     echo "✗ Scores out of range"

@@ -738,30 +738,55 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
   int num_heads = mha->num_heads;
   double scale = 1.0 / sqrt((double)d_k);
 
-  Matrix* Q = matrix_create(seq_len, d_model);
-  Matrix* K = matrix_create(seq_len, d_model);
-  Matrix* V = matrix_create(seq_len, d_model);
-  if (!Q || !K || !V) {
-    matrix_free(Q);
-    matrix_free(K);
-    matrix_free(V);
-    matrix_zero(output);
-    return;
+  Matrix* Q = NULL;
+  Matrix* K = NULL;
+  Matrix* V = NULL;
+  Matrix* concat_output = NULL;
+  Matrix* scores = NULL;
+  Matrix* k_head_T = NULL;
+  Matrix* head_context = NULL;
+  double* q_head_data = NULL;
+  double* k_head_data = NULL;
+  double* v_head_data = NULL;
+  double* prob_buffer = NULL;
+  bool success = false;
+
+  if (cache) {
+    cache->Q = NULL;
+    cache->K = NULL;
+    cache->V = NULL;
+    cache->concat_output = NULL;
+    cache->attn_probs = NULL;
   }
+
+  Q = matrix_create(seq_len, d_model);
+  K = matrix_create(seq_len, d_model);
+  V = matrix_create(seq_len, d_model);
+  if (!Q || !K || !V)
+    goto cleanup;
 
   matrix_multiply_parallel(Q, query, mha->W_q, num_threads);
   matrix_multiply_parallel(K, key, mha->W_k, num_threads);
   matrix_multiply_parallel(V, value, mha->W_v, num_threads);
 
-  Matrix* concat_output = matrix_create(seq_len, d_model);
-  if (!concat_output) {
-    matrix_free(Q);
-    matrix_free(K);
-    matrix_free(V);
-    matrix_zero(output);
-    return;
-  }
+  concat_output = matrix_create(seq_len, d_model);
+  if (!concat_output)
+    goto cleanup;
   matrix_zero(concat_output);
+
+  scores = matrix_create(seq_len, seq_len);
+  k_head_T = matrix_create(d_k, seq_len);
+  head_context = matrix_create(seq_len, d_k);
+  if (!scores || !k_head_T || !head_context)
+    goto cleanup;
+
+  size_t head_buffer_elems = (size_t)seq_len * d_k;
+  q_head_data = (double*)malloc(head_buffer_elems * sizeof(double));
+  k_head_data = (double*)malloc(head_buffer_elems * sizeof(double));
+  v_head_data = (double*)malloc(head_buffer_elems * sizeof(double));
+  prob_buffer = (double*)malloc(seq_len * sizeof(double));
+  if (!q_head_data || !k_head_data || !v_head_data || !prob_buffer)
+    goto cleanup;
 
   if (cache) {
     cache->Q = Q;
@@ -774,82 +799,52 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
       fprintf(stderr,
               "Error: Unable to allocate attention probability cache\n");
       cache->Q = cache->K = cache->V = cache->concat_output = NULL;
-      matrix_free(Q);
-      matrix_free(K);
-      matrix_free(V);
-      matrix_free(concat_output);
-      matrix_zero(output);
-      return;
+      goto cleanup;
     }
     memset(cache->attn_probs, 0, prob_count * sizeof(double));
   }
 
-  double* prob_buffer = (double*)malloc(seq_len * sizeof(double));
-  if (!prob_buffer) {
-    if (cache) {
-      free(cache->attn_probs);
-      cache->attn_probs = NULL;
-      cache->Q = cache->K = cache->V = cache->concat_output = NULL;
-    }
-    matrix_free(Q);
-    matrix_free(K);
-    matrix_free(V);
-    matrix_free(concat_output);
-    matrix_zero(output);
-    return;
-  }
-
   for (int h = 0; h < num_heads; h++) {
     int head_offset = h * d_k;
-    Matrix* Q_head = matrix_create(seq_len, d_k);
-    Matrix* K_head = matrix_create(seq_len, d_k);
-    Matrix* V_head = matrix_create(seq_len, d_k);
-    if (!Q_head || !K_head || !V_head) {
-      matrix_free(Q_head);
-      matrix_free(K_head);
-      matrix_free(V_head);
-      continue;
-    }
-
     for (int i = 0; i < seq_len; i++) {
-      memcpy(&Q_head->data[i * d_k], &Q->data[i * d_model + head_offset],
-             d_k * sizeof(double));
-      memcpy(&K_head->data[i * d_k], &K->data[i * d_model + head_offset],
-             d_k * sizeof(double));
-      memcpy(&V_head->data[i * d_k], &V->data[i * d_model + head_offset],
-             d_k * sizeof(double));
+      const double* q_row = &Q->data[i * d_model + head_offset];
+      const double* k_row = &K->data[i * d_model + head_offset];
+      const double* v_row = &V->data[i * d_model + head_offset];
+      double* q_dst = &q_head_data[i * d_k];
+      double* k_dst = &k_head_data[i * d_k];
+      double* v_dst = &v_head_data[i * d_k];
+      for (int c = 0; c < d_k; c++) {
+        q_dst[c] = q_row[c];
+        k_dst[c] = k_row[c];
+        v_dst[c] = v_row[c];
+      }
     }
 
-    Matrix* K_head_T = matrix_create(d_k, seq_len);
-    Matrix* scores = matrix_create(seq_len, seq_len);
-    if (!K_head_T || !scores) {
-      matrix_free(Q_head);
-      matrix_free(K_head);
-      matrix_free(V_head);
-      matrix_free(K_head_T);
-      matrix_free(scores);
-      continue;
-    }
+    Matrix q_head = {.data = q_head_data, .rows = seq_len, .cols = d_k};
+    Matrix k_head = {.data = k_head_data, .rows = seq_len, .cols = d_k};
+    Matrix v_head = {.data = v_head_data, .rows = seq_len, .cols = d_k};
 
-    matrix_transpose(K_head_T, K_head);
-    matrix_multiply_parallel(scores, Q_head, K_head_T, num_threads);
+    matrix_transpose(k_head_T, &k_head);
+    matrix_multiply_parallel(scores, &q_head, k_head_T, num_threads);
 
     double* head_probs =
         cache ? &cache->attn_probs[h * seq_len * seq_len] : NULL;
 
     for (int i = 0; i < seq_len; i++) {
       double* score_row = &scores->data[i * seq_len];
-      double max_val = -1e9;
       for (int j = 0; j < seq_len; j++) {
-        double val = score_row[j] * scale;
+        score_row[j] *= scale;
         if (mask) {
           double mask_val = mask->data[i * mask->cols + j];
           if (mask_val == 0.0)
-            val = -1e9;
+            score_row[j] = -1e9;
         }
-        score_row[j] = val;
-        if (val > max_val)
-          max_val = val;
+      }
+
+      double max_val = -1e9;
+      for (int j = 0; j < seq_len; j++) {
+        if (score_row[j] > max_val)
+          max_val = score_row[j];
       }
 
       double sum_exp = 0.0;
@@ -861,41 +856,56 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
       if (sum_exp <= 0.0)
         sum_exp = 1.0;
 
-      double* out_row = &concat_output->data[i * d_model + head_offset];
-      memset(out_row, 0, sizeof(double) * d_k);
-
       for (int j = 0; j < seq_len; j++) {
         double prob = prob_buffer[j] / sum_exp;
+        score_row[j] = prob;
         if (head_probs)
           head_probs[i * seq_len + j] = prob;
-        const double* v_row = &V_head->data[j * d_k];
-        for (int k = 0; k < d_k; k++) {
-          out_row[k] += prob * v_row[k];
-        }
       }
     }
 
-    matrix_free(Q_head);
-    matrix_free(K_head);
-    matrix_free(V_head);
-    matrix_free(K_head_T);
-    matrix_free(scores);
+    matrix_multiply_parallel(head_context, scores, &v_head, num_threads);
+
+    for (int i = 0; i < seq_len; i++) {
+      double* out_row = &concat_output->data[i * d_model + head_offset];
+      const double* head_row = &head_context->data[i * d_k];
+      for (int c = 0; c < d_k; c++) {
+        out_row[c] = head_row[c];
+      }
+    }
+  }
+
+  matrix_multiply_parallel(output, concat_output, mha->W_o, num_threads);
+  success = true;
+
+cleanup:
+  if (!success) {
+    matrix_zero(output);
   }
 
   free(prob_buffer);
+  free(q_head_data);
+  free(k_head_data);
+  free(v_head_data);
+  matrix_free(scores);
+  matrix_free(k_head_T);
+  matrix_free(head_context);
 
-  matrix_multiply_parallel(output, concat_output, mha->W_o, num_threads);
-
-  if (!cache) {
+  if (!cache || !success) {
     matrix_free(Q);
     matrix_free(K);
     matrix_free(V);
     matrix_free(concat_output);
+    if (cache) {
+      free(cache->attn_probs);
+      cache->attn_probs = NULL;
+      cache->Q = cache->K = cache->V = cache->concat_output = NULL;
+    }
   }
 }
 
-static void accumulate_weight_gradient(double* grad_buffer, const Matrix* a,
-                                       const Matrix* b) {
+static void compute_weight_gradient(double* grad_buffer, const Matrix* a,
+                                    const Matrix* b) {
   // grad = a^T @ b
   int rows = a->rows;
   int a_cols = a->cols;
@@ -906,7 +916,7 @@ static void accumulate_weight_gradient(double* grad_buffer, const Matrix* a,
       for (int r = 0; r < rows; r++) {
         sum += a->data[r * a_cols + i] * b->data[r * b_cols + j];
       }
-      grad_buffer[i * b_cols + j] += sum;
+      grad_buffer[i * b_cols + j] = sum;
     }
   }
 }
@@ -938,7 +948,7 @@ void multihead_attention_backward(
 
   if (opt && mha->grad_offset_W_o >= 0) {
     double* grad_W_o = opt->gradients + mha->grad_offset_W_o;
-    accumulate_weight_gradient(grad_W_o, cache->concat_output, grad_output);
+    compute_weight_gradient(grad_W_o, cache->concat_output, grad_output);
   }
 
   Matrix* grad_Q = matrix_create(seq_len, d_model);
@@ -971,19 +981,20 @@ void multihead_attention_backward(
           grad_v_row[k] += prob * grad_out_row[k];
           dot += grad_out_row[k] * v_row[k];
         }
-        grad_probs[i * seq_len + j] += dot;
+        grad_probs[i * seq_len + j] = dot;
       }
     }
 
     for (int i = 0; i < seq_len; i++) {
-      double row_sum = 0.0;
+      const double* prob_row = &head_probs[i * seq_len];
+      const double* grad_prob_row = &grad_probs[i * seq_len];
+      double dot = 0.0;
       for (int j = 0; j < seq_len; j++) {
-        row_sum += grad_probs[i * seq_len + j] * head_probs[i * seq_len + j];
+        dot += grad_prob_row[j] * prob_row[j];
       }
       for (int j = 0; j < seq_len; j++) {
-        double p = head_probs[i * seq_len + j];
-        grad_scores[i * seq_len + j] =
-            (grad_probs[i * seq_len + j] - row_sum) * p * scale;
+        double p = prob_row[j];
+        grad_scores[i * seq_len + j] = (grad_prob_row[j] - dot) * p * scale;
       }
     }
 
@@ -1007,14 +1018,14 @@ void multihead_attention_backward(
 
   if (opt) {
     if (mha->grad_offset_W_q >= 0)
-      accumulate_weight_gradient(opt->gradients + mha->grad_offset_W_q, query,
-                                 grad_Q);
+      compute_weight_gradient(opt->gradients + mha->grad_offset_W_q, query,
+                              grad_Q);
     if (mha->grad_offset_W_k >= 0)
-      accumulate_weight_gradient(opt->gradients + mha->grad_offset_W_k, key,
-                                 grad_K);
+      compute_weight_gradient(opt->gradients + mha->grad_offset_W_k, key,
+                              grad_K);
     if (mha->grad_offset_W_v >= 0)
-      accumulate_weight_gradient(opt->gradients + mha->grad_offset_W_v, value,
-                                 grad_V);
+      compute_weight_gradient(opt->gradients + mha->grad_offset_W_v, value,
+                              grad_V);
   }
 
   Matrix* W_q_T = matrix_create(d_model, d_model);
@@ -1221,8 +1232,8 @@ void feedforward_backward(FeedForward* ff, Matrix* grad_input,
 
   if (opt) {
     if (ff->grad_offset_W2 >= 0)
-      accumulate_weight_gradient(opt->gradients + ff->grad_offset_W2,
-                                 activation, grad_output);
+      compute_weight_gradient(opt->gradients + ff->grad_offset_W2, activation,
+                              grad_output);
     if (ff->grad_offset_b2 >= 0) {
       double* grad_b2 = opt->gradients + ff->grad_offset_b2;
       for (int j = 0; j < ff->d_model; j++) {
@@ -1230,7 +1241,7 @@ void feedforward_backward(FeedForward* ff, Matrix* grad_input,
         for (int i = 0; i < seq_len; i++) {
           sum += grad_output->data[i * ff->d_model + j];
         }
-        grad_b2[j] += sum;
+        grad_b2[j] = sum;
       }
     }
   }
@@ -1248,8 +1259,8 @@ void feedforward_backward(FeedForward* ff, Matrix* grad_input,
 
   if (opt) {
     if (ff->grad_offset_W1 >= 0)
-      accumulate_weight_gradient(opt->gradients + ff->grad_offset_W1, input,
-                                 grad_hidden);
+      compute_weight_gradient(opt->gradients + ff->grad_offset_W1, input,
+                              grad_hidden);
     if (ff->grad_offset_b1 >= 0) {
       double* grad_b1 = opt->gradients + ff->grad_offset_b1;
       for (int j = 0; j < d_ff; j++) {
@@ -1257,7 +1268,7 @@ void feedforward_backward(FeedForward* ff, Matrix* grad_input,
         for (int i = 0; i < seq_len; i++) {
           sum += grad_hidden->data[i * d_ff + j];
         }
-        grad_b1[j] += sum;
+        grad_b1[j] = sum;
       }
     }
   }
@@ -2428,7 +2439,7 @@ static double process_sequence_window(TransformerModel* model,
     if (model->grad_offset_output_projection >= 0) {
       double* grad_out_proj =
           model->optimizer->gradients + model->grad_offset_output_projection;
-      accumulate_weight_gradient(grad_out_proj, encoder_out, &grad_logits_mat);
+      compute_weight_gradient(grad_out_proj, encoder_out, &grad_logits_mat);
     }
 
     Matrix* grad_encoder_out =
@@ -2443,8 +2454,9 @@ static double process_sequence_window(TransformerModel* model,
     Matrix* grad_current = grad_encoder_out;
     for (int i = model->config->num_encoder_layers - 1; i >= 0; i--) {
       Matrix* grad_prev = matrix_create(window_len, model->config->d_model);
-      const Matrix* layer_input =
-          (i == 0) ? projected : layer_caches[i - 1].output;
+      const Matrix* layer_input = layer_caches[i].input;
+      if (!layer_input)
+        layer_input = (i == 0) ? projected : layer_caches[i - 1].output;
       encoder_layer_backward(model->encoder_layers[i], grad_prev, grad_current,
                              layer_input, NULL, model->num_threads,
                              &layer_caches[i], model->optimizer);
@@ -2453,9 +2465,9 @@ static double process_sequence_window(TransformerModel* model,
     }
 
     if (model->grad_offset_cwt_projection >= 0)
-      accumulate_weight_gradient(model->optimizer->gradients +
-                                     model->grad_offset_cwt_projection,
-                                 features, grad_current);
+      compute_weight_gradient(model->optimizer->gradients +
+                                  model->grad_offset_cwt_projection,
+                              features, grad_current);
 
     matrix_free(grad_current);
     free(grad_logits_data);
