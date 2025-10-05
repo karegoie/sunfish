@@ -958,7 +958,7 @@ void multihead_attention_backward(
   matrix_zero(grad_Q);
   matrix_zero(grad_K);
   matrix_zero(grad_V);
-  
+
   // Temporary matrices for per-head gradients in head space
   Matrix* grad_Q_head = matrix_create(seq_len, d_k);
   Matrix* grad_K_head = matrix_create(seq_len, d_k);
@@ -984,7 +984,7 @@ void multihead_attention_backward(
       free(grad_scores);
       continue;
     }
-    
+
     // Zero out per-head gradient matrices
     matrix_zero(grad_Q_head);
     matrix_zero(grad_K_head);
@@ -1035,20 +1035,21 @@ void multihead_attention_backward(
         }
       }
     }
-    
+
     // Transform per-head gradients back and accumulate
-    // grad_Q += grad_Q_head * W_q_head^T (where W_q_head is the columns for this head)
-    // Since W_q is d_model x d_model, we extract the relevant d_k columns for each head
+    // grad_Q += grad_Q_head * W_q_head^T (where W_q_head is the columns for
+    // this head) Since W_q is d_model x d_model, we extract the relevant d_k
+    // columns for each head
     for (int i = 0; i < seq_len; i++) {
       for (int j = 0; j < d_model; j++) {
         double sum_q = 0.0, sum_k = 0.0, sum_v = 0.0;
         for (int k = 0; k < d_k; k++) {
           // W_q[j, head_offset + k] * grad_Q_head[i, k]
-          sum_q += mha->W_q->data[j * d_model + head_offset + k] * 
+          sum_q += mha->W_q->data[j * d_model + head_offset + k] *
                    grad_Q_head->data[i * d_k + k];
-          sum_k += mha->W_k->data[j * d_model + head_offset + k] * 
+          sum_k += mha->W_k->data[j * d_model + head_offset + k] *
                    grad_K_head->data[i * d_k + k];
-          sum_v += mha->W_v->data[j * d_model + head_offset + k] * 
+          sum_v += mha->W_v->data[j * d_model + head_offset + k] *
                    grad_V_head->data[i * d_k + k];
         }
         grad_Q->data[i * d_model + j] += sum_q;
@@ -1060,7 +1061,7 @@ void multihead_attention_backward(
     free(grad_probs);
     free(grad_scores);
   }
-  
+
   matrix_free(grad_Q_head);
   matrix_free(grad_K_head);
   matrix_free(grad_V_head);
@@ -1945,10 +1946,10 @@ bool transformer_train(TransformerModel* model, const char* train_fasta,
           char* forward_window = (char*)malloc((window_len + 1) * sizeof(char));
           strncpy(forward_window, sequence + window_start, window_len);
           forward_window[window_len] = '\0';
-          
+
           char* rc_window = reverse_complement(forward_window);
           free(forward_window);
-          
+
           if (rc_window) {
             double window_loss =
                 process_sequence_window(model, ws, rc_window, window_len,
@@ -1957,7 +1958,7 @@ bool transformer_train(TransformerModel* model, const char* train_fasta,
             num_windows++;
             free(rc_window);
           }
-          
+
           if (window_end >= seq_len)
             break;
         }
@@ -2152,8 +2153,6 @@ bool transformer_save(const TransformerModel* model, const char* filename) {
     fprintf(stderr, "Error: Cannot open file '%s' for writing\n", filename);
     return false;
   }
-
-  fprintf(stderr, "Saving model to %s...\n", filename);
 
   // Write magic number and version
   const char magic[] = "SUNFISH1";
@@ -2516,8 +2515,8 @@ static double process_sequence_window(TransformerModel* model,
     matrix_free(grad_current);
     free(grad_logits_data);
 
-    adam_optimizer_step(model->optimizer, model->config->learning_rate, 
-                        model->config->adam_beta1, model->config->adam_beta2, 
+    adam_optimizer_step(model->optimizer, model->config->learning_rate,
+                        model->config->adam_beta1, model->config->adam_beta2,
                         model->config->adam_epsilon, model->training_step);
     model->training_step++;
   } else {
