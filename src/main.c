@@ -36,28 +36,40 @@ static char* find_config_arg(int argc, char* argv[]) {
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
-  // Ensure real-time output behavior
-  setvbuf(stdout, NULL, _IOLBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
-
+/* Parse args early and print help on error; returns 0 on OK, non-zero on error
+   If returns 0, config_file_out will be set to the config path (or NULL if not
+   required for the chosen command). */
+static int parse_args_or_print_help(int argc, char* argv[],
+                                    char** config_file_out) {
   if (argc < 2) {
     print_help(argv[0]);
-    return 0;
+    return 1;
   }
 
   if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
       strcmp(argv[1], "-h") == 0) {
     print_help(argv[0]);
-    return 0;
+    return 1;
   }
 
-  // Find config file argument
-  char* config_file = find_config_arg(argc, argv);
-  if (!config_file) {
+  *config_file_out = find_config_arg(argc, argv);
+  if (!*config_file_out) {
     fprintf(stderr, "Error: Configuration file required (-c <config.toml>)\n");
     print_help(argv[0]);
     return 1;
+  }
+
+  return 0;
+}
+
+int main(int argc, char* argv[]) {
+  // Ensure real-time output behavior
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  char* config_file = NULL;
+  if (parse_args_or_print_help(argc, argv, &config_file) != 0) {
+    return 0;
   }
 
   // Load configuration

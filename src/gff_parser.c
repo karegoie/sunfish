@@ -285,7 +285,9 @@ bool create_labels_from_gff(const GFFData* gff_data, const char* seqid,
 
       if (parents) {
         char* cursor = parents;
-        while (*cursor) {
+        /* include success in loop condition so we don't exit early without
+           completing cleanup in this block */
+        while (*cursor && success) {
           while (*cursor == ',' || isspace((unsigned char)*cursor))
             cursor++;
           if (!*cursor)
@@ -309,9 +311,8 @@ bool create_labels_from_gff(const GFFData* gff_data, const char* seqid,
             *cursor = saved;
             cursor++;
           }
-          if (!success)
-            break;
         }
+        /* Always free the allocated parents string before moving on */
         free(parents);
       }
       if (!success)
