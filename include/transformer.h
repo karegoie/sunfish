@@ -82,6 +82,8 @@ void matrix_add(Matrix* result, const Matrix* a, const Matrix* b);
 void matrix_transpose(Matrix* result, const Matrix* input);
 void matrix_multiply_parallel(Matrix* result, const Matrix* a, const Matrix* b,
                               int num_threads);
+void matrix_add_inplace(Matrix* a, const Matrix* b);
+void matrix_scale(Matrix* m, double scale);
 
 // Attention and Layer components
 void scaled_dot_product_attention(Matrix* output, const Matrix* Q,
@@ -93,19 +95,34 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
                                  const Matrix* query, const Matrix* key,
                                  const Matrix* value, const Matrix* mask,
                                  int num_threads);
+void multihead_attention_backward(MultiHeadAttention* mha, Matrix* grad_query,
+                                  Matrix* grad_key, Matrix* grad_value,
+                                  const Matrix* grad_output,
+                                  const Matrix* query, const Matrix* key,
+                                  const Matrix* value, const Matrix* mask,
+                                  int num_threads);
 FeedForward* feedforward_create(int d_model, int d_ff);
 void feedforward_free(FeedForward* ff);
 void feedforward_forward(FeedForward* ff, Matrix* output, const Matrix* input,
                          int num_threads);
+void feedforward_backward(FeedForward* ff, Matrix* grad_input,
+                          const Matrix* grad_output, const Matrix* input,
+                          int num_threads);
 LayerNorm* layer_norm_create(int d_model, int num_threads);
 void layer_norm_free(LayerNorm* ln);
 void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input);
+void layer_norm_backward(LayerNorm* ln, Matrix* grad_input,
+                         const Matrix* grad_output, const Matrix* input,
+                         const Matrix* output);
 EncoderLayer* encoder_layer_create(int d_model, int num_heads, int d_ff,
                                    double dropout_rate, int num_threads);
 void encoder_layer_free(EncoderLayer* layer);
 void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
                            const Matrix* input, const Matrix* mask,
                            int num_threads, bool training);
+void encoder_layer_backward(EncoderLayer* layer, Matrix* grad_input,
+                            const Matrix* grad_output, const Matrix* input,
+                            const Matrix* mask, int num_threads);
 
 // Positional Encoding
 void compute_positional_encoding(Matrix* pos_enc, int max_length, int d_model);
