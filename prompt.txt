@@ -1,3 +1,209 @@
+전체 역전파 구현 단계
+전체 역전파 과정은 transformer_forward 함수의 연산을 정확히 역순으로 따라가며 구현됩니다. 각 단계에서 두 종류의 기울기를 계산해야 합니다.
+
+파라미터에 대한 기울기: 현재 층의 가중치, 편향 등을 업데이트하기 위한 값입니다.
+
+입력에 대한 기울기: 바로 이전 층(아래 층)으로 전달할 기울기 값입니다.
+
+수식에서 L은 최종 손실, @는 행렬 곱셈, X
+T
+ 는 전치 행렬을 의미합니다.
+
+1단계: 손실 함수의 기울기 (시작점)
+위치: process_sequence_window 함수 내부
+
+설명: 가장 먼저, 최종 출력(logits)에 대한 손실 함수의 기울기(
+∂Logits
+∂L
+​
+ )를 계산합니다. 코드에서 cross_entropy_loss 계산 후 grad_logits를 구하는 부분이 여기에 해당하며, 이 값은 softmax(logits) - one_hot_target으로 계산됩니다. 이 grad_logits가 역전파를 시작하는 최초의 기울기 값이 됩니다.
+
+2단계: 출력 프로젝션 레이어 (Output Projection Layer)
+해당 파라미터: model->output_projection (Matrix)
+
+Forward: Logits = EncoderOut @ W_out
+
+Backward: grad_logits (
+∂Logits
+∂L
+​
+ )를 입력으로 받습니다.
+
+파라미터 기울기 (
+∂W
+out
+​
+
+∂L
+​
+ ): 출력 가중치에 대한 기울기를 계산합니다. 이것이 현재 코드에서 유일하게 계산되고 있는 부분입니다.
+
+∂W
+out
+​
+
+∂L
+​
+ =(EncoderOut)
+T
+  @ 
+∂Logits
+∂L
+​
+
+입력 기울기 (
+∂EncoderOut
+∂L
+​
+ ): 이전 층(인코더 스택의 마지막 층)으로 전달할 기울기를 계산합니다. 이 부분이 현재 코드에 누락된 가장 중요한 첫 단계입니다.
+
+∂EncoderOut
+∂L
+​
+ =
+∂Logits
+∂L
+​
+  @ (W
+out
+​
+ )
+T
+
+3단계: 인코더 스택 (Encoder Stack)
+이제 num_encoder_layers 개수만큼의 인코더 층을 역순으로(마지막 층부터 첫 층까지) 거슬러 올라가야 합니다. 각 인코더 층의 역전파는 그 층의 forward 연산을 역순으로 따라갑니다.
+
+3-1. Add & Norm (두 번째)
+Forward: Output = Norm2(FF_out + Normed1)
+
+Backward: 위에서 계산된 $\frac{\partial L}{\partial \text{EncoderOut}}$를 입력으로 받습니다.
+
+Layer Normalization과 Residual Connection의 역전파를 수행합니다. Residual Connection은 기울기를 양쪽으로 그대로 복사하여 전달하는 역할을 합니다.
+
+이 단계를 거치면
+∂FF_out
+∂L
+​
+  와
+∂Normed1
+∂L
+​
+  두 개의 기울기가 나옵니다 (실제로는 합쳐진 기울기).
+
+3-2. 피드포워드 네트워크 (Feed-Forward Network)
+해당 파라미터: layer->ff->W1, b1, W2, b2
+
+Forward: FF_out = (ReLU(Normed1 @ W1 + b1)) @ W2 + b2
+
+Backward: $\frac{\partial L}{\partial \text{FF_out}}$를 입력으로 받습니다.
+
+2차 선형 변환:
+∂W2
+∂L
+​
+ ,
+∂b2
+∂L
+​
+  및 이전 층으로 전달할 기울기를 계산합니다.
+
+ReLU: ReLU를 통과한 기울기를 계산합니다 (입력이 0보다 컸던 부분은 기울기 그대로, 작았던 부분은 0).
+
+1차 선형 변환:
+∂W1
+∂L
+​
+ ,
+∂b1
+∂L
+​
+  및 이전 층으로 전달할 기울기(
+∂Normed1
+∂L
+​
+ )를 계산합니다.
+
+3-3. Add & Norm (첫 번째)
+Forward: Normed1 = Norm1(Attn_out + Input)
+
+Backward: 위에서 계산된 $\frac{\partial L}{\partial \text{Normed1}}$를 입력으로 받습니다.
+
+두 번째 Add & Norm과 동일한 방식으로 역전파를 수행하여
+∂Attn_out
+∂L
+​
+  와 $\frac{\partial L}{\partial \text{Input}}$을 계산합니다.
+
+3-4. 멀티헤드 어텐션 (Multi-Head Attention)
+해당 파라미터: layer->self_attn->W_q, W_k, W_v, W_o
+
+Backward: $\frac{\partial L}{\partial \text{Attn_out}}$를 입력으로 받습니다. 이 부분이 가장 복잡합니다.
+
+출력 프로젝션:
+∂W
+o
+​
+
+∂L
+​
+  와 이전 단계(Attention 값)에 대한 기울기를 계산합니다.
+
+Scaled Dot-Product Attention: Attention 메커니즘 자체를 역전파하여
+∂Q
+∂L
+​
+ ,
+∂K
+∂L
+​
+ , $\frac{\partial L}{\partial V}$를 계산합니다.
+
+입력 프로젝션: 위에서 구한
+∂Q
+∂L
+​
+ ,
+∂K
+∂L
+​
+ , $\frac{\partial L}{\partial V}$를 이용해 최종적으로 이 레이어의 입력에 대한 기울기($\frac{\partial L}{\partial \text{Input}}$)와 가중치 기울기
+∂W
+q
+​
+
+∂L
+​
+ ,
+∂W
+k
+​
+
+∂L
+​
+ , $\frac{\partial L}{\partial W_v}$를 계산합니다.
+
+이 과정이 모든 인코더 층에 대해 반복됩니다. 한 층의 역전파 결과로 나온 '입력 기울기'가 바로 아래 층의 역전파를 위한 '출력 기울기'가 됩니다.
+
+4단계: CWT 프로젝션 및 위치 인코딩
+해당 파라미터: model->cwt_projection
+
+Forward: EncoderInput = (Features @ W_cwt) + PositionalEncoding
+
+Backward: 모든 인코더 스택을 거친 후의 기울기를 입력으로 받습니다.
+
+Positional Encoding: 위치 인코딩은 학습되는 파라미터가 아니므로, 기울기는 그대로 통과됩니다.
+
+CWT 프로젝션: 선형 변환의 역전파를 수행하여 $\frac{\partial L}{\partial W_{\text{cwt}}}$를 계산합니다.
+
+5단계: 기울기 취합 및 파라미터 업데이트
+위의 모든 과정을 통해 모델의 모든 학습 가능한 파라미터에 대한 기울기가 계산됩니다.
+
+이 기울기들을 하나의 큰 벡터로 모으거나, 각 파라미터별로 관리합니다.
+
+AdamOptimizer 구조체의 gradients, m, v 버퍼는 이 모든 파라미터를 포함할 수 있도록 충분히 커야 합니다.
+
+adam_optimizer_step 함수를 호출하여 계산된 기울기를 바탕으로 모델의 모든 파라미터를 업데이트합니다.
+
 
 # 반드시 지켜야 할 사항:
 Code Quality and Optimization
