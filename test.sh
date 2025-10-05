@@ -24,7 +24,7 @@ d_ff = 64
 dropout_rate = 0.1
 learning_rate = 0.01
 batch_size = 4
-num_epochs = 10
+num_epochs = 200
 
 [parallel]
 num_threads = 2
