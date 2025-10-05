@@ -16,6 +16,8 @@ CONFIG_SRC = $(SRCDIR)/config.c
 TRANSFORMER_SRC = $(SRCDIR)/transformer.c
 THREAD_POOL_SRC = $(SRCDIR)/thread_pool.c
 FASTA_PARSER_SRC = $(SRCDIR)/fasta_parser.c
+FFT_SRC = $(SRCDIR)/fft.c
+CWT_SRC = $(SRCDIR)/cwt.c
 MAIN_SRC = $(SRCDIR)/main.c
 
 # Object files
@@ -24,11 +26,13 @@ CONFIG_OBJ = $(OBJDIR)/config.o
 TRANSFORMER_OBJ = $(OBJDIR)/transformer.o
 THREAD_POOL_OBJ = $(OBJDIR)/thread_pool.o
 FASTA_PARSER_OBJ = $(OBJDIR)/fasta_parser.o
+FFT_OBJ = $(OBJDIR)/fft.o
+CWT_OBJ = $(OBJDIR)/cwt.o
 MAIN_OBJ = $(OBJDIR)/main.o
 
 # Build executable
 SUNFISH_EXE = $(BINDIR)/sunfish
-SUNFISH_OBJS = $(TOML_OBJ) $(CONFIG_OBJ) $(TRANSFORMER_OBJ) $(THREAD_POOL_OBJ) $(FASTA_PARSER_OBJ) $(MAIN_OBJ)
+SUNFISH_OBJS = $(TOML_OBJ) $(CONFIG_OBJ) $(TRANSFORMER_OBJ) $(THREAD_POOL_OBJ) $(FASTA_PARSER_OBJ) $(FFT_OBJ) $(CWT_OBJ) $(MAIN_OBJ)
 
 all: directories $(SUNFISH_EXE)
 	@rm -rf $(OBJDIR)
@@ -56,6 +60,8 @@ $(SUNFISH_DEBUG_EXE): $(SUNFISH_OBJS)
 	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/transformer.c -o $(OBJDIR)/transformer.o
 	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/thread_pool.c -o $(OBJDIR)/thread_pool.o
 	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/fasta_parser.c -o $(OBJDIR)/fasta_parser.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/fft.c -o $(OBJDIR)/fft.o
+	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/cwt.c -o $(OBJDIR)/cwt.o
 	$(CC) -Wall -Wextra -std=c17 -g -O0 -fno-omit-frame-pointer -fsanitize=address -I$(INCDIR) -pthread -c $(SRCDIR)/main.c -o $(OBJDIR)/main.o
 	$(CC) -g -O0 -fsanitize=address $(OBJDIR)/*.o -pthread -lm -o $@
 
@@ -81,6 +87,12 @@ $(OBJDIR)/thread_pool.o: $(SRCDIR)/thread_pool.c $(INCDIR)/thread_pool.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJDIR)/fasta_parser.o: $(SRCDIR)/fasta_parser.c $(INCDIR)/fasta_parser.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/fft.o: $(SRCDIR)/fft.c $(INCDIR)/fft.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/cwt.o: $(SRCDIR)/cwt.c $(INCDIR)/cwt.h $(INCDIR)/fft.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJDIR)/main.o: $(SRCDIR)/main.c $(INCDIR)/config.h $(INCDIR)/transformer.h

@@ -18,6 +18,15 @@ void config_init_defaults(TransformerConfig* config) {
   config->num_epochs = 10;
   config->num_threads = 4;
   config->vocab_size = 4; // A, C, G, T
+  
+  // Default CWT scales
+  config->num_cwt_scales = 5;
+  config->cwt_scales = (double*)malloc(config->num_cwt_scales * sizeof(double));
+  config->cwt_scales[0] = 2.0;
+  config->cwt_scales[1] = 4.0;
+  config->cwt_scales[2] = 8.0;
+  config->cwt_scales[3] = 16.0;
+  config->cwt_scales[4] = 32.0;
 }
 
 bool config_load(const char* filename, TransformerConfig* config) {
@@ -91,6 +100,30 @@ bool config_load(const char* filename, TransformerConfig* config) {
     if (d.ok) config->num_threads = d.u.i;
   }
 
+  // Parse CWT section if present
+  toml_table_t* cwt = toml_table_in(conf, "cwt");
+  if (cwt) {
+    toml_array_t* scales_arr = toml_array_in(cwt, "scales");
+    if (scales_arr) {
+      int num_scales = toml_array_nelem(scales_arr);
+      if (num_scales > 0) {
+        // Free default scales and allocate new
+        free(config->cwt_scales);
+        config->num_cwt_scales = num_scales;
+        config->cwt_scales = (double*)malloc(num_scales * sizeof(double));
+        
+        for (int i = 0; i < num_scales; i++) {
+          toml_datum_t scale = toml_double_at(scales_arr, i);
+          if (scale.ok) {
+            config->cwt_scales[i] = scale.u.d;
+          } else {
+            config->cwt_scales[i] = 2.0 * (i + 1);  // Fallback
+          }
+        }
+      }
+    }
+  }
+
   toml_free(conf);
   
   // Validate configuration
@@ -108,6 +141,9 @@ bool config_load(const char* filename, TransformerConfig* config) {
 }
 
 void config_free(TransformerConfig* config) {
-  // Currently no dynamic allocations, but kept for future extensibility
-  (void)config;
+  if (config) {
+    free(config->cwt_scales);
+    config->cwt_scales = NULL;
+    config->num_cwt_scales = 0;
+  }
 }

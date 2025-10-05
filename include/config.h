@@ -25,6 +25,10 @@ typedef struct {
   // Input/Output
   int vocab_size;        // Vocabulary size (e.g., 4 for DNA bases)
   
+  // CWT Feature Extraction
+  int num_cwt_scales;    // Number of wavelet scales
+  double* cwt_scales;    // Array of scale values (dynamically allocated)
+  
 } TransformerConfig;
 
 /**

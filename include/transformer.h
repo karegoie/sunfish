@@ -72,6 +72,9 @@ typedef struct {
   Matrix* src_embedding;  // [vocab_size x d_model]
   Matrix* tgt_embedding;  // [vocab_size x d_model]
   
+  // CWT feature projection
+  Matrix* cwt_projection;  // [(num_cwt_scales * 2) x d_model]
+  
   // Positional encoding (pre-computed)
   Matrix* pos_encoding;   // [max_seq_length x d_model]
   
@@ -112,6 +115,13 @@ void matrix_multiply_parallel(Matrix* result, const Matrix* a, const Matrix* b,
 void scaled_dot_product_attention(Matrix* output, const Matrix* Q,
                                   const Matrix* K, const Matrix* V,
                                   const Matrix* mask, int num_threads);
+
+// Backward pass for attention (simplified gradient computation)
+void scaled_dot_product_attention_backward(const Matrix* grad_output,
+                                          const Matrix* Q, const Matrix* K,
+                                          const Matrix* V,
+                                          Matrix* grad_Q, Matrix* grad_K,
+                                          Matrix* grad_V, int num_threads);
 
 // Positional encoding
 void compute_positional_encoding(Matrix* pos_enc, int max_length, int d_model);
@@ -164,6 +174,28 @@ bool transformer_train(TransformerModel* model, const char* train_data,
                       const char* valid_data);
 void transformer_predict(TransformerModel* model, const char* input_file,
                         const char* output_file);
+
+// Feature extraction with CWT
+bool extract_cwt_features(const char* sequence, int seq_len, 
+                         const TransformerConfig* config,
+                         Matrix** out_features);
+
+// Training utilities
+typedef struct {
+  double* gradients;
+  double* m;  // First moment (mean)
+  double* v;  // Second moment (variance)
+} AdamOptimizer;
+
+AdamOptimizer* adam_optimizer_create(int param_count);
+void adam_optimizer_free(AdamOptimizer* opt);
+void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
+                        double learning_rate, double beta1, double beta2,
+                        double epsilon, int t);
+
+// Loss functions
+double cross_entropy_loss(const Matrix* predictions, const int* targets, 
+                         int batch_size, int vocab_size);
 
 // Save and load model
 bool transformer_save(const TransformerModel* model, const char* filename);
