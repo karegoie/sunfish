@@ -1921,44 +1921,47 @@ bool transformer_train(TransformerModel* model, const char* train_fasta,
       free(labels);
 
       // Process reverse complement strand
-      char* rc_seq = reverse_complement(sequence);
-      if (rc_seq) {
-        int* rc_labels = (int*)malloc(seq_len * sizeof(int));
-        if (create_labels_from_gff(gff, seq_id, seq_len, '-', rc_labels)) {
-          // Reverse the labels to match reverse complement sequence
-          for (int i = 0; i < seq_len / 2; i++) {
-            int tmp = rc_labels[i];
-            rc_labels[i] = rc_labels[seq_len - 1 - i];
-            rc_labels[seq_len - 1 - i] = tmp;
-          }
+      // Generate RC windows on-demand instead of creating full RC sequence
+      int* rc_labels = (int*)malloc(seq_len * sizeof(int));
+      if (create_labels_from_gff(gff, seq_id, seq_len, '-', rc_labels)) {
+        // Reverse the labels to match reverse complement sequence
+        for (int i = 0; i < seq_len / 2; i++) {
+          int tmp = rc_labels[i];
+          rc_labels[i] = rc_labels[seq_len - 1 - i];
+          rc_labels[seq_len - 1 - i] = tmp;
+        }
 
-          for (int window_start = 0; window_start < seq_len;
-               window_start += step) {
-            int window_end = window_start + window_size;
-            if (window_end > seq_len)
-              window_end = seq_len;
-            int window_len = window_end - window_start;
-            if (window_len < 10)
-              continue;
+        for (int window_start = 0; window_start < seq_len;
+             window_start += step) {
+          int window_end = window_start + window_size;
+          if (window_end > seq_len)
+            window_end = seq_len;
+          int window_len = window_end - window_start;
+          if (window_len < 10)
+            continue;
 
-            char* window_seq = (char*)malloc((window_len + 1) * sizeof(char));
-            strncpy(window_seq, rc_seq + window_start, window_len);
-            window_seq[window_len] = '\0';
-
+          // Extract window from forward strand and compute its RC
+          char* forward_window = (char*)malloc((window_len + 1) * sizeof(char));
+          strncpy(forward_window, sequence + window_start, window_len);
+          forward_window[window_len] = '\0';
+          
+          char* rc_window = reverse_complement(forward_window);
+          free(forward_window);
+          
+          if (rc_window) {
             double window_loss =
-                process_sequence_window(model, ws, window_seq, window_len,
+                process_sequence_window(model, ws, rc_window, window_len,
                                         &rc_labels[window_start], true);
             epoch_loss += window_loss;
             num_windows++;
-
-            free(window_seq);
-            if (window_end >= seq_len)
-              break;
+            free(rc_window);
           }
+          
+          if (window_end >= seq_len)
+            break;
         }
-        free(rc_labels);
-        free(rc_seq);
       }
+      free(rc_labels);
     }
     fprintf(stderr, "\n"); // Newline after progress indicator
 
