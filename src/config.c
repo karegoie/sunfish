@@ -19,6 +19,18 @@ void config_init_defaults(TransformerConfig* config) {
   config->num_threads = 4;
   config->vocab_size = 4; // A, C, G, T
   
+  // Sliding window defaults
+  config->window_size = 5000;
+  config->window_overlap = 1000;
+  
+  // File paths defaults (NULL means not set)
+  config->train_fasta = NULL;
+  config->train_gff = NULL;
+  config->predict_fasta = NULL;
+  config->output_gff = NULL;
+  config->output_bedgraph = NULL;
+  config->model_path = NULL;
+  
   // Default CWT scales
   config->num_cwt_scales = 5;
   config->cwt_scales = (double*)malloc(config->num_cwt_scales * sizeof(double));
@@ -123,6 +135,60 @@ bool config_load(const char* filename, TransformerConfig* config) {
       }
     }
   }
+  
+  // Parse sliding window section
+  toml_table_t* sliding_window = toml_table_in(conf, "sliding_window");
+  if (sliding_window) {
+    toml_datum_t d;
+    
+    d = toml_int_in(sliding_window, "window_size");
+    if (d.ok) config->window_size = d.u.i;
+    
+    d = toml_int_in(sliding_window, "window_overlap");
+    if (d.ok) config->window_overlap = d.u.i;
+  }
+  
+  // Parse paths section
+  toml_table_t* paths = toml_table_in(conf, "paths");
+  if (paths) {
+    toml_datum_t d;
+    
+    d = toml_string_in(paths, "train_fasta");
+    if (d.ok) {
+      config->train_fasta = strdup(d.u.s);
+      free(d.u.s);
+    }
+    
+    d = toml_string_in(paths, "train_gff");
+    if (d.ok) {
+      config->train_gff = strdup(d.u.s);
+      free(d.u.s);
+    }
+    
+    d = toml_string_in(paths, "predict_fasta");
+    if (d.ok) {
+      config->predict_fasta = strdup(d.u.s);
+      free(d.u.s);
+    }
+    
+    d = toml_string_in(paths, "output_gff");
+    if (d.ok) {
+      config->output_gff = strdup(d.u.s);
+      free(d.u.s);
+    }
+    
+    d = toml_string_in(paths, "output_bedgraph");
+    if (d.ok) {
+      config->output_bedgraph = strdup(d.u.s);
+      free(d.u.s);
+    }
+    
+    d = toml_string_in(paths, "model_path");
+    if (d.ok) {
+      config->model_path = strdup(d.u.s);
+      free(d.u.s);
+    }
+  }
 
   toml_free(conf);
   
@@ -145,5 +211,19 @@ void config_free(TransformerConfig* config) {
     free(config->cwt_scales);
     config->cwt_scales = NULL;
     config->num_cwt_scales = 0;
+    
+    free(config->train_fasta);
+    free(config->train_gff);
+    free(config->predict_fasta);
+    free(config->output_gff);
+    free(config->output_bedgraph);
+    free(config->model_path);
+    
+    config->train_fasta = NULL;
+    config->train_gff = NULL;
+    config->predict_fasta = NULL;
+    config->output_gff = NULL;
+    config->output_bedgraph = NULL;
+    config->model_path = NULL;
   }
 }
