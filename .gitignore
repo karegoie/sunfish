@@ -30,5 +30,10 @@ vgcore.*
 
 # Sunfish model file (generated during training)
 sunfish.model
+*.model
+
+# Test output files
+test_output.*
+test_config.toml
 
 gffcmp*

@@ -1,0 +1,134 @@
+#!/bin/bash
+# Integration test for Sunfish Transformer with sliding window support
+
+set -e
+
+echo "=== Sunfish Transformer Integration Test ==="
+echo ""
+
+# Create small test data
+echo "Creating test data..."
+head -10 data/NC_001133.9.fasta > /tmp/test_tiny.fasta
+head -10 data/NC_001133.9.gff > /tmp/test_tiny.gff
+
+# Create test configuration
+cat > /tmp/test_integration.toml << 'EOF'
+[model]
+d_model = 32
+num_encoder_layers = 1
+num_decoder_layers = 1
+num_heads = 2
+d_ff = 64
+vocab_size = 4
+max_seq_length = 500
+
+[training]
+dropout_rate = 0.1
+learning_rate = 0.001
+batch_size = 4
+num_epochs = 1
+
+[parallel]
+num_threads = 2
+
+[cwt]
+scales = [2.0, 4.0]
+
+[sliding_window]
+window_size = 200
+window_overlap = 40
+
+[paths]
+train_fasta = "/tmp/test_tiny.fasta"
+train_gff = "/tmp/test_tiny.gff"
+predict_fasta = "/tmp/test_tiny.fasta"
+output_gff = "/tmp/test_output.gff"
+output_bedgraph = "/tmp/test_output.bedgraph"
+model_path = "/tmp/test_model.bin"
+EOF
+
+echo "Test configuration created"
+echo ""
+
+# Run training
+echo "=== Testing Training ==="
+./bin/sunfish train -c /tmp/test_integration.toml
+echo ""
+
+# Check if model was saved
+if [ -f /tmp/test_model.bin ]; then
+    echo "✓ Model file created successfully"
+    ls -lh /tmp/test_model.bin
+else
+    echo "✗ Model file not found"
+    exit 1
+fi
+echo ""
+
+# Run prediction
+echo "=== Testing Prediction ==="
+./bin/sunfish predict -c /tmp/test_integration.toml
+echo ""
+
+# Check outputs
+echo "=== Checking Outputs ==="
+if [ -f /tmp/test_output.gff ]; then
+    echo "✓ GFF output created"
+    echo "  GFF lines: $(wc -l < /tmp/test_output.gff)"
+    head -5 /tmp/test_output.gff
+else
+    echo "✗ GFF output not found"
+    exit 1
+fi
+echo ""
+
+if [ -f /tmp/test_output.bedgraph ]; then
+    echo "✓ Bedgraph output created"
+    echo "  Bedgraph lines: $(wc -l < /tmp/test_output.bedgraph)"
+    head -5 /tmp/test_output.bedgraph
+else
+    echo "✗ Bedgraph output not found"
+    exit 1
+fi
+echo ""
+
+# Verify bedgraph format
+echo "=== Verifying Bedgraph Format ==="
+# Check that bedgraph has 4 columns: chr, start, end, score
+if head -2 /tmp/test_output.bedgraph | tail -1 | awk '{print NF}' | grep -q '^4$'; then
+    echo "✓ Bedgraph has correct format (4 columns: chr, start, end, score)"
+else
+    echo "✗ Bedgraph format incorrect"
+    exit 1
+fi
+
+# Check that scores are probabilities (0-1)
+max_score=$(tail -n +2 /tmp/test_output.bedgraph | awk '{print $4}' | sort -rn | head -1)
+min_score=$(tail -n +2 /tmp/test_output.bedgraph | awk '{print $4}' | sort -n | head -1)
+echo "  Score range: $min_score to $max_score"
+
+if (( $(echo "$max_score <= 1.0" | bc -l) )) && (( $(echo "$min_score >= 0.0" | bc -l) )); then
+    echo "✓ Scores are in valid probability range [0, 1]"
+else
+    echo "✗ Scores out of range"
+    exit 1
+fi
+echo ""
+
+# Clean up
+echo "=== Cleaning Up ==="
+rm -f /tmp/test_tiny.fasta /tmp/test_tiny.gff
+rm -f /tmp/test_integration.toml
+rm -f /tmp/test_model.bin
+rm -f /tmp/test_output.gff /tmp/test_output.bedgraph
+echo "Test files cleaned up"
+echo ""
+
+echo "=== All Tests Passed! ==="
+echo ""
+echo "Features verified:"
+echo "  ✓ Sliding window training"
+echo "  ✓ Model save/load"
+echo "  ✓ Config-based file paths"
+echo "  ✓ GFF output generation"
+echo "  ✓ Bedgraph output with exon probabilities"
