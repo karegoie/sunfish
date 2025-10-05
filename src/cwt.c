@@ -48,8 +48,7 @@ void generate_morlet_wavelet(double scale, int length, cplx* output) {
 }
 
 bool convolve_with_wavelet(const cplx* signal, int signal_len,
-                           const cplx* wavelet, int wavelet_len,
-                           cplx* output) {
+                           const cplx* wavelet, int wavelet_len, cplx* output) {
   // Find common padded length (power of 2)
   int max_len = signal_len + wavelet_len - 1;
   int padded_len = next_power_of_2(max_len);
@@ -97,64 +96,60 @@ bool convolve_with_wavelet(const cplx* signal, int signal_len,
 bool compute_cwt_features(const char* sequence, int seq_len,
                           const double* scales, int num_scales,
                           double** features) {
-  // Convert DNA to complex signal
   cplx* signal = (cplx*)malloc(seq_len * sizeof(cplx));
-  if (signal == NULL) {
+  if (!signal)
     return false;
-  }
   dna_to_signal(sequence, seq_len, signal);
 
-  // For each scale, generate wavelet and convolve
+  // Pre-allocate memory for the largest wavelet and CWT result
+  int max_wavelet_len = 0;
   for (int s = 0; s < num_scales; s++) {
-    // Choose wavelet length based on scale
-    int wavelet_len = (int)(10 * scales[s]);
-    if (wavelet_len > seq_len) {
-      wavelet_len = seq_len;
-    }
-    if (wavelet_len % 2 == 0) {
-      wavelet_len++;  // Make it odd for symmetric center
-    }
+    int len = (int)(10 * scales[s]);
+    if (len > max_wavelet_len)
+      max_wavelet_len = len;
+  }
+  if (max_wavelet_len > seq_len)
+    max_wavelet_len = seq_len;
+  if (max_wavelet_len % 2 == 0)
+    max_wavelet_len++;
 
-    cplx* wavelet = (cplx*)malloc(wavelet_len * sizeof(cplx));
-    if (wavelet == NULL) {
-      free(signal);
-      return false;
-    }
+  cplx* wavelet = (cplx*)malloc(max_wavelet_len * sizeof(cplx));
+  cplx* cwt_result = (cplx*)malloc(seq_len * sizeof(cplx));
+
+  if (!wavelet || !cwt_result) {
+    free(signal);
+    free(wavelet);
+    free(cwt_result);
+    return false;
+  }
+
+  for (int s = 0; s < num_scales; s++) {
+    int wavelet_len = (int)(10 * scales[s]);
+    if (wavelet_len > seq_len)
+      wavelet_len = seq_len;
+    if (wavelet_len % 2 == 0)
+      wavelet_len++;
 
     generate_morlet_wavelet(scales[s], wavelet_len, wavelet);
 
-    // Convolve signal with wavelet
-    cplx* cwt_result = (cplx*)malloc(seq_len * sizeof(cplx));
-    if (cwt_result == NULL) {
-      free(wavelet);
+    if (!convolve_with_wavelet(signal, seq_len, wavelet, wavelet_len,
+                               cwt_result)) {
       free(signal);
-      return false;
-    }
-
-    if (!convolve_with_wavelet(signal, seq_len, wavelet, wavelet_len, cwt_result)) {
+      free(wavelet);
       free(cwt_result);
-      free(wavelet);
-      free(signal);
       return false;
     }
 
-    // Store real and imaginary parts separately
-    // features[s * 2] = real part
-    // features[s * 2 + 1] = imaginary part
     int real_idx = s * 2;
     int imag_idx = s * 2 + 1;
-    double* real_features = features[real_idx];
-    double* imag_features = features[imag_idx];
-    
     for (int i = 0; i < seq_len; i++) {
-      real_features[i] = creal(cwt_result[i]);
-      imag_features[i] = cimag(cwt_result[i]);
+      features[real_idx][i] = creal(cwt_result[i]);
+      features[imag_idx][i] = cimag(cwt_result[i]);
     }
-
-    free(cwt_result);
-    free(wavelet);
   }
 
   free(signal);
+  free(wavelet);
+  free(cwt_result);
   return true;
 }

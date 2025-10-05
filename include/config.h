@@ -6,33 +6,32 @@
 // Transformer model configuration
 typedef struct {
   // Model architecture
-  int d_model;           // Model dimension (e.g., 512)
+  int d_model;            // Model dimension (e.g., 512)
   int num_encoder_layers; // Number of encoder layers
-  int num_decoder_layers; // Number of decoder layers
-  int num_heads;         // Number of attention heads
-  int d_ff;              // Feed-forward dimension
-  
+  int num_heads;          // Number of attention heads
+  int d_ff;               // Feed-forward dimension
+
   // Training parameters
-  double dropout_rate;   // Dropout rate
-  double learning_rate;  // Learning rate
-  int max_seq_length;    // Maximum sequence length (deprecated, use sliding window)
-  int batch_size;        // Batch size for training
-  int num_epochs;        // Number of training epochs
-  
+  double dropout_rate;  // Dropout rate
+  double learning_rate; // Learning rate
+  // (Removed deprecated max_seq_length; sliding window fields below replace it)
+  int batch_size; // Batch size for training
+  int num_epochs; // Number of training epochs
+
   // Parallelization
-  int num_threads;       // Number of threads for parallel computation
-  
+  int num_threads; // Number of threads for parallel computation
+
   // Classification
-  int num_labels;        // Number of output labels (3 for exon/intron/intergenic)
-  
+  int num_labels; // Number of output labels (3 for exon/intron/intergenic)
+
   // CWT Feature Extraction
-  int num_cwt_scales;    // Number of wavelet scales
-  double* cwt_scales;    // Array of scale values (dynamically allocated)
-  
+  int num_cwt_scales; // Number of wavelet scales
+  double* cwt_scales; // Array of scale values (dynamically allocated)
+
   // Sliding window configuration
-  int window_size;       // Window size for sliding window approach
-  int window_overlap;    // Overlap between consecutive windows
-  
+  int window_size;    // Window size for sliding window approach
+  int window_overlap; // Overlap between consecutive windows
+
   // File paths
   char* train_fasta;     // Training FASTA file path
   char* train_gff;       // Training GFF file path
@@ -40,7 +39,7 @@ typedef struct {
   char* output_gff;      // Output GFF file path
   char* output_bedgraph; // Output bedgraph file path
   char* model_path;      // Model save/load path
-  
+
 } TransformerConfig;
 
 /**

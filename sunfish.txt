@@ -1,0 +1,5807 @@
+==> src/config.c <==
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../include/config.h"
+#include "../include/toml.h"
+
+void config_init_defaults(TransformerConfig* config) {
+  config->d_model = 512;
+  config->num_encoder_layers = 6;
+  config->num_heads = 8;
+  config->d_ff = 2048;
+  config->dropout_rate = 0.1;
+  config->learning_rate = 0.0001;
+  config->batch_size = 32;
+  config->num_epochs = 10;
+  config->num_threads = 4;
+  config->num_labels = 3; // exon, intron, intergenic
+
+  // Sliding window defaults
+  config->window_size = 5000;
+  config->window_overlap = 1000;
+
+  // File paths defaults (NULL means not set)
+  config->train_fasta = NULL;
+  config->train_gff = NULL;
+  config->predict_fasta = NULL;
+  config->output_gff = NULL;
+  config->output_bedgraph = NULL;
+  config->model_path = NULL;
+
+  // Default CWT scales
+  config->num_cwt_scales = 5;
+  config->cwt_scales = (double*)malloc(config->num_cwt_scales * sizeof(double));
+  config->cwt_scales[0] = 2.0;
+  config->cwt_scales[1] = 4.0;
+  config->cwt_scales[2] = 8.0;
+  config->cwt_scales[3] = 16.0;
+  config->cwt_scales[4] = 32.0;
+}
+
+bool config_load(const char* filename, TransformerConfig* config) {
+  FILE* fp = fopen(filename, "r");
+  if (!fp) {
+    fprintf(stderr, "Error: Cannot open config file '%s'\n", filename);
+    return false;
+  }
+
+  char errbuf[200];
+  toml_table_t* conf = toml_parse_file(fp, errbuf, sizeof(errbuf));
+  fclose(fp);
+
+  if (!conf) {
+    fprintf(stderr, "Error parsing config file: %s\n", errbuf);
+    return false;
+  }
+
+  // Initialize with defaults first
+  config_init_defaults(config);
+
+  // Parse model section
+  toml_table_t* model = toml_table_in(conf, "model");
+  if (model) {
+    toml_datum_t d;
+
+    d = toml_int_in(model, "d_model");
+    if (d.ok)
+      config->d_model = d.u.i;
+
+    d = toml_int_in(model, "num_encoder_layers");
+    if (d.ok)
+      config->num_encoder_layers = d.u.i;
+
+    d = toml_int_in(model, "num_heads");
+    if (d.ok)
+      config->num_heads = d.u.i;
+
+    d = toml_int_in(model, "d_ff");
+    if (d.ok)
+      config->d_ff = d.u.i;
+  }
+
+  // Parse training section
+  toml_table_t* training = toml_table_in(conf, "training");
+  if (training) {
+    toml_datum_t d;
+
+    d = toml_double_in(training, "dropout_rate");
+    if (d.ok)
+      config->dropout_rate = d.u.d;
+
+    d = toml_double_in(training, "learning_rate");
+    if (d.ok)
+      config->learning_rate = d.u.d;
+
+    d = toml_int_in(training, "batch_size");
+    if (d.ok)
+      config->batch_size = d.u.i;
+
+    d = toml_int_in(training, "num_epochs");
+    if (d.ok)
+      config->num_epochs = d.u.i;
+  }
+
+  // Parse parallel section
+  toml_table_t* parallel = toml_table_in(conf, "parallel");
+  if (parallel) {
+    toml_datum_t d = toml_int_in(parallel, "num_threads");
+    if (d.ok)
+      config->num_threads = d.u.i;
+  }
+
+  // Parse CWT section if present
+  toml_table_t* cwt = toml_table_in(conf, "cwt");
+  if (cwt) {
+    toml_array_t* scales_arr = toml_array_in(cwt, "scales");
+    if (scales_arr) {
+      int num_scales = toml_array_nelem(scales_arr);
+      if (num_scales > 0) {
+        // Free default scales and allocate new
+        free(config->cwt_scales);
+        config->num_cwt_scales = num_scales;
+        config->cwt_scales = (double*)malloc(num_scales * sizeof(double));
+
+        for (int i = 0; i < num_scales; i++) {
+          toml_datum_t scale = toml_double_at(scales_arr, i);
+          if (scale.ok) {
+            config->cwt_scales[i] = scale.u.d;
+          } else {
+            config->cwt_scales[i] = 2.0 * (i + 1); // Fallback
+          }
+        }
+      }
+    }
+  }
+
+  // Parse sliding window section
+  toml_table_t* sliding_window = toml_table_in(conf, "sliding_window");
+  if (sliding_window) {
+    toml_datum_t d;
+
+    d = toml_int_in(sliding_window, "window_size");
+    if (d.ok)
+      config->window_size = d.u.i;
+
+    d = toml_int_in(sliding_window, "window_overlap");
+    if (d.ok)
+      config->window_overlap = d.u.i;
+  }
+
+  // Parse paths section
+  toml_table_t* paths = toml_table_in(conf, "paths");
+  if (paths) {
+    toml_datum_t d;
+
+    d = toml_string_in(paths, "train_fasta");
+    if (d.ok) {
+      config->train_fasta = strdup(d.u.s);
+      free(d.u.s);
+    }
+
+    d = toml_string_in(paths, "train_gff");
+    if (d.ok) {
+      config->train_gff = strdup(d.u.s);
+      free(d.u.s);
+    }
+
+    d = toml_string_in(paths, "predict_fasta");
+    if (d.ok) {
+      config->predict_fasta = strdup(d.u.s);
+      free(d.u.s);
+    }
+
+    d = toml_string_in(paths, "output_gff");
+    if (d.ok) {
+      config->output_gff = strdup(d.u.s);
+      free(d.u.s);
+    }
+
+    d = toml_string_in(paths, "output_bedgraph");
+    if (d.ok) {
+      config->output_bedgraph = strdup(d.u.s);
+      free(d.u.s);
+    }
+
+    d = toml_string_in(paths, "model_path");
+    if (d.ok) {
+      config->model_path = strdup(d.u.s);
+      free(d.u.s);
+    }
+  }
+
+  toml_free(conf);
+
+  // Validate configuration
+  if (config->d_model <= 0 || config->num_heads <= 0) {
+    fprintf(stderr, "Error: Invalid configuration values\n");
+    return false;
+  }
+
+  if (config->d_model % config->num_heads != 0) {
+    fprintf(stderr, "Error: d_model must be divisible by num_heads\n");
+    return false;
+  }
+
+  return true;
+}
+
+void config_free(TransformerConfig* config) {
+  if (config) {
+    free(config->cwt_scales);
+    config->cwt_scales = NULL;
+    config->num_cwt_scales = 0;
+
+    free(config->train_fasta);
+    free(config->train_gff);
+    free(config->predict_fasta);
+    free(config->output_gff);
+    free(config->output_bedgraph);
+    free(config->model_path);
+
+    config->train_fasta = NULL;
+    config->train_gff = NULL;
+    config->predict_fasta = NULL;
+    config->output_gff = NULL;
+    config->output_bedgraph = NULL;
+    config->model_path = NULL;
+  }
+
+==> src/cwt.c <==
+#include <complex.h>
+#include <ctype.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../include/cwt.h"
+#include "../include/fft.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+cplx dna_to_complex(char base) {
+  switch (toupper((unsigned char)base)) {
+  case 'A':
+    return 1.0 + 1.0 * I;
+  case 'T':
+    return 1.0 - 1.0 * I;
+  case 'G':
+    return -1.0 + 1.0 * I;
+  case 'C':
+    return -1.0 - 1.0 * I;
+  default:
+    // For unknown bases, return zero
+    return 0.0 + 0.0 * I;
+  }
+}
+
+void dna_to_signal(const char* sequence, int length, cplx* output) {
+  for (int i = 0; i < length; i++) {
+    output[i] = dna_to_complex(sequence[i]);
+  }
+}
+
+void generate_morlet_wavelet(double scale, int length, cplx* output) {
+  // Morlet wavelet: ψ(t) = exp(-t²/(2s²)) * exp(j*2π*t/s) / √(s*π^(1/4))
+  int center = length / 2;
+  double norm = 1.0 / sqrt(scale * pow(M_PI, 0.25));
+
+  for (int i = 0; i < length; i++) {
+    double t = (i - center) / scale;
+    double gaussian = exp(-0.5 * t * t);
+    double phase = 2.0 * M_PI * t;
+    output[i] = norm * gaussian * cexp(I * phase);
+  }
+}
+
+bool convolve_with_wavelet(const cplx* signal, int signal_len,
+                           const cplx* wavelet, int wavelet_len, cplx* output) {
+  // Find common padded length (power of 2)
+  int max_len = signal_len + wavelet_len - 1;
+  int padded_len = next_power_of_2(max_len);
+
+  // Allocate padded arrays
+  cplx* signal_padded = (cplx*)calloc(padded_len, sizeof(cplx));
+  cplx* wavelet_padded = (cplx*)calloc(padded_len, sizeof(cplx));
+
+  if (signal_padded == NULL || wavelet_padded == NULL) {
+    free(signal_padded);
+    free(wavelet_padded);
+    return false;
+  }
+
+  // Copy data to padded arrays
+  memcpy(signal_padded, signal, signal_len * sizeof(cplx));
+  memcpy(wavelet_padded, wavelet, wavelet_len * sizeof(cplx));
+
+  // Compute FFT of both
+  fft(signal_padded, padded_len, false);
+  fft(wavelet_padded, padded_len, false);
+
+  // Element-wise multiplication in frequency domain
+  for (int i = 0; i < padded_len; i++) {
+    signal_padded[i] = signal_padded[i] * wavelet_padded[i];
+  }
+
+  // Inverse FFT
+  ifft(signal_padded, padded_len);
+
+  // Calculate offset to correct for convolution delay
+  int offset = wavelet_len / 2;
+
+  // Extract complex values with offset correction
+  for (int i = 0; i < signal_len; i++) {
+    output[i] = signal_padded[i + offset];
+  }
+
+  free(signal_padded);
+  free(wavelet_padded);
+
+  return true;
+}
+
+bool compute_cwt_features(const char* sequence, int seq_len,
+                          const double* scales, int num_scales,
+                          double** features) {
+  cplx* signal = (cplx*)malloc(seq_len * sizeof(cplx));
+  if (!signal)
+    return false;
+  dna_to_signal(sequence, seq_len, signal);
+
+  // Pre-allocate memory for the largest wavelet and CWT result
+  int max_wavelet_len = 0;
+  for (int s = 0; s < num_scales; s++) {
+    int len = (int)(10 * scales[s]);
+    if (len > max_wavelet_len)
+      max_wavelet_len = len;
+  }
+  if (max_wavelet_len > seq_len)
+    max_wavelet_len = seq_len;
+  if (max_wavelet_len % 2 == 0)
+    max_wavelet_len++;
+
+  cplx* wavelet = (cplx*)malloc(max_wavelet_len * sizeof(cplx));
+  cplx* cwt_result = (cplx*)malloc(seq_len * sizeof(cplx));
+
+  if (!wavelet || !cwt_result) {
+    free(signal);
+    free(wavelet);
+    free(cwt_result);
+    return false;
+  }
+
+  for (int s = 0; s < num_scales; s++) {
+    int wavelet_len = (int)(10 * scales[s]);
+    if (wavelet_len > seq_len)
+      wavelet_len = seq_len;
+    if (wavelet_len % 2 == 0)
+      wavelet_len++;
+
+    generate_morlet_wavelet(scales[s], wavelet_len, wavelet);
+
+    if (!convolve_with_wavelet(signal, seq_len, wavelet, wavelet_len,
+                               cwt_result)) {
+      free(signal);
+      free(wavelet);
+      free(cwt_result);
+      return false;
+    }
+
+    int real_idx = s * 2;
+    int imag_idx = s * 2 + 1;
+    for (int i = 0; i < seq_len; i++) {
+      features[real_idx][i] = creal(cwt_result[i]);
+      features[imag_idx][i] = cimag(cwt_result[i]);
+    }
+  }
+
+  free(signal);
+  free(wavelet);
+  free(cwt_result);
+  return true;
+
+==> src/fasta_parser.c <==
+#define _POSIX_C_SOURCE 200809L
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../include/fasta_parser.h"
+
+#define MAX_LINE_LEN 50000
+
+void free_fasta_data(FastaData* data) {
+  if (!data)
+    return;
+  for (int i = 0; i < data->count; i++) {
+    free(data->records[i].id);
+    free(data->records[i].sequence);
+  }
+  free(data->records);
+  free(data);
+}
+
+FastaData* parse_fasta(const char* path) {
+  FILE* fp = fopen(path, "r");
+  if (!fp) {
+    fprintf(stderr, "Error: Cannot open FASTA file: %s\n", path);
+    return NULL;
+  }
+  FastaData* data = (FastaData*)calloc(1, sizeof(FastaData));
+  if (!data) {
+    fclose(fp);
+    return NULL;
+  }
+  int cap = 16;
+  data->records = (FastaRecord*)malloc(cap * sizeof(FastaRecord));
+  if (!data->records) {
+    fclose(fp);
+    free(data);
+    return NULL;
+  }
+  data->count = 0;
+  char line[MAX_LINE_LEN];
+  char* cur = NULL;
+  size_t cur_cap = 0;
+  size_t cur_len = 0;
+  while (fgets(line, sizeof(line), fp)) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = '\0';
+    if (line[0] == '>') {
+      if (cur) {
+        data->records[data->count - 1].sequence = cur;
+        cur = NULL;
+      }
+      if (data->count >= cap) {
+        int new_cap = cap * 2;
+        FastaRecord* new_records =
+            (FastaRecord*)realloc(data->records, new_cap * sizeof(FastaRecord));
+        if (!new_records) {
+          free(cur);
+          fclose(fp);
+          free_fasta_data(data);
+          return NULL;
+        }
+        data->records = new_records;
+        cap = new_cap;
+      }
+      const char* header = line + 1;
+      size_t id_len = 0;
+      while (header[id_len] && !isspace((unsigned char)header[id_len]))
+        id_len++;
+      char* id = (char*)malloc(id_len + 1);
+      memcpy(id, header, id_len);
+      id[id_len] = '\0';
+      data->records[data->count].id = id;
+      data->records[data->count].sequence = NULL;
+      data->count++;
+      cur_cap = 8192;
+      cur_len = 0;
+      cur = (char*)malloc(cur_cap);
+      cur[0] = '\0';
+    } else if (cur) {
+      size_t ll = strlen(line);
+      while (cur_len + ll + 1 > cur_cap) {
+        size_t new_cap = cur_cap * 2;
+        char* new_buf = (char*)realloc(cur, new_cap);
+        if (!new_buf) {
+          free(cur);
+          fclose(fp);
+          free_fasta_data(data);
+          return NULL;
+        }
+        cur = new_buf;
+        cur_cap = new_cap;
+      }
+      memcpy(cur + cur_len, line, ll + 1);
+      cur_len += ll;
+    }
+  }
+  if (cur && data->count > 0)
+    data->records[data->count - 1].sequence = cur;
+  fclose(fp);
+  return data;
+}
+
+char complement_base(char base) {
+  switch (base) {
+    case 'A': case 'a': return 'T';
+    case 'T': case 't': return 'A';
+    case 'G': case 'g': return 'C';
+    case 'C': case 'c': return 'G';
+    default: return 'N';
+  }
+}
+
+char* reverse_complement(const char* sequence) {
+  if (!sequence) return NULL;
+  
+  size_t len = strlen(sequence);
+  char* rc = (char*)malloc(len + 1);
+  if (!rc) return NULL;
+  
+  for (size_t i = 0; i < len; i++) {
+    rc[i] = complement_base(sequence[len - 1 - i]);
+  }
+  rc[len] = '\0';
+  
+  return rc;
+
+==> src/fft.c <==
+#include <complex.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../include/fft.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+int next_power_of_2(int n) {
+  int power = 1;
+  while (power < n) {
+    power *= 2;
+  }
+  return power;
+}
+
+// Bit-reversal permutation for FFT
+static void bit_reverse_copy(cplx* dst, const cplx* src, int n) {
+  int bits = 0;
+  int temp = n;
+  while (temp > 1) {
+    bits++;
+    temp >>= 1;
+  }
+
+  for (int i = 0; i < n; i++) {
+    int rev = 0;
+    for (int j = 0; j < bits; j++) {
+      if (i & (1 << j)) {
+        rev |= 1 << (bits - 1 - j);
+      }
+    }
+    dst[rev] = src[i];
+  }
+}
+
+void fft(cplx* x, int n, bool inverse) {
+  if (n <= 1) return;
+
+  // Bit-reversal permutation
+  cplx* temp = (cplx*)malloc(n * sizeof(cplx));
+  bit_reverse_copy(temp, x, n);
+  memcpy(x, temp, n * sizeof(cplx));
+  free(temp);
+
+  // Cooley-Tukey FFT
+  for (int s = 1; s <= (int)(log2(n)); s++) {
+    int m = 1 << s;  // 2^s
+    int m2 = m >> 1; // m/2
+
+    // Compute twiddle factor
+    double theta = (inverse ? 2.0 : -2.0) * M_PI / m;
+    cplx w_m = cexp(I * theta);
+
+    for (int k = 0; k < n; k += m) {
+      cplx w = 1.0;
+      for (int j = 0; j < m2; j++) {
+        cplx t = w * x[k + j + m2];
+        cplx u = x[k + j];
+        x[k + j] = u + t;
+        x[k + j + m2] = u - t;
+        w = w * w_m;
+      }
+    }
+  }
+
+  // Normalize for inverse FFT
+  if (inverse) {
+    for (int i = 0; i < n; i++) {
+      x[i] /= n;
+    }
+  }
+}
+
+void ifft(cplx* x, int n) {
+  fft(x, n, true);
+
+==> src/gff_parser.c <==
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../include/gff_parser.h"
+
+#define INITIAL_CAPACITY 1000
+#define LINE_BUFFER_SIZE 8192
+
+// Helper function to trim whitespace
+static char* trim(char* str) {
+  while (isspace((unsigned char)*str))
+    str++;
+  if (*str == 0)
+    return str;
+
+  char* end = str + strlen(str) - 1;
+  while (end > str && isspace((unsigned char)*end))
+    end--;
+  end[1] = '\0';
+
+  return str;
+}
+
+GFFData* parse_gff(const char* filename) {
+  FILE* fp = fopen(filename, "r");
+  if (!fp) {
+    fprintf(stderr, "Error: Cannot open GFF file '%s'\n", filename);
+    return NULL;
+  }
+
+  GFFData* gff_data = (GFFData*)malloc(sizeof(GFFData));
+  if (!gff_data) {
+    fclose(fp);
+    return NULL;
+  }
+
+  gff_data->capacity = INITIAL_CAPACITY;
+  gff_data->count = 0;
+  gff_data->records =
+      (GFFRecord*)malloc(gff_data->capacity * sizeof(GFFRecord));
+
+  if (!gff_data->records) {
+    free(gff_data);
+    fclose(fp);
+    return NULL;
+  }
+
+  char line[LINE_BUFFER_SIZE];
+  while (fgets(line, sizeof(line), fp)) {
+    if (line[0] == '#' || line[0] == '\n')
+      continue;
+
+    char* tokens[9];
+    int token_count = 0;
+    char* line_ptr = line;
+
+    // Manual tokenization by tab
+    for (int i = 0; i < 9 && line_ptr; i++) {
+      char* next_tab = strchr(line_ptr, '\t');
+      if (next_tab) {
+        *next_tab = '\0';
+        tokens[token_count++] = line_ptr;
+        line_ptr = next_tab + 1;
+      } else {
+        // Last field
+        char* newline = strchr(line_ptr, '\n');
+        if (newline)
+          *newline = '\0';
+        tokens[token_count++] = line_ptr;
+        line_ptr = NULL;
+      }
+    }
+
+    if (token_count < 8)
+      continue;
+
+    // Only keep CDS features
+    if (strcmp(tokens[2], "CDS") != 0)
+      continue;
+
+    if (gff_data->count >= gff_data->capacity) {
+      gff_data->capacity *= 2;
+      GFFRecord* new_records = (GFFRecord*)realloc(
+          gff_data->records, gff_data->capacity * sizeof(GFFRecord));
+      if (!new_records) {
+        free_gff_data(gff_data);
+        fclose(fp);
+        return NULL;
+      }
+      gff_data->records = new_records;
+    }
+
+    GFFRecord* record = &gff_data->records[gff_data->count];
+    record->seqid = strdup(tokens[0]);
+    record->source = strdup(tokens[1]);
+    record->feature = strdup(tokens[2]);
+    record->start = atoi(tokens[3]);
+    record->end = atoi(tokens[4]);
+    record->strand = tokens[6][0];
+    record->attributes =
+        (token_count >= 9) ? strdup(trim(tokens[8])) : strdup("");
+
+    gff_data->count++;
+  }
+
+  fclose(fp);
+  fprintf(stderr, "Loaded %d CDS records from GFF\n", gff_data->count);
+  return gff_data;
+}
+
+void free_gff_data(GFFData* gff_data) {
+  if (!gff_data)
+    return;
+
+  for (int i = 0; i < gff_data->count; i++) {
+    free(gff_data->records[i].seqid);
+    free(gff_data->records[i].source);
+    free(gff_data->records[i].feature);
+    free(gff_data->records[i].attributes);
+  }
+
+  free(gff_data->records);
+  free(gff_data);
+}
+
+bool create_labels_from_gff(const GFFData* gff_data, const char* seqid,
+                            int seq_len, char strand, int* labels) {
+  if (!gff_data || !seqid || !labels)
+    return false;
+
+  // Initialize all positions as intergenic
+  for (int i = 0; i < seq_len; i++) {
+    labels[i] = LABEL_INTERGENIC;
+  }
+
+  // Mark CDS regions as exons
+  for (int i = 0; i < gff_data->count; i++) {
+    const GFFRecord* record = &gff_data->records[i];
+
+    // Skip if different sequence or strand
+    if (strcmp(record->seqid, seqid) != 0)
+      continue;
+    if (record->strand != strand)
+      continue;
+
+    // Mark positions as exon (CDS)
+    // GFF uses 1-based coordinates, convert to 0-based
+    int start_idx = record->start - 1;
+    int end_idx = record->end - 1;
+
+    // Clamp to sequence bounds
+    if (start_idx < 0)
+      start_idx = 0;
+    if (end_idx >= seq_len)
+      end_idx = seq_len - 1;
+
+    for (int pos = start_idx; pos <= end_idx; pos++) {
+      labels[pos] = LABEL_EXON;
+    }
+  }
+
+  return true;
+
+==> src/main.c <==
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../include/config.h"
+#include "../include/transformer.h"
+
+static void print_help(const char* prog_name) {
+  fprintf(stderr, "Sunfish Transformer-based Gene Annotation Tool\n\n");
+  fprintf(stderr, "Usage:\n");
+  fprintf(stderr, "  %s <command> -c <config.toml>\n\n", prog_name);
+  fprintf(stderr, "Commands:\n");
+  fprintf(stderr, "  help                         Show this help message\n");
+  fprintf(
+      stderr,
+      "  train -c <config.toml>       Train model (uses paths from config)\n");
+  fprintf(stderr, "  predict -c <config.toml>     Predict genes (uses paths "
+                  "from config)\n\n");
+  fprintf(stderr, "Options:\n");
+  fprintf(stderr, "  -h, --help                   Show this help message\n");
+  fprintf(stderr,
+          "  -c <config.toml>             Configuration file (required)\n\n");
+  fprintf(stderr, "Examples:\n");
+  fprintf(stderr, "  %s train -c config.toml\n", prog_name);
+  fprintf(stderr, "  %s predict -c config.toml\n", prog_name);
+}
+
+static char* find_config_arg(int argc, char* argv[]) {
+  for (int i = 1; i < argc - 1; i++) {
+    if (strcmp(argv[i], "-c") == 0) {
+      return argv[i + 1];
+    }
+  }
+  return NULL;
+}
+
+int main(int argc, char* argv[]) {
+  // Ensure real-time output behavior
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  if (argc < 2) {
+    print_help(argv[0]);
+    return 0;
+  }
+
+  if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
+      strcmp(argv[1], "-h") == 0) {
+    print_help(argv[0]);
+    return 0;
+  }
+
+  // Find config file argument
+  char* config_file = find_config_arg(argc, argv);
+  if (!config_file) {
+    fprintf(stderr, "Error: Configuration file required (-c <config.toml>)\n");
+    print_help(argv[0]);
+    return 1;
+  }
+
+  // Load configuration
+  TransformerConfig config;
+  if (!config_load(config_file, &config)) {
+    fprintf(stderr, "Error: Failed to load configuration from '%s'\n",
+            config_file);
+    return 1;
+  }
+
+  fprintf(stderr, "Loaded configuration from '%s'\n", config_file);
+  fprintf(stderr, "  Model: d_model=%d, heads=%d, encoder_layers=%d\n",
+          config.d_model, config.num_heads, config.num_encoder_layers);
+
+  // Create Transformer model
+  TransformerModel* model = transformer_create(&config);
+  if (!model) {
+    fprintf(stderr, "Error: Failed to create Transformer model\n");
+    config_free(&config);
+    return 1;
+  }
+
+  if (strcmp(argv[1], "train") == 0) {
+    // Check if paths are provided in config
+    if (!config.train_fasta || !config.train_gff) {
+      fprintf(stderr, "Error: train_fasta and train_gff must be specified in "
+                      "config.toml [paths] section\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    if (!config.model_path) {
+      fprintf(stderr, "Error: model_path must be specified in config.toml "
+                      "[paths] section\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    fprintf(stderr, "Starting training...\n");
+    fprintf(stderr, "  Training FASTA: %s\n", config.train_fasta);
+    fprintf(stderr, "  Training GFF: %s\n", config.train_gff);
+    fprintf(stderr, "  Model will be saved to: %s\n", config.model_path);
+
+    if (!transformer_train(model, config.train_fasta, config.train_gff)) {
+      fprintf(stderr, "Error: Training failed\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    // Save the trained model
+    fprintf(stderr, "Saving model to %s...\n", config.model_path);
+    if (!transformer_save(model, config.model_path)) {
+      fprintf(stderr, "Error: Failed to save model\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    fprintf(stderr, "Training completed successfully!\n");
+
+  } else if (strcmp(argv[1], "predict") == 0) {
+    // Check if paths are provided in config
+    if (!config.predict_fasta) {
+      fprintf(stderr, "Error: predict_fasta must be specified in config.toml "
+                      "[paths] section\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    if (!config.model_path) {
+      fprintf(stderr, "Error: model_path must be specified in config.toml "
+                      "[paths] section\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    if (!config.output_gff) {
+      fprintf(stderr, "Error: output_gff must be specified in config.toml "
+                      "[paths] section\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    // Load the trained model
+    fprintf(stderr, "Loading model from %s...\n", config.model_path);
+    if (!transformer_load(model, config.model_path)) {
+      fprintf(stderr, "Error: Failed to load model\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+
+    fprintf(stderr, "Starting prediction...\n");
+    fprintf(stderr, "  Input FASTA: %s\n", config.predict_fasta);
+    fprintf(stderr, "  Output GFF: %s\n", config.output_gff);
+    if (config.output_bedgraph) {
+      fprintf(stderr, "  Output bedgraph: %s\n", config.output_bedgraph);
+    }
+
+    transformer_predict(model, config.predict_fasta, config.output_gff,
+                        config.output_bedgraph);
+    fprintf(stderr, "Prediction completed!\n");
+
+  } else {
+    fprintf(stderr, "Error: Unknown mode '%s'\n", argv[1]);
+    fprintf(stderr, "Valid commands: help, train, predict\n");
+    print_help(argv[0]);
+    transformer_free(model);
+    config_free(&config);
+    return 1;
+  }
+
+  transformer_free(model);
+  config_free(&config);
+
+  return 0;
+
+==> src/thread_pool.c <==
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
+#include "../include/thread_pool.h"
+
+// Worker thread function
+static void* worker_thread(void* arg) {
+  thread_pool_t* pool = (thread_pool_t*)arg;
+  
+  while (true) {
+    pthread_mutex_lock(&pool->queue_mutex);
+    
+    // Wait for a task or shutdown signal
+    while (pool->task_queue_head == NULL && !pool->shutdown) {
+      pthread_cond_wait(&pool->queue_cond, &pool->queue_mutex);
+    }
+    
+    // Check for shutdown
+    if (pool->shutdown && pool->task_queue_head == NULL) {
+      pthread_mutex_unlock(&pool->queue_mutex);
+      break;
+    }
+    
+    // Dequeue task
+    task_t* task = pool->task_queue_head;
+    if (task != NULL) {
+      pool->task_queue_head = task->next;
+      if (pool->task_queue_head == NULL) {
+        pool->task_queue_tail = NULL;
+      }
+      pool->active_tasks++;
+    }
+    
+    pthread_mutex_unlock(&pool->queue_mutex);
+    
+    // Execute task
+    if (task != NULL) {
+      task->function(task->argument);
+      free(task);
+      
+      pthread_mutex_lock(&pool->queue_mutex);
+      pool->active_tasks--;
+      if (pool->active_tasks == 0 && pool->task_queue_head == NULL) {
+        pthread_cond_broadcast(&pool->done_cond);
+      }
+      pthread_mutex_unlock(&pool->queue_mutex);
+    }
+  }
+  
+  return NULL;
+}
+
+thread_pool_t* thread_pool_create(int num_threads) {
+  if (num_threads <= 0) {
+    return NULL;
+  }
+  
+  thread_pool_t* pool = (thread_pool_t*)malloc(sizeof(thread_pool_t));
+  if (pool == NULL) {
+    return NULL;
+  }
+  
+  pool->thread_count = num_threads;
+  pool->task_queue_head = NULL;
+  pool->task_queue_tail = NULL;
+  pool->active_tasks = 0;
+  pool->shutdown = false;
+  
+  // Initialize mutex and condition variables
+  if (pthread_mutex_init(&pool->queue_mutex, NULL) != 0) {
+    free(pool);
+    return NULL;
+  }
+  
+  if (pthread_cond_init(&pool->queue_cond, NULL) != 0) {
+    pthread_mutex_destroy(&pool->queue_mutex);
+    free(pool);
+    return NULL;
+  }
+  
+  if (pthread_cond_init(&pool->done_cond, NULL) != 0) {
+    pthread_cond_destroy(&pool->queue_cond);
+    pthread_mutex_destroy(&pool->queue_mutex);
+    free(pool);
+    return NULL;
+  }
+  
+  // Allocate thread array
+  pool->threads = (pthread_t*)malloc(sizeof(pthread_t) * num_threads);
+  if (pool->threads == NULL) {
+    pthread_cond_destroy(&pool->done_cond);
+    pthread_cond_destroy(&pool->queue_cond);
+    pthread_mutex_destroy(&pool->queue_mutex);
+    free(pool);
+    return NULL;
+  }
+  
+  // Create worker threads
+  for (int i = 0; i < num_threads; i++) {
+    if (pthread_create(&pool->threads[i], NULL, worker_thread, pool) != 0) {
+      // Failed to create thread, cleanup
+      pool->shutdown = true;
+      pthread_cond_broadcast(&pool->queue_cond);
+      for (int j = 0; j < i; j++) {
+        pthread_join(pool->threads[j], NULL);
+      }
+      free(pool->threads);
+      pthread_cond_destroy(&pool->done_cond);
+      pthread_cond_destroy(&pool->queue_cond);
+      pthread_mutex_destroy(&pool->queue_mutex);
+      free(pool);
+      return NULL;
+    }
+  }
+  
+  return pool;
+}
+
+bool thread_pool_add_task(thread_pool_t* pool, task_func_t function, void* arg) {
+  if (pool == NULL || function == NULL) {
+    return false;
+  }
+  
+  task_t* task = (task_t*)malloc(sizeof(task_t));
+  if (task == NULL) {
+    return false;
+  }
+  
+  task->function = function;
+  task->argument = arg;
+  task->next = NULL;
+  
+  pthread_mutex_lock(&pool->queue_mutex);
+  
+  if (pool->shutdown) {
+    pthread_mutex_unlock(&pool->queue_mutex);
+    free(task);
+    return false;
+  }
+  
+  // Enqueue task
+  if (pool->task_queue_tail == NULL) {
+    pool->task_queue_head = task;
+    pool->task_queue_tail = task;
+  } else {
+    pool->task_queue_tail->next = task;
+    pool->task_queue_tail = task;
+  }
+  
+  pthread_cond_signal(&pool->queue_cond);
+  pthread_mutex_unlock(&pool->queue_mutex);
+  
+  return true;
+}
+
+void thread_pool_wait(thread_pool_t* pool) {
+  if (pool == NULL) {
+    return;
+  }
+  
+  pthread_mutex_lock(&pool->queue_mutex);
+  
+  while (pool->active_tasks > 0 || pool->task_queue_head != NULL) {
+    pthread_cond_wait(&pool->done_cond, &pool->queue_mutex);
+  }
+  
+  pthread_mutex_unlock(&pool->queue_mutex);
+}
+
+void thread_pool_destroy(thread_pool_t* pool) {
+  if (pool == NULL) {
+    return;
+  }
+  
+  pthread_mutex_lock(&pool->queue_mutex);
+  pool->shutdown = true;
+  pthread_cond_broadcast(&pool->queue_cond);
+  pthread_mutex_unlock(&pool->queue_mutex);
+  
+  // Join all threads
+  for (int i = 0; i < pool->thread_count; i++) {
+    pthread_join(pool->threads[i], NULL);
+  }
+  
+  // Free remaining tasks in queue
+  task_t* task = pool->task_queue_head;
+  while (task != NULL) {
+    task_t* next = task->next;
+    free(task);
+    task = next;
+  }
+  
+  free(pool->threads);
+  pthread_cond_destroy(&pool->done_cond);
+  pthread_cond_destroy(&pool->queue_cond);
+  pthread_mutex_destroy(&pool->queue_mutex);
+  free(pool);
+
+==> src/toml.c <==
+/*
+
+  MIT License
+
+  Copyright (c) CK Tan
+  https://github.com/cktan/tomlc99
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+*/
+#define _POSIX_C_SOURCE 200809L
+#include "toml.h"
+#include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void *(*ppmalloc)(size_t) = malloc;
+static void (*ppfree)(void *) = free;
+
+void toml_set_memutil(void *(*xxmalloc)(size_t), void (*xxfree)(void *)) {
+  if (xxmalloc)
+    ppmalloc = xxmalloc;
+  if (xxfree)
+    ppfree = xxfree;
+}
+
+#define ALIGN8(sz) (((sz) + 7) & ~7)
+#define MALLOC(a) ppmalloc(a)
+#define FREE(a) ppfree(a)
+
+#define malloc(x) error - forbidden - use MALLOC instead
+#define free(x) error - forbidden - use FREE instead
+#define calloc(x, y) error - forbidden - use CALLOC instead
+
+static void *CALLOC(size_t nmemb, size_t sz) {
+  int nb = ALIGN8(sz) * nmemb;
+  void *p = MALLOC(nb);
+  if (p) {
+    memset(p, 0, nb);
+  }
+  return p;
+}
+
+// some old platforms define strdup macro -- drop it.
+#undef strdup
+#define strdup(x) error - forbidden - use STRDUP instead
+
+static char *STRDUP(const char *s) {
+  int len = strlen(s);
+  char *p = MALLOC(len + 1);
+  if (p) {
+    memcpy(p, s, len);
+    p[len] = 0;
+  }
+  return p;
+}
+
+// some old platforms define strndup macro -- drop it.
+#undef strndup
+#define strndup(x) error - forbiden - use STRNDUP instead
+
+static char *STRNDUP(const char *s, size_t n) {
+  size_t len = strnlen(s, n);
+  char *p = MALLOC(len + 1);
+  if (p) {
+    memcpy(p, s, len);
+    p[len] = 0;
+  }
+  return p;
+}
+
+/**
+ * Convert a char in utf8 into UCS, and store it in *ret.
+ * Return #bytes consumed or -1 on failure.
+ */
+int toml_utf8_to_ucs(const char *orig, int len, int64_t *ret) {
+  const unsigned char *buf = (const unsigned char *)orig;
+  unsigned i = *buf++;
+  int64_t v;
+
+  /* 0x00000000 - 0x0000007F:
+     0xxxxxxx
+  */
+  if (0 == (i >> 7)) {
+    if (len < 1)
+      return -1;
+    v = i;
+    return *ret = v, 1;
+  }
+  /* 0x00000080 - 0x000007FF:
+     110xxxxx 10xxxxxx
+  */
+  if (0x6 == (i >> 5)) {
+    if (len < 2)
+      return -1;
+    v = i & 0x1f;
+    for (int j = 0; j < 1; j++) {
+      i = *buf++;
+      if (0x2 != (i >> 6))
+        return -1;
+      v = (v << 6) | (i & 0x3f);
+    }
+    return *ret = v, (const char *)buf - orig;
+  }
+
+  /* 0x00000800 - 0x0000FFFF:
+     1110xxxx 10xxxxxx 10xxxxxx
+  */
+  if (0xE == (i >> 4)) {
+    if (len < 3)
+      return -1;
+    v = i & 0x0F;
+    for (int j = 0; j < 2; j++) {
+      i = *buf++;
+      if (0x2 != (i >> 6))
+        return -1;
+      v = (v << 6) | (i & 0x3f);
+    }
+    return *ret = v, (const char *)buf - orig;
+  }
+
+  /* 0x00010000 - 0x001FFFFF:
+     11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+  */
+  if (0x1E == (i >> 3)) {
+    if (len < 4)
+      return -1;
+    v = i & 0x07;
+    for (int j = 0; j < 3; j++) {
+      i = *buf++;
+      if (0x2 != (i >> 6))
+        return -1;
+      v = (v << 6) | (i & 0x3f);
+    }
+    return *ret = v, (const char *)buf - orig;
+  }
+
+  /* 0x00200000 - 0x03FFFFFF:
+     111110xx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+  */
+  if (0x3E == (i >> 2)) {
+    if (len < 5)
+      return -1;
+    v = i & 0x03;
+    for (int j = 0; j < 4; j++) {
+      i = *buf++;
+      if (0x2 != (i >> 6))
+        return -1;
+      v = (v << 6) | (i & 0x3f);
+    }
+    return *ret = v, (const char *)buf - orig;
+  }
+
+  /* 0x04000000 - 0x7FFFFFFF:
+     1111110x 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+  */
+  if (0x7e == (i >> 1)) {
+    if (len < 6)
+      return -1;
+    v = i & 0x01;
+    for (int j = 0; j < 5; j++) {
+      i = *buf++;
+      if (0x2 != (i >> 6))
+        return -1;
+      v = (v << 6) | (i & 0x3f);
+    }
+    return *ret = v, (const char *)buf - orig;
+  }
+  return -1;
+}
+
+/**
+ *	Convert a UCS char to utf8 code, and return it in buf.
+ *	Return #bytes used in buf to encode the char, or
+ *	-1 on error.
+ */
+int toml_ucs_to_utf8(int64_t code, char buf[6]) {
+  /* http://stackoverflow.com/questions/6240055/manually-converting-unicode-codepoints-into-utf-8-and-utf-16
+   */
+  /* The UCS code values 0xd800–0xdfff (UTF-16 surrogates) as well
+   * as 0xfffe and 0xffff (UCS noncharacters) should not appear in
+   * conforming UTF-8 streams.
+   */
+  if (0xd800 <= code && code <= 0xdfff)
+    return -1;
+  if (0xfffe <= code && code <= 0xffff)
+    return -1;
+
+  /* 0x00000000 - 0x0000007F:
+     0xxxxxxx
+  */
+  if (code < 0)
+    return -1;
+  if (code <= 0x7F) {
+    buf[0] = (unsigned char)code;
+    return 1;
+  }
+
+  /* 0x00000080 - 0x000007FF:
+     110xxxxx 10xxxxxx
+  */
+  if (code <= 0x000007FF) {
+    buf[0] = (unsigned char)(0xc0 | (code >> 6));
+    buf[1] = (unsigned char)(0x80 | (code & 0x3f));
+    return 2;
+  }
+
+  /* 0x00000800 - 0x0000FFFF:
+     1110xxxx 10xxxxxx 10xxxxxx
+  */
+  if (code <= 0x0000FFFF) {
+    buf[0] = (unsigned char)(0xe0 | (code >> 12));
+    buf[1] = (unsigned char)(0x80 | ((code >> 6) & 0x3f));
+    buf[2] = (unsigned char)(0x80 | (code & 0x3f));
+    return 3;
+  }
+
+  /* 0x00010000 - 0x001FFFFF:
+     11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+  */
+  if (code <= 0x001FFFFF) {
+    buf[0] = (unsigned char)(0xf0 | (code >> 18));
+    buf[1] = (unsigned char)(0x80 | ((code >> 12) & 0x3f));
+    buf[2] = (unsigned char)(0x80 | ((code >> 6) & 0x3f));
+    buf[3] = (unsigned char)(0x80 | (code & 0x3f));
+    return 4;
+  }
+
+  /* 0x00200000 - 0x03FFFFFF:
+     111110xx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+  */
+  if (code <= 0x03FFFFFF) {
+    buf[0] = (unsigned char)(0xf8 | (code >> 24));
+    buf[1] = (unsigned char)(0x80 | ((code >> 18) & 0x3f));
+    buf[2] = (unsigned char)(0x80 | ((code >> 12) & 0x3f));
+    buf[3] = (unsigned char)(0x80 | ((code >> 6) & 0x3f));
+    buf[4] = (unsigned char)(0x80 | (code & 0x3f));
+    return 5;
+  }
+
+  /* 0x04000000 - 0x7FFFFFFF:
+     1111110x 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+  */
+  if (code <= 0x7FFFFFFF) {
+    buf[0] = (unsigned char)(0xfc | (code >> 30));
+    buf[1] = (unsigned char)(0x80 | ((code >> 24) & 0x3f));
+    buf[2] = (unsigned char)(0x80 | ((code >> 18) & 0x3f));
+    buf[3] = (unsigned char)(0x80 | ((code >> 12) & 0x3f));
+    buf[4] = (unsigned char)(0x80 | ((code >> 6) & 0x3f));
+    buf[5] = (unsigned char)(0x80 | (code & 0x3f));
+    return 6;
+  }
+
+  return -1;
+}
+
+/*
+ *	TOML has 3 data structures: value, array, table.
+ *	Each of them can have identification key.
+ */
+typedef struct toml_keyval_t toml_keyval_t;
+struct toml_keyval_t {
+  const char *key; /* key to this value */
+  const char *val; /* the raw value */
+};
+
+typedef struct toml_arritem_t toml_arritem_t;
+struct toml_arritem_t {
+  int valtype; /* for value kind: 'i'nt, 'd'ouble, 'b'ool, 's'tring, 't'ime,
+                  'D'ate, 'T'imestamp */
+  char *val;
+  toml_array_t *arr;
+  toml_table_t *tab;
+};
+
+struct toml_array_t {
+  const char *key; /* key to this array */
+  int kind;        /* element kind: 'v'alue, 'a'rray, or 't'able, 'm'ixed */
+  int type;        /* for value kind: 'i'nt, 'd'ouble, 'b'ool, 's'tring, 't'ime,
+                      'D'ate, 'T'imestamp, 'm'ixed */
+
+  int nitem; /* number of elements */
+  toml_arritem_t *item;
+};
+
+struct toml_table_t {
+  const char *key; /* key to this table */
+  bool implicit;   /* table was created implicitly */
+  bool readonly;   /* no more modification allowed */
+
+  /* key-values in the table */
+  int nkval;
+  toml_keyval_t **kval;
+
+  /* arrays in the table */
+  int narr;
+  toml_array_t **arr;
+
+  /* tables in the table */
+  int ntab;
+  toml_table_t **tab;
+};
+
+static inline void xfree(const void *x) {
+  if (x)
+    FREE((void *)(intptr_t)x);
+}
+
+enum tokentype_t {
+  INVALID,
+  DOT,
+  COMMA,
+  EQUAL,
+  LBRACE,
+  RBRACE,
+  NEWLINE,
+  LBRACKET,
+  RBRACKET,
+  STRING,
+};
+typedef enum tokentype_t tokentype_t;
+
+typedef struct token_t token_t;
+struct token_t {
+  tokentype_t tok;
+  int lineno;
+  char *ptr; /* points into context->start */
+  int len;
+  int eof;
+};
+
+typedef struct context_t context_t;
+struct context_t {
+  char *start;
+  char *stop;
+  char *errbuf;
+  int errbufsz;
+
+  token_t tok;
+  toml_table_t *root;
+  toml_table_t *curtab;
+
+  struct {
+    int top;
+    char *key[10];
+    token_t tok[10];
+  } tpath;
+};
+
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+#define FLINE __FILE__ ":" TOSTRING(__LINE__)
+
+static int next_token(context_t *ctx, int dotisspecial);
+
+/*
+  Error reporting. Call when an error is detected. Always return -1.
+*/
+static int e_outofmemory(context_t *ctx, const char *fline) {
+  snprintf(ctx->errbuf, ctx->errbufsz, "ERROR: out of memory (%s)", fline);
+  return -1;
+}
+
+static int e_internal(context_t *ctx, const char *fline) {
+  snprintf(ctx->errbuf, ctx->errbufsz, "internal error (%s)", fline);
+  return -1;
+}
+
+static int e_syntax(context_t *ctx, int lineno, const char *msg) {
+  snprintf(ctx->errbuf, ctx->errbufsz, "line %d: %s", lineno, msg);
+  return -1;
+}
+
+static int e_badkey(context_t *ctx, int lineno) {
+  snprintf(ctx->errbuf, ctx->errbufsz, "line %d: bad key", lineno);
+  return -1;
+}
+
+static int e_keyexists(context_t *ctx, int lineno) {
+  snprintf(ctx->errbuf, ctx->errbufsz, "line %d: key exists", lineno);
+  return -1;
+}
+
+static int e_forbid(context_t *ctx, int lineno, const char *msg) {
+  snprintf(ctx->errbuf, ctx->errbufsz, "line %d: %s", lineno, msg);
+  return -1;
+}
+
+static void *expand(void *p, int sz, int newsz) {
+  void *s = MALLOC(newsz);
+  if (!s)
+    return 0;
+
+  if (p) {
+    memcpy(s, p, sz);
+    FREE(p);
+  }
+  return s;
+}
+
+static void **expand_ptrarr(void **p, int n) {
+  void **s = MALLOC((n + 1) * sizeof(void *));
+  if (!s)
+    return 0;
+
+  s[n] = 0;
+  if (p) {
+    memcpy(s, p, n * sizeof(void *));
+    FREE(p);
+  }
+  return s;
+}
+
+static toml_arritem_t *expand_arritem(toml_arritem_t *p, int n) {
+  toml_arritem_t *pp = expand(p, n * sizeof(*p), (n + 1) * sizeof(*p));
+  if (!pp)
+    return 0;
+
+  memset(&pp[n], 0, sizeof(pp[n]));
+  return pp;
+}
+
+static char *norm_lit_str(const char *src, int srclen, int multiline,
+                          char *errbuf, int errbufsz) {
+  char *dst = 0; /* will write to dst[] and return it */
+  int max = 0;   /* max size of dst[] */
+  int off = 0;   /* cur offset in dst[] */
+  const char *sp = src;
+  const char *sq = src + srclen;
+  int ch;
+
+  /* scan forward on src */
+  for (;;) {
+    if (off >= max - 10) { /* have some slack for misc stuff */
+      int newmax = max + 50;
+      char *x = expand(dst, max, newmax);
+      if (!x) {
+        xfree(dst);
+        snprintf(errbuf, errbufsz, "out of memory");
+        return 0;
+      }
+      dst = x;
+      max = newmax;
+    }
+
+    /* finished? */
+    if (sp >= sq)
+      break;
+
+    ch = *sp++;
+    /* control characters other than tab is not allowed */
+    if ((0 <= ch && ch <= 0x08) || (0x0a <= ch && ch <= 0x1f) || (ch == 0x7f)) {
+      if (!(multiline && (ch == '\r' || ch == '\n'))) {
+        xfree(dst);
+        snprintf(errbuf, errbufsz, "invalid char U+%04x", ch);
+        return 0;
+      }
+    }
+
+    // a plain copy suffice
+    dst[off++] = ch;
+  }
+
+  dst[off++] = 0;
+  return dst;
+}
+
+/*
+ * Convert src to raw unescaped utf-8 string.
+ * Returns NULL if error with errmsg in errbuf.
+ */
+static char *norm_basic_str(const char *src, int srclen, int multiline,
+                            char *errbuf, int errbufsz) {
+  char *dst = 0; /* will write to dst[] and return it */
+  int max = 0;   /* max size of dst[] */
+  int off = 0;   /* cur offset in dst[] */
+  const char *sp = src;
+  const char *sq = src + srclen;
+  int ch;
+
+  /* scan forward on src */
+  for (;;) {
+    if (off >= max - 10) { /* have some slack for misc stuff */
+      int newmax = max + 50;
+      char *x = expand(dst, max, newmax);
+      if (!x) {
+        xfree(dst);
+        snprintf(errbuf, errbufsz, "out of memory");
+        return 0;
+      }
+      dst = x;
+      max = newmax;
+    }
+
+    /* finished? */
+    if (sp >= sq)
+      break;
+
+    ch = *sp++;
+    if (ch != '\\') {
+      /* these chars must be escaped: U+0000 to U+0008, U+000A to U+001F, U+007F
+       */
+      if ((0 <= ch && ch <= 0x08) || (0x0a <= ch && ch <= 0x1f) ||
+          (ch == 0x7f)) {
+        if (!(multiline && (ch == '\r' || ch == '\n'))) {
+          xfree(dst);
+          snprintf(errbuf, errbufsz, "invalid char U+%04x", ch);
+          return 0;
+        }
+      }
+
+      // a plain copy suffice
+      dst[off++] = ch;
+      continue;
+    }
+
+    /* ch was backslash. we expect the escape char. */
+    if (sp >= sq) {
+      snprintf(errbuf, errbufsz, "last backslash is invalid");
+      xfree(dst);
+      return 0;
+    }
+
+    /* for multi-line, we want to kill line-ending-backslash ... */
+    if (multiline) {
+
+      // if there is only whitespace after the backslash ...
+      if (sp[strspn(sp, " \t\r")] == '\n') {
+        /* skip all the following whitespaces */
+        sp += strspn(sp, " \t\r\n");
+        continue;
+      }
+    }
+
+    /* get the escaped char */
+    ch = *sp++;
+    switch (ch) {
+    case 'u':
+    case 'U': {
+      int64_t ucs = 0;
+      int nhex = (ch == 'u' ? 4 : 8);
+      for (int i = 0; i < nhex; i++) {
+        if (sp >= sq) {
+          snprintf(errbuf, errbufsz, "\\%c expects %d hex chars", ch, nhex);
+          xfree(dst);
+          return 0;
+        }
+        ch = *sp++;
+        int v = ('0' <= ch && ch <= '9')
+                    ? ch - '0'
+                    : (('A' <= ch && ch <= 'F') ? ch - 'A' + 10 : -1);
+        if (-1 == v) {
+          snprintf(errbuf, errbufsz, "invalid hex chars for \\u or \\U");
+          xfree(dst);
+          return 0;
+        }
+        ucs = ucs * 16 + v;
+      }
+      int n = toml_ucs_to_utf8(ucs, &dst[off]);
+      if (-1 == n) {
+        snprintf(errbuf, errbufsz, "illegal ucs code in \\u or \\U");
+        xfree(dst);
+        return 0;
+      }
+      off += n;
+    }
+      continue;
+
+    case 'b':
+      ch = '\b';
+      break;
+    case 't':
+      ch = '\t';
+      break;
+    case 'n':
+      ch = '\n';
+      break;
+    case 'f':
+      ch = '\f';
+      break;
+    case 'r':
+      ch = '\r';
+      break;
+    case '"':
+      ch = '"';
+      break;
+    case '\\':
+      ch = '\\';
+      break;
+    default:
+      snprintf(errbuf, errbufsz, "illegal escape char \\%c", ch);
+      xfree(dst);
+      return 0;
+    }
+
+    dst[off++] = ch;
+  }
+
+  // Cap with NUL and return it.
+  dst[off++] = 0;
+  return dst;
+}
+
+/* Normalize a key. Convert all special chars to raw unescaped utf-8 chars. */
+static char *normalize_key(context_t *ctx, token_t strtok) {
+  const char *sp = strtok.ptr;
+  const char *sq = strtok.ptr + strtok.len;
+  int lineno = strtok.lineno;
+  char *ret;
+  int ch = *sp;
+  char ebuf[80];
+
+  /* handle quoted string */
+  if (ch == '\'' || ch == '\"') {
+    /* if ''' or """, take 3 chars off front and back. Else, take 1 char off. */
+    int multiline = 0;
+    if (sp[1] == ch && sp[2] == ch) {
+      sp += 3, sq -= 3;
+      multiline = 1;
+    } else
+      sp++, sq--;
+
+    if (ch == '\'') {
+      /* for single quote, take it verbatim. */
+      if (!(ret = STRNDUP(sp, sq - sp))) {
+        e_outofmemory(ctx, FLINE);
+        return 0;
+      }
+    } else {
+      /* for double quote, we need to normalize */
+      ret = norm_basic_str(sp, sq - sp, multiline, ebuf, sizeof(ebuf));
+      if (!ret) {
+        e_syntax(ctx, lineno, ebuf);
+        return 0;
+      }
+    }
+
+    /* newlines are not allowed in keys */
+    if (strchr(ret, '\n')) {
+      xfree(ret);
+      e_badkey(ctx, lineno);
+      return 0;
+    }
+    return ret;
+  }
+
+  /* for bare-key allow only this regex: [A-Za-z0-9_-]+ */
+  const char *xp;
+  for (xp = sp; xp != sq; xp++) {
+    int k = *xp;
+    if (isalnum(k))
+      continue;
+    if (k == '_' || k == '-')
+      continue;
+    e_badkey(ctx, lineno);
+    return 0;
+  }
+
+  /* dup and return it */
+  if (!(ret = STRNDUP(sp, sq - sp))) {
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  return ret;
+}
+
+/*
+ * Look up key in tab. Return 0 if not found, or
+ * 'v'alue, 'a'rray or 't'able depending on the element.
+ */
+static int check_key(toml_table_t *tab, const char *key,
+                     toml_keyval_t **ret_val, toml_array_t **ret_arr,
+                     toml_table_t **ret_tab) {
+  int i;
+  void *dummy;
+
+  if (!ret_tab)
+    ret_tab = (toml_table_t **)&dummy;
+  if (!ret_arr)
+    ret_arr = (toml_array_t **)&dummy;
+  if (!ret_val)
+    ret_val = (toml_keyval_t **)&dummy;
+
+  *ret_tab = 0;
+  *ret_arr = 0;
+  *ret_val = 0;
+
+  for (i = 0; i < tab->nkval; i++) {
+    if (0 == strcmp(key, tab->kval[i]->key)) {
+      *ret_val = tab->kval[i];
+      return 'v';
+    }
+  }
+  for (i = 0; i < tab->narr; i++) {
+    if (0 == strcmp(key, tab->arr[i]->key)) {
+      *ret_arr = tab->arr[i];
+      return 'a';
+    }
+  }
+  for (i = 0; i < tab->ntab; i++) {
+    if (0 == strcmp(key, tab->tab[i]->key)) {
+      *ret_tab = tab->tab[i];
+      return 't';
+    }
+  }
+  return 0;
+}
+
+static int key_kind(toml_table_t *tab, const char *key) {
+  return check_key(tab, key, 0, 0, 0);
+}
+
+/* Create a keyval in the table.
+ */
+static toml_keyval_t *create_keyval_in_table(context_t *ctx, toml_table_t *tab,
+                                             token_t keytok) {
+  /* first, normalize the key to be used for lookup.
+   * remember to free it if we error out.
+   */
+  char *newkey = normalize_key(ctx, keytok);
+  if (!newkey)
+    return 0;
+
+  /* if key exists: error out. */
+  toml_keyval_t *dest = 0;
+  if (key_kind(tab, newkey)) {
+    xfree(newkey);
+    e_keyexists(ctx, keytok.lineno);
+    return 0;
+  }
+
+  /* make a new entry */
+  int n = tab->nkval;
+  toml_keyval_t **base;
+  if (0 == (base = (toml_keyval_t **)expand_ptrarr((void **)tab->kval, n))) {
+    xfree(newkey);
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  tab->kval = base;
+
+  if (0 == (base[n] = (toml_keyval_t *)CALLOC(1, sizeof(*base[n])))) {
+    xfree(newkey);
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  dest = tab->kval[tab->nkval++];
+
+  /* save the key in the new value struct */
+  dest->key = newkey;
+  return dest;
+}
+
+/* Create a table in the table.
+ */
+static toml_table_t *create_keytable_in_table(context_t *ctx, toml_table_t *tab,
+                                              token_t keytok) {
+  /* first, normalize the key to be used for lookup.
+   * remember to free it if we error out.
+   */
+  char *newkey = normalize_key(ctx, keytok);
+  if (!newkey)
+    return 0;
+
+  /* if key exists: error out */
+  toml_table_t *dest = 0;
+  if (check_key(tab, newkey, 0, 0, &dest)) {
+    xfree(newkey); /* don't need this anymore */
+
+    /* special case: if table exists, but was created implicitly ... */
+    if (dest && dest->implicit) {
+      /* we make it explicit now, and simply return it. */
+      dest->implicit = false;
+      return dest;
+    }
+    e_keyexists(ctx, keytok.lineno);
+    return 0;
+  }
+
+  /* create a new table entry */
+  int n = tab->ntab;
+  toml_table_t **base;
+  if (0 == (base = (toml_table_t **)expand_ptrarr((void **)tab->tab, n))) {
+    xfree(newkey);
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  tab->tab = base;
+
+  if (0 == (base[n] = (toml_table_t *)CALLOC(1, sizeof(*base[n])))) {
+    xfree(newkey);
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  dest = tab->tab[tab->ntab++];
+
+  /* save the key in the new table struct */
+  dest->key = newkey;
+  return dest;
+}
+
+/* Create an array in the table.
+ */
+static toml_array_t *create_keyarray_in_table(context_t *ctx, toml_table_t *tab,
+                                              token_t keytok, char kind) {
+  /* first, normalize the key to be used for lookup.
+   * remember to free it if we error out.
+   */
+  char *newkey = normalize_key(ctx, keytok);
+  if (!newkey)
+    return 0;
+
+  /* if key exists: error out */
+  if (key_kind(tab, newkey)) {
+    xfree(newkey); /* don't need this anymore */
+    e_keyexists(ctx, keytok.lineno);
+    return 0;
+  }
+
+  /* make a new array entry */
+  int n = tab->narr;
+  toml_array_t **base;
+  if (0 == (base = (toml_array_t **)expand_ptrarr((void **)tab->arr, n))) {
+    xfree(newkey);
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  tab->arr = base;
+
+  if (0 == (base[n] = (toml_array_t *)CALLOC(1, sizeof(*base[n])))) {
+    xfree(newkey);
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  toml_array_t *dest = tab->arr[tab->narr++];
+
+  /* save the key in the new array struct */
+  dest->key = newkey;
+  dest->kind = kind;
+  return dest;
+}
+
+static toml_arritem_t *create_value_in_array(context_t *ctx,
+                                             toml_array_t *parent) {
+  const int n = parent->nitem;
+  toml_arritem_t *base = expand_arritem(parent->item, n);
+  if (!base) {
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  parent->item = base;
+  parent->nitem++;
+  return &parent->item[n];
+}
+
+/* Create an array in an array
+ */
+static toml_array_t *create_array_in_array(context_t *ctx,
+                                           toml_array_t *parent) {
+  const int n = parent->nitem;
+  toml_arritem_t *base = expand_arritem(parent->item, n);
+  if (!base) {
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  toml_array_t *ret = (toml_array_t *)CALLOC(1, sizeof(toml_array_t));
+  if (!ret) {
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  base[n].arr = ret;
+  parent->item = base;
+  parent->nitem++;
+  return ret;
+}
+
+/* Create a table in an array
+ */
+static toml_table_t *create_table_in_array(context_t *ctx,
+                                           toml_array_t *parent) {
+  int n = parent->nitem;
+  toml_arritem_t *base = expand_arritem(parent->item, n);
+  if (!base) {
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  toml_table_t *ret = (toml_table_t *)CALLOC(1, sizeof(toml_table_t));
+  if (!ret) {
+    e_outofmemory(ctx, FLINE);
+    return 0;
+  }
+  base[n].tab = ret;
+  parent->item = base;
+  parent->nitem++;
+  return ret;
+}
+
+static int skip_newlines(context_t *ctx, int isdotspecial) {
+  while (ctx->tok.tok == NEWLINE) {
+    if (next_token(ctx, isdotspecial))
+      return -1;
+    if (ctx->tok.eof)
+      break;
+  }
+  return 0;
+}
+
+static int parse_keyval(context_t *ctx, toml_table_t *tab);
+
+static inline int eat_token(context_t *ctx, tokentype_t typ, int isdotspecial,
+                            const char *fline) {
+  if (ctx->tok.tok != typ)
+    return e_internal(ctx, fline);
+
+  if (next_token(ctx, isdotspecial))
+    return -1;
+
+  return 0;
+}
+
+/* We are at '{ ... }'.
+ * Parse the table.
+ */
+static int parse_inline_table(context_t *ctx, toml_table_t *tab) {
+  if (eat_token(ctx, LBRACE, 1, FLINE))
+    return -1;
+
+  for (;;) {
+    if (ctx->tok.tok == NEWLINE)
+      return e_syntax(ctx, ctx->tok.lineno,
+                      "newline not allowed in inline table");
+
+    /* until } */
+    if (ctx->tok.tok == RBRACE)
+      break;
+
+    if (ctx->tok.tok != STRING)
+      return e_syntax(ctx, ctx->tok.lineno, "expect a string");
+
+    if (parse_keyval(ctx, tab))
+      return -1;
+
+    if (ctx->tok.tok == NEWLINE)
+      return e_syntax(ctx, ctx->tok.lineno,
+                      "newline not allowed in inline table");
+
+    /* on comma, continue to scan for next keyval */
+    if (ctx->tok.tok == COMMA) {
+      if (eat_token(ctx, COMMA, 1, FLINE))
+        return -1;
+      continue;
+    }
+    break;
+  }
+
+  if (eat_token(ctx, RBRACE, 1, FLINE))
+    return -1;
+
+  tab->readonly = 1;
+
+  return 0;
+}
+
+static int valtype(const char *val) {
+  toml_timestamp_t ts;
+  if (*val == '\'' || *val == '"')
+    return 's';
+  if (0 == toml_rtob(val, 0))
+    return 'b';
+  if (0 == toml_rtoi(val, 0))
+    return 'i';
+  if (0 == toml_rtod(val, 0))
+    return 'd';
+  if (0 == toml_rtots(val, &ts)) {
+    if (ts.year && ts.hour)
+      return 'T'; /* timestamp */
+    if (ts.year)
+      return 'D'; /* date */
+    return 't';   /* time */
+  }
+  return 'u'; /* unknown */
+}
+
+/* We are at '[...]' */
+static int parse_array(context_t *ctx, toml_array_t *arr) {
+  if (eat_token(ctx, LBRACKET, 0, FLINE))
+    return -1;
+
+  for (;;) {
+    if (skip_newlines(ctx, 0))
+      return -1;
+
+    /* until ] */
+    if (ctx->tok.tok == RBRACKET)
+      break;
+
+    switch (ctx->tok.tok) {
+    case STRING: {
+      /* set array kind if this will be the first entry */
+      if (arr->kind == 0)
+        arr->kind = 'v';
+      else if (arr->kind != 'v')
+        arr->kind = 'm';
+
+      char *val = ctx->tok.ptr;
+      int vlen = ctx->tok.len;
+
+      /* make a new value in array */
+      toml_arritem_t *newval = create_value_in_array(ctx, arr);
+      if (!newval)
+        return e_outofmemory(ctx, FLINE);
+
+      if (!(newval->val = STRNDUP(val, vlen)))
+        return e_outofmemory(ctx, FLINE);
+
+      newval->valtype = valtype(newval->val);
+
+      /* set array type if this is the first entry */
+      if (arr->nitem == 1)
+        arr->type = newval->valtype;
+      else if (arr->type != newval->valtype)
+        arr->type = 'm'; /* mixed */
+
+      if (eat_token(ctx, STRING, 0, FLINE))
+        return -1;
+      break;
+    }
+
+    case LBRACKET: { /* [ [array], [array] ... ] */
+      /* set the array kind if this will be the first entry */
+      if (arr->kind == 0)
+        arr->kind = 'a';
+      else if (arr->kind != 'a')
+        arr->kind = 'm';
+
+      toml_array_t *subarr = create_array_in_array(ctx, arr);
+      if (!subarr)
+        return -1;
+      if (parse_array(ctx, subarr))
+        return -1;
+      break;
+    }
+
+    case LBRACE: { /* [ {table}, {table} ... ] */
+      /* set the array kind if this will be the first entry */
+      if (arr->kind == 0)
+        arr->kind = 't';
+      else if (arr->kind != 't')
+        arr->kind = 'm';
+
+      toml_table_t *subtab = create_table_in_array(ctx, arr);
+      if (!subtab)
+        return -1;
+      if (parse_inline_table(ctx, subtab))
+        return -1;
+      break;
+    }
+
+    default:
+      return e_syntax(ctx, ctx->tok.lineno, "syntax error");
+    }
+
+    if (skip_newlines(ctx, 0))
+      return -1;
+
+    /* on comma, continue to scan for next element */
+    if (ctx->tok.tok == COMMA) {
+      if (eat_token(ctx, COMMA, 0, FLINE))
+        return -1;
+      continue;
+    }
+    break;
+  }
+
+  if (eat_token(ctx, RBRACKET, 1, FLINE))
+    return -1;
+  return 0;
+}
+
+/* handle lines like these:
+   key = "value"
+   key = [ array ]
+   key = { table }
+*/
+static int parse_keyval(context_t *ctx, toml_table_t *tab) {
+  if (tab->readonly) {
+    return e_forbid(ctx, ctx->tok.lineno,
+                    "cannot insert new entry into existing table");
+  }
+
+  token_t key = ctx->tok;
+  if (eat_token(ctx, STRING, 1, FLINE))
+    return -1;
+
+  if (ctx->tok.tok == DOT) {
+    /* handle inline dotted key.
+       e.g.
+       physical.color = "orange"
+       physical.shape = "round"
+    */
+    toml_table_t *subtab = 0;
+    {
+      char *subtabstr = normalize_key(ctx, key);
+      if (!subtabstr)
+        return -1;
+
+      subtab = toml_table_in(tab, subtabstr);
+      xfree(subtabstr);
+    }
+    if (!subtab) {
+      subtab = create_keytable_in_table(ctx, tab, key);
+      if (!subtab)
+        return -1;
+    }
+    if (next_token(ctx, 1))
+      return -1;
+    if (parse_keyval(ctx, subtab))
+      return -1;
+    return 0;
+  }
+
+  if (ctx->tok.tok != EQUAL) {
+    return e_syntax(ctx, ctx->tok.lineno, "missing =");
+  }
+
+  if (next_token(ctx, 0))
+    return -1;
+
+  switch (ctx->tok.tok) {
+  case STRING: { /* key = "value" */
+    toml_keyval_t *keyval = create_keyval_in_table(ctx, tab, key);
+    if (!keyval)
+      return -1;
+    token_t val = ctx->tok;
+
+    assert(keyval->val == 0);
+    if (!(keyval->val = STRNDUP(val.ptr, val.len)))
+      return e_outofmemory(ctx, FLINE);
+
+    if (next_token(ctx, 1))
+      return -1;
+
+    return 0;
+  }
+
+  case LBRACKET: { /* key = [ array ] */
+    toml_array_t *arr = create_keyarray_in_table(ctx, tab, key, 0);
+    if (!arr)
+      return -1;
+    if (parse_array(ctx, arr))
+      return -1;
+    return 0;
+  }
+
+  case LBRACE: { /* key = { table } */
+    toml_table_t *nxttab = create_keytable_in_table(ctx, tab, key);
+    if (!nxttab)
+      return -1;
+    if (parse_inline_table(ctx, nxttab))
+      return -1;
+    return 0;
+  }
+
+  default:
+    return e_syntax(ctx, ctx->tok.lineno, "syntax error");
+  }
+  return 0;
+}
+
+typedef struct tabpath_t tabpath_t;
+struct tabpath_t {
+  int cnt;
+  token_t key[10];
+};
+
+/* at [x.y.z] or [[x.y.z]]
+ * Scan forward and fill tabpath until it enters ] or ]]
+ * There will be at least one entry on return.
+ */
+static int fill_tabpath(context_t *ctx) {
+  int lineno = ctx->tok.lineno;
+  int i;
+
+  /* clear tpath */
+  for (i = 0; i < ctx->tpath.top; i++) {
+    char **p = &ctx->tpath.key[i];
+    xfree(*p);
+    *p = 0;
+  }
+  ctx->tpath.top = 0;
+
+  for (;;) {
+    if (ctx->tpath.top >= 10)
+      return e_syntax(ctx, lineno,
+                      "table path is too deep; max allowed is 10.");
+
+    if (ctx->tok.tok != STRING)
+      return e_syntax(ctx, lineno, "invalid or missing key");
+
+    char *key = normalize_key(ctx, ctx->tok);
+    if (!key)
+      return -1;
+    ctx->tpath.tok[ctx->tpath.top] = ctx->tok;
+    ctx->tpath.key[ctx->tpath.top] = key;
+    ctx->tpath.top++;
+
+    if (next_token(ctx, 1))
+      return -1;
+
+    if (ctx->tok.tok == RBRACKET)
+      break;
+
+    if (ctx->tok.tok != DOT)
+      return e_syntax(ctx, lineno, "invalid key");
+
+    if (next_token(ctx, 1))
+      return -1;
+  }
+
+  if (ctx->tpath.top <= 0)
+    return e_syntax(ctx, lineno, "empty table selector");
+
+  return 0;
+}
+
+/* Walk tabpath from the root, and create new tables on the way.
+ * Sets ctx->curtab to the final table.
+ */
+static int walk_tabpath(context_t *ctx) {
+  /* start from root */
+  toml_table_t *curtab = ctx->root;
+
+  for (int i = 0; i < ctx->tpath.top; i++) {
+    const char *key = ctx->tpath.key[i];
+
+    toml_keyval_t *nextval = 0;
+    toml_array_t *nextarr = 0;
+    toml_table_t *nexttab = 0;
+    switch (check_key(curtab, key, &nextval, &nextarr, &nexttab)) {
+    case 't':
+      /* found a table. nexttab is where we will go next. */
+      break;
+
+    case 'a':
+      /* found an array. nexttab is the last table in the array. */
+      if (nextarr->kind != 't')
+        return e_internal(ctx, FLINE);
+
+      if (nextarr->nitem == 0)
+        return e_internal(ctx, FLINE);
+
+      nexttab = nextarr->item[nextarr->nitem - 1].tab;
+      break;
+
+    case 'v':
+      return e_keyexists(ctx, ctx->tpath.tok[i].lineno);
+
+    default: { /* Not found. Let's create an implicit table. */
+      int n = curtab->ntab;
+      toml_table_t **base =
+          (toml_table_t **)expand_ptrarr((void **)curtab->tab, n);
+      if (0 == base)
+        return e_outofmemory(ctx, FLINE);
+
+      curtab->tab = base;
+
+      if (0 == (base[n] = (toml_table_t *)CALLOC(1, sizeof(*base[n]))))
+        return e_outofmemory(ctx, FLINE);
+
+      if (0 == (base[n]->key = STRDUP(key)))
+        return e_outofmemory(ctx, FLINE);
+
+      nexttab = curtab->tab[curtab->ntab++];
+
+      /* tabs created by walk_tabpath are considered implicit */
+      nexttab->implicit = true;
+    } break;
+    }
+
+    /* switch to next tab */
+    curtab = nexttab;
+  }
+
+  /* save it */
+  ctx->curtab = curtab;
+
+  return 0;
+}
+
+/* handle lines like [x.y.z] or [[x.y.z]] */
+static int parse_select(context_t *ctx) {
+  assert(ctx->tok.tok == LBRACKET);
+
+  /* true if [[ */
+  int llb = (ctx->tok.ptr + 1 < ctx->stop && ctx->tok.ptr[1] == '[');
+  /* need to detect '[[' on our own because next_token() will skip whitespace,
+     and '[ [' would be taken as '[[', which is wrong. */
+
+  /* eat [ or [[ */
+  if (eat_token(ctx, LBRACKET, 1, FLINE))
+    return -1;
+  if (llb) {
+    assert(ctx->tok.tok == LBRACKET);
+    if (eat_token(ctx, LBRACKET, 1, FLINE))
+      return -1;
+  }
+
+  if (fill_tabpath(ctx))
+    return -1;
+
+  /* For [x.y.z] or [[x.y.z]], remove z from tpath.
+   */
+  token_t z = ctx->tpath.tok[ctx->tpath.top - 1];
+  xfree(ctx->tpath.key[ctx->tpath.top - 1]);
+  ctx->tpath.top--;
+
+  /* set up ctx->curtab */
+  if (walk_tabpath(ctx))
+    return -1;
+
+  if (!llb) {
+    /* [x.y.z] -> create z = {} in x.y */
+    toml_table_t *curtab = create_keytable_in_table(ctx, ctx->curtab, z);
+    if (!curtab)
+      return -1;
+    ctx->curtab = curtab;
+  } else {
+    /* [[x.y.z]] -> create z = [] in x.y */
+    toml_array_t *arr = 0;
+    {
+      char *zstr = normalize_key(ctx, z);
+      if (!zstr)
+        return -1;
+      arr = toml_array_in(ctx->curtab, zstr);
+      xfree(zstr);
+    }
+    if (!arr) {
+      arr = create_keyarray_in_table(ctx, ctx->curtab, z, 't');
+      if (!arr)
+        return -1;
+    }
+    if (arr->kind != 't')
+      return e_syntax(ctx, z.lineno, "array mismatch");
+
+    /* add to z[] */
+    toml_table_t *dest;
+    {
+      toml_table_t *t = create_table_in_array(ctx, arr);
+      if (!t)
+        return -1;
+
+      if (0 == (t->key = STRDUP("__anon__")))
+        return e_outofmemory(ctx, FLINE);
+
+      dest = t;
+    }
+
+    ctx->curtab = dest;
+  }
+
+  if (ctx->tok.tok != RBRACKET) {
+    return e_syntax(ctx, ctx->tok.lineno, "expects ]");
+  }
+  if (llb) {
+    if (!(ctx->tok.ptr + 1 < ctx->stop && ctx->tok.ptr[1] == ']')) {
+      return e_syntax(ctx, ctx->tok.lineno, "expects ]]");
+    }
+    if (eat_token(ctx, RBRACKET, 1, FLINE))
+      return -1;
+  }
+
+  if (eat_token(ctx, RBRACKET, 1, FLINE))
+    return -1;
+
+  if (ctx->tok.tok != NEWLINE)
+    return e_syntax(ctx, ctx->tok.lineno, "extra chars after ] or ]]");
+
+  return 0;
+}
+
+toml_table_t *toml_parse(char *conf, char *errbuf, int errbufsz) {
+  context_t ctx;
+
+  // clear errbuf
+  if (errbufsz <= 0)
+    errbufsz = 0;
+  if (errbufsz > 0)
+    errbuf[0] = 0;
+
+  // init context
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.start = conf;
+  ctx.stop = ctx.start + strlen(conf);
+  ctx.errbuf = errbuf;
+  ctx.errbufsz = errbufsz;
+
+  // start with an artificial newline of length 0
+  ctx.tok.tok = NEWLINE;
+  ctx.tok.lineno = 1;
+  ctx.tok.ptr = conf;
+  ctx.tok.len = 0;
+
+  // make a root table
+  if (0 == (ctx.root = CALLOC(1, sizeof(*ctx.root)))) {
+    e_outofmemory(&ctx, FLINE);
+    // Do not goto fail, root table not set up yet
+    return 0;
+  }
+
+  // set root as default table
+  ctx.curtab = ctx.root;
+
+  /* Scan forward until EOF */
+  for (token_t tok = ctx.tok; !tok.eof; tok = ctx.tok) {
+    switch (tok.tok) {
+
+    case NEWLINE:
+      if (next_token(&ctx, 1))
+        goto fail;
+      break;
+
+    case STRING:
+      if (parse_keyval(&ctx, ctx.curtab))
+        goto fail;
+
+      if (ctx.tok.tok != NEWLINE) {
+        e_syntax(&ctx, ctx.tok.lineno, "extra chars after value");
+        goto fail;
+      }
+
+      if (eat_token(&ctx, NEWLINE, 1, FLINE))
+        goto fail;
+      break;
+
+    case LBRACKET: /* [ x.y.z ] or [[ x.y.z ]] */
+      if (parse_select(&ctx))
+        goto fail;
+      break;
+
+    default:
+      e_syntax(&ctx, tok.lineno, "syntax error");
+      goto fail;
+    }
+  }
+
+  /* success */
+  for (int i = 0; i < ctx.tpath.top; i++)
+    xfree(ctx.tpath.key[i]);
+  return ctx.root;
+
+fail:
+  // Something bad has happened. Free resources and return error.
+  for (int i = 0; i < ctx.tpath.top; i++)
+    xfree(ctx.tpath.key[i]);
+  toml_free(ctx.root);
+  return 0;
+}
+
+toml_table_t *toml_parse_file(FILE *fp, char *errbuf, int errbufsz) {
+  int bufsz = 0;
+  char *buf = 0;
+  int off = 0;
+
+  /* read from fp into buf */
+  while (!feof(fp)) {
+
+    if (off == bufsz) {
+      int xsz = bufsz + 1000;
+      char *x = expand(buf, bufsz, xsz);
+      if (!x) {
+        snprintf(errbuf, errbufsz, "out of memory");
+        xfree(buf);
+        return 0;
+      }
+      buf = x;
+      bufsz = xsz;
+    }
+
+    errno = 0;
+    int n = fread(buf + off, 1, bufsz - off, fp);
+    if (ferror(fp)) {
+      snprintf(errbuf, errbufsz, "%s",
+               errno ? strerror(errno) : "Error reading file");
+      xfree(buf);
+      return 0;
+    }
+    off += n;
+  }
+
+  /* tag on a NUL to cap the string */
+  if (off == bufsz) {
+    int xsz = bufsz + 1;
+    char *x = expand(buf, bufsz, xsz);
+    if (!x) {
+      snprintf(errbuf, errbufsz, "out of memory");
+      xfree(buf);
+      return 0;
+    }
+    buf = x;
+    bufsz = xsz;
+  }
+  buf[off] = 0;
+
+  /* parse it, cleanup and finish */
+  toml_table_t *ret = toml_parse(buf, errbuf, errbufsz);
+  xfree(buf);
+  return ret;
+}
+
+static void xfree_kval(toml_keyval_t *p) {
+  if (!p)
+    return;
+  xfree(p->key);
+  xfree(p->val);
+  xfree(p);
+}
+
+static void xfree_tab(toml_table_t *p);
+
+static void xfree_arr(toml_array_t *p) {
+  if (!p)
+    return;
+
+  xfree(p->key);
+  const int n = p->nitem;
+  for (int i = 0; i < n; i++) {
+    toml_arritem_t *a = &p->item[i];
+    if (a->val)
+      xfree(a->val);
+    else if (a->arr)
+      xfree_arr(a->arr);
+    else if (a->tab)
+      xfree_tab(a->tab);
+  }
+  xfree(p->item);
+  xfree(p);
+}
+
+static void xfree_tab(toml_table_t *p) {
+  int i;
+
+  if (!p)
+    return;
+
+  xfree(p->key);
+
+  for (i = 0; i < p->nkval; i++)
+    xfree_kval(p->kval[i]);
+  xfree(p->kval);
+
+  for (i = 0; i < p->narr; i++)
+    xfree_arr(p->arr[i]);
+  xfree(p->arr);
+
+  for (i = 0; i < p->ntab; i++)
+    xfree_tab(p->tab[i]);
+  xfree(p->tab);
+
+  xfree(p);
+}
+
+void toml_free(toml_table_t *tab) { xfree_tab(tab); }
+
+static void set_token(context_t *ctx, tokentype_t tok, int lineno, char *ptr,
+                      int len) {
+  token_t t;
+  t.tok = tok;
+  t.lineno = lineno;
+  t.ptr = ptr;
+  t.len = len;
+  t.eof = 0;
+  ctx->tok = t;
+}
+
+static void set_eof(context_t *ctx, int lineno) {
+  set_token(ctx, NEWLINE, lineno, ctx->stop, 0);
+  ctx->tok.eof = 1;
+}
+
+/* Scan p for n digits compositing entirely of [0-9] */
+static int scan_digits(const char *p, int n) {
+  int ret = 0;
+  for (; n > 0 && isdigit(*p); n--, p++) {
+    ret = 10 * ret + (*p - '0');
+  }
+  return n ? -1 : ret;
+}
+
+static int scan_date(const char *p, int *YY, int *MM, int *DD) {
+  int year, month, day;
+  year = scan_digits(p, 4);
+  month = (year >= 0 && p[4] == '-') ? scan_digits(p + 5, 2) : -1;
+  day = (month >= 0 && p[7] == '-') ? scan_digits(p + 8, 2) : -1;
+  if (YY)
+    *YY = year;
+  if (MM)
+    *MM = month;
+  if (DD)
+    *DD = day;
+  return (year >= 0 && month >= 0 && day >= 0) ? 0 : -1;
+}
+
+static int scan_time(const char *p, int *hh, int *mm, int *ss) {
+  int hour, minute, second;
+  hour = scan_digits(p, 2);
+  minute = (hour >= 0 && p[2] == ':') ? scan_digits(p + 3, 2) : -1;
+  second = (minute >= 0 && p[5] == ':') ? scan_digits(p + 6, 2) : -1;
+  if (hh)
+    *hh = hour;
+  if (mm)
+    *mm = minute;
+  if (ss)
+    *ss = second;
+  return (hour >= 0 && minute >= 0 && second >= 0) ? 0 : -1;
+}
+
+static int scan_string(context_t *ctx, char *p, int lineno, int dotisspecial) {
+  char *orig = p;
+  if (0 == strncmp(p, "'''", 3)) {
+    char *q = p + 3;
+
+    while (1) {
+      q = strstr(q, "'''");
+      if (0 == q) {
+        return e_syntax(ctx, lineno, "unterminated triple-s-quote");
+      }
+      while (q[3] == '\'')
+        q++;
+      break;
+    }
+
+    set_token(ctx, STRING, lineno, orig, q + 3 - orig);
+    return 0;
+  }
+
+  if (0 == strncmp(p, "\"\"\"", 3)) {
+    char *q = p + 3;
+
+    while (1) {
+      q = strstr(q, "\"\"\"");
+      if (0 == q) {
+        return e_syntax(ctx, lineno, "unterminated triple-d-quote");
+      }
+      if (q[-1] == '\\') {
+        q++;
+        continue;
+      }
+      while (q[3] == '\"')
+        q++;
+      break;
+    }
+
+    // the string is [p+3, q-1]
+
+    int hexreq = 0; /* #hex required */
+    int escape = 0;
+    for (p += 3; p < q; p++) {
+      if (escape) {
+        escape = 0;
+        if (strchr("btnfr\"\\", *p))
+          continue;
+        if (*p == 'u') {
+          hexreq = 4;
+          continue;
+        }
+        if (*p == 'U') {
+          hexreq = 8;
+          continue;
+        }
+        if (p[strspn(p, " \t\r")] == '\n')
+          continue; /* allow for line ending backslash */
+        return e_syntax(ctx, lineno, "bad escape char");
+      }
+      if (hexreq) {
+        hexreq--;
+        if (strchr("0123456789ABCDEF", *p))
+          continue;
+        return e_syntax(ctx, lineno, "expect hex char");
+      }
+      if (*p == '\\') {
+        escape = 1;
+        continue;
+      }
+    }
+    if (escape)
+      return e_syntax(ctx, lineno, "expect an escape char");
+    if (hexreq)
+      return e_syntax(ctx, lineno, "expected more hex char");
+
+    set_token(ctx, STRING, lineno, orig, q + 3 - orig);
+    return 0;
+  }
+
+  if ('\'' == *p) {
+    for (p++; *p && *p != '\n' && *p != '\''; p++)
+      ;
+    if (*p != '\'') {
+      return e_syntax(ctx, lineno, "unterminated s-quote");
+    }
+
+    set_token(ctx, STRING, lineno, orig, p + 1 - orig);
+    return 0;
+  }
+
+  if ('\"' == *p) {
+    int hexreq = 0; /* #hex required */
+    int escape = 0;
+    for (p++; *p; p++) {
+      if (escape) {
+        escape = 0;
+        if (strchr("btnfr\"\\", *p))
+          continue;
+        if (*p == 'u') {
+          hexreq = 4;
+          continue;
+        }
+        if (*p == 'U') {
+          hexreq = 8;
+          continue;
+        }
+        return e_syntax(ctx, lineno, "bad escape char");
+      }
+      if (hexreq) {
+        hexreq--;
+        if (strchr("0123456789ABCDEF", *p))
+          continue;
+        return e_syntax(ctx, lineno, "expect hex char");
+      }
+      if (*p == '\\') {
+        escape = 1;
+        continue;
+      }
+      if (*p == '\'') {
+        if (p[1] == '\'' && p[2] == '\'') {
+          return e_syntax(ctx, lineno, "triple-s-quote inside string lit");
+        }
+        continue;
+      }
+      if (*p == '\n')
+        break;
+      if (*p == '"')
+        break;
+    }
+    if (*p != '"') {
+      return e_syntax(ctx, lineno, "unterminated quote");
+    }
+
+    set_token(ctx, STRING, lineno, orig, p + 1 - orig);
+    return 0;
+  }
+
+  /* check for timestamp without quotes */
+  if (0 == scan_date(p, 0, 0, 0) || 0 == scan_time(p, 0, 0, 0)) {
+    // forward thru the timestamp
+    p += strspn(p, "0123456789.:+-Tt Zz");
+    // squeeze out any spaces at end of string
+    for (; p[-1] == ' '; p--)
+      ;
+    // tokenize
+    set_token(ctx, STRING, lineno, orig, p - orig);
+    return 0;
+  }
+
+  /* literals */
+  for (; *p && *p != '\n'; p++) {
+    int ch = *p;
+    if (ch == '.' && dotisspecial)
+      break;
+    if ('A' <= ch && ch <= 'Z')
+      continue;
+    if ('a' <= ch && ch <= 'z')
+      continue;
+    if (strchr("0123456789+-_.", ch))
+      continue;
+    break;
+  }
+
+  set_token(ctx, STRING, lineno, orig, p - orig);
+  return 0;
+}
+
+static int next_token(context_t *ctx, int dotisspecial) {
+  int lineno = ctx->tok.lineno;
+  char *p = ctx->tok.ptr;
+  int i;
+
+  /* eat this tok */
+  for (i = 0; i < ctx->tok.len; i++) {
+    if (*p++ == '\n')
+      lineno++;
+  }
+
+  /* make next tok */
+  while (p < ctx->stop) {
+    /* skip comment. stop just before the \n. */
+    if (*p == '#') {
+      for (p++; p < ctx->stop && *p != '\n'; p++)
+        ;
+      continue;
+    }
+
+    if (dotisspecial && *p == '.') {
+      set_token(ctx, DOT, lineno, p, 1);
+      return 0;
+    }
+
+    switch (*p) {
+    case ',':
+      set_token(ctx, COMMA, lineno, p, 1);
+      return 0;
+    case '=':
+      set_token(ctx, EQUAL, lineno, p, 1);
+      return 0;
+    case '{':
+      set_token(ctx, LBRACE, lineno, p, 1);
+      return 0;
+    case '}':
+      set_token(ctx, RBRACE, lineno, p, 1);
+      return 0;
+    case '[':
+      set_token(ctx, LBRACKET, lineno, p, 1);
+      return 0;
+    case ']':
+      set_token(ctx, RBRACKET, lineno, p, 1);
+      return 0;
+    case '\n':
+      set_token(ctx, NEWLINE, lineno, p, 1);
+      return 0;
+    case '\r':
+    case ' ':
+    case '\t':
+      /* ignore white spaces */
+      p++;
+      continue;
+    }
+
+    return scan_string(ctx, p, lineno, dotisspecial);
+  }
+
+  set_eof(ctx, lineno);
+  return 0;
+}
+
+const char *toml_key_in(const toml_table_t *tab, int keyidx) {
+  if (keyidx < tab->nkval)
+    return tab->kval[keyidx]->key;
+
+  keyidx -= tab->nkval;
+  if (keyidx < tab->narr)
+    return tab->arr[keyidx]->key;
+
+  keyidx -= tab->narr;
+  if (keyidx < tab->ntab)
+    return tab->tab[keyidx]->key;
+
+  return 0;
+}
+
+int toml_key_exists(const toml_table_t *tab, const char *key) {
+  int i;
+  for (i = 0; i < tab->nkval; i++) {
+    if (0 == strcmp(key, tab->kval[i]->key))
+      return 1;
+  }
+  for (i = 0; i < tab->narr; i++) {
+    if (0 == strcmp(key, tab->arr[i]->key))
+      return 1;
+  }
+  for (i = 0; i < tab->ntab; i++) {
+    if (0 == strcmp(key, tab->tab[i]->key))
+      return 1;
+  }
+  return 0;
+}
+
+toml_raw_t toml_raw_in(const toml_table_t *tab, const char *key) {
+  int i;
+  for (i = 0; i < tab->nkval; i++) {
+    if (0 == strcmp(key, tab->kval[i]->key))
+      return tab->kval[i]->val;
+  }
+  return 0;
+}
+
+toml_array_t *toml_array_in(const toml_table_t *tab, const char *key) {
+  int i;
+  for (i = 0; i < tab->narr; i++) {
+    if (0 == strcmp(key, tab->arr[i]->key))
+      return tab->arr[i];
+  }
+  return 0;
+}
+
+toml_table_t *toml_table_in(const toml_table_t *tab, const char *key) {
+  int i;
+  for (i = 0; i < tab->ntab; i++) {
+    if (0 == strcmp(key, tab->tab[i]->key))
+      return tab->tab[i];
+  }
+  return 0;
+}
+
+toml_raw_t toml_raw_at(const toml_array_t *arr, int idx) {
+  return (0 <= idx && idx < arr->nitem) ? arr->item[idx].val : 0;
+}
+
+char toml_array_kind(const toml_array_t *arr) { return arr->kind; }
+
+char toml_array_type(const toml_array_t *arr) {
+  if (arr->kind != 'v')
+    return 0;
+
+  if (arr->nitem == 0)
+    return 0;
+
+  return arr->type;
+}
+
+int toml_array_nelem(const toml_array_t *arr) { return arr->nitem; }
+
+const char *toml_array_key(const toml_array_t *arr) {
+  return arr ? arr->key : (const char *)NULL;
+}
+
+int toml_table_nkval(const toml_table_t *tab) { return tab->nkval; }
+
+int toml_table_narr(const toml_table_t *tab) { return tab->narr; }
+
+int toml_table_ntab(const toml_table_t *tab) { return tab->ntab; }
+
+const char *toml_table_key(const toml_table_t *tab) {
+  return tab ? tab->key : (const char *)NULL;
+}
+
+toml_array_t *toml_array_at(const toml_array_t *arr, int idx) {
+  return (0 <= idx && idx < arr->nitem) ? arr->item[idx].arr : 0;
+}
+
+toml_table_t *toml_table_at(const toml_array_t *arr, int idx) {
+  return (0 <= idx && idx < arr->nitem) ? arr->item[idx].tab : 0;
+}
+
+static int parse_millisec(const char *p, const char **endp);
+
+int toml_rtots(toml_raw_t src_, toml_timestamp_t *ret) {
+  if (!src_)
+    return -1;
+
+  const char *p = src_;
+  int must_parse_time = 0;
+
+  memset(ret, 0, sizeof(*ret));
+
+  int *year = &ret->__buffer.year;
+  int *month = &ret->__buffer.month;
+  int *day = &ret->__buffer.day;
+  int *hour = &ret->__buffer.hour;
+  int *minute = &ret->__buffer.minute;
+  int *second = &ret->__buffer.second;
+  int *millisec = &ret->__buffer.millisec;
+
+  /* parse date YYYY-MM-DD */
+  if (0 == scan_date(p, year, month, day)) {
+    ret->year = year;
+    ret->month = month;
+    ret->day = day;
+
+    p += 10;
+    if (*p) {
+      // parse the T or space separator
+      if (*p != 'T' && *p != 't' && *p != ' ')
+        return -1;
+      must_parse_time = 1;
+      p++;
+    }
+  }
+
+  /* parse time HH:MM:SS */
+  if (0 == scan_time(p, hour, minute, second)) {
+    ret->hour = hour;
+    ret->minute = minute;
+    ret->second = second;
+
+    /* optionally, parse millisec */
+    p += 8;
+    if (*p == '.') {
+      p++; /* skip '.' */
+      const char *qq;
+      *millisec = parse_millisec(p, &qq);
+      ret->millisec = millisec;
+      p = qq;
+    }
+
+    if (*p) {
+      /* parse and copy Z */
+      char *z = ret->__buffer.z;
+      ret->z = z;
+      if (*p == 'Z' || *p == 'z') {
+        *z++ = 'Z';
+        p++;
+        *z = 0;
+
+      } else if (*p == '+' || *p == '-') {
+        *z++ = *p++;
+
+        if (!(isdigit(p[0]) && isdigit(p[1])))
+          return -1;
+        *z++ = *p++;
+        *z++ = *p++;
+
+        if (*p == ':') {
+          *z++ = *p++;
+
+          if (!(isdigit(p[0]) && isdigit(p[1])))
+            return -1;
+          *z++ = *p++;
+          *z++ = *p++;
+        }
+
+        *z = 0;
+      }
+    }
+  }
+  if (*p != 0)
+    return -1;
+
+  if (must_parse_time && !ret->hour)
+    return -1;
+
+  return 0;
+}
+
+/* Raw to boolean */
+int toml_rtob(toml_raw_t src, int *ret_) {
+  if (!src)
+    return -1;
+  int dummy;
+  int *ret = ret_ ? ret_ : &dummy;
+
+  if (0 == strcmp(src, "true")) {
+    *ret = 1;
+    return 0;
+  }
+  if (0 == strcmp(src, "false")) {
+    *ret = 0;
+    return 0;
+  }
+  return -1;
+}
+
+/* Raw to integer */
+int toml_rtoi(toml_raw_t src, int64_t *ret_) {
+  if (!src)
+    return -1;
+
+  char buf[100];
+  char *p = buf;
+  char *q = p + sizeof(buf);
+  const char *s = src;
+  int base = 0;
+  int64_t dummy;
+  int64_t *ret = ret_ ? ret_ : &dummy;
+
+  /* allow +/- */
+  if (s[0] == '+' || s[0] == '-')
+    *p++ = *s++;
+
+  /* disallow +_100 */
+  if (s[0] == '_')
+    return -1;
+
+  /* if 0* ... */
+  if ('0' == s[0]) {
+    switch (s[1]) {
+    case 'x':
+      base = 16;
+      s += 2;
+      break;
+    case 'o':
+      base = 8;
+      s += 2;
+      break;
+    case 'b':
+      base = 2;
+      s += 2;
+      break;
+    case '\0':
+      return *ret = 0, 0;
+    default:
+      /* ensure no other digits after it */
+      if (s[1])
+        return -1;
+    }
+  }
+
+  /* just strip underscores and pass to strtoll */
+  while (*s && p < q) {
+    int ch = *s++;
+    if (ch == '_') {
+      // disallow '__'
+      if (s[0] == '_')
+        return -1;
+      // numbers cannot end with '_'
+      if (s[0] == '\0')
+        return -1;
+      continue; /* skip _ */
+    }
+    *p++ = ch;
+  }
+
+  // if not at end-of-string or we ran out of buffer ...
+  if (*s || p == q)
+    return -1;
+
+  /* cap with NUL */
+  *p = 0;
+
+  /* Run strtoll on buf to get the integer */
+  char *endp;
+  errno = 0;
+  *ret = strtoll(buf, &endp, base);
+  return (errno || *endp) ? -1 : 0;
+}
+
+int toml_rtod_ex(toml_raw_t src, double *ret_, char *buf, int buflen) {
+  if (!src)
+    return -1;
+
+  char *p = buf;
+  char *q = p + buflen;
+  const char *s = src;
+  double dummy;
+  double *ret = ret_ ? ret_ : &dummy;
+
+  /* allow +/- */
+  if (s[0] == '+' || s[0] == '-')
+    *p++ = *s++;
+
+  /* disallow +_1.00 */
+  if (s[0] == '_')
+    return -1;
+
+  /* decimal point, if used, must be surrounded by at least one digit on each
+   * side */
+  {
+    char *dot = strchr(s, '.');
+    if (dot) {
+      if (dot == s || !isdigit(dot[-1]) || !isdigit(dot[1]))
+        return -1;
+    }
+  }
+
+  /* zero must be followed by . or 'e', or NUL */
+  if (s[0] == '0' && s[1] && !strchr("eE.", s[1]))
+    return -1;
+
+  /* just strip underscores and pass to strtod */
+  while (*s && p < q) {
+    int ch = *s++;
+    if (ch == '_') {
+      // disallow '__'
+      if (s[0] == '_')
+        return -1;
+      // disallow last char '_'
+      if (s[0] == 0)
+        return -1;
+      continue; /* skip _ */
+    }
+    *p++ = ch;
+  }
+  if (*s || p == q)
+    return -1; /* reached end of string or buffer is full? */
+
+  /* cap with NUL */
+  *p = 0;
+
+  /* Run strtod on buf to get the value */
+  char *endp;
+  errno = 0;
+  *ret = strtod(buf, &endp);
+  return (errno || *endp) ? -1 : 0;
+}
+
+int toml_rtod(toml_raw_t src, double *ret_) {
+  char buf[100];
+  return toml_rtod_ex(src, ret_, buf, sizeof(buf));
+}
+
+int toml_rtos(toml_raw_t src, char **ret) {
+  int multiline = 0;
+  const char *sp;
+  const char *sq;
+
+  *ret = 0;
+  if (!src)
+    return -1;
+
+  // for strings, first char must be a s-quote or d-quote
+  int qchar = src[0];
+  int srclen = strlen(src);
+  if (!(qchar == '\'' || qchar == '"')) {
+    return -1;
+  }
+
+  // triple quotes?
+  if (qchar == src[1] && qchar == src[2]) {
+    multiline = 1;         // triple-quote implies multiline
+    sp = src + 3;          // first char after quote
+    sq = src + srclen - 3; // first char of ending quote
+
+    if (!(sp <= sq && sq[0] == qchar && sq[1] == qchar && sq[2] == qchar)) {
+      // last 3 chars in src must be qchar
+      return -1;
+    }
+
+    /* skip new line immediate after qchar */
+    if (sp[0] == '\n')
+      sp++;
+    else if (sp[0] == '\r' && sp[1] == '\n')
+      sp += 2;
+
+  } else {
+    sp = src + 1;          // first char after quote
+    sq = src + srclen - 1; // ending quote
+    if (!(sp <= sq && *sq == qchar)) {
+      /* last char in src must be qchar */
+      return -1;
+    }
+  }
+
+  // at this point:
+  //     sp points to first valid char after quote.
+  //     sq points to one char beyond last valid char.
+  //     string len is (sq - sp).
+  if (qchar == '\'') {
+    *ret = norm_lit_str(sp, sq - sp, multiline, 0, 0);
+  } else {
+    *ret = norm_basic_str(sp, sq - sp, multiline, 0, 0);
+  }
+
+  return *ret ? 0 : -1;
+}
+
+toml_datum_t toml_string_at(const toml_array_t *arr, int idx) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtos(toml_raw_at(arr, idx), &ret.u.s));
+  return ret;
+}
+
+toml_datum_t toml_bool_at(const toml_array_t *arr, int idx) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtob(toml_raw_at(arr, idx), &ret.u.b));
+  return ret;
+}
+
+toml_datum_t toml_int_at(const toml_array_t *arr, int idx) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtoi(toml_raw_at(arr, idx), &ret.u.i));
+  return ret;
+}
+
+toml_datum_t toml_double_at(const toml_array_t *arr, int idx) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtod(toml_raw_at(arr, idx), &ret.u.d));
+  return ret;
+}
+
+toml_datum_t toml_timestamp_at(const toml_array_t *arr, int idx) {
+  toml_timestamp_t ts;
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtots(toml_raw_at(arr, idx), &ts));
+  if (ret.ok) {
+    ret.ok = !!(ret.u.ts = MALLOC(sizeof(*ret.u.ts)));
+    if (ret.ok) {
+      *ret.u.ts = ts;
+      if (ret.u.ts->year)
+        ret.u.ts->year = &ret.u.ts->__buffer.year;
+      if (ret.u.ts->month)
+        ret.u.ts->month = &ret.u.ts->__buffer.month;
+      if (ret.u.ts->day)
+        ret.u.ts->day = &ret.u.ts->__buffer.day;
+      if (ret.u.ts->hour)
+        ret.u.ts->hour = &ret.u.ts->__buffer.hour;
+      if (ret.u.ts->minute)
+        ret.u.ts->minute = &ret.u.ts->__buffer.minute;
+      if (ret.u.ts->second)
+        ret.u.ts->second = &ret.u.ts->__buffer.second;
+      if (ret.u.ts->millisec)
+        ret.u.ts->millisec = &ret.u.ts->__buffer.millisec;
+      if (ret.u.ts->z)
+        ret.u.ts->z = ret.u.ts->__buffer.z;
+    }
+  }
+  return ret;
+}
+
+toml_datum_t toml_string_in(const toml_table_t *arr, const char *key) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  toml_raw_t raw = toml_raw_in(arr, key);
+  if (raw) {
+    ret.ok = (0 == toml_rtos(raw, &ret.u.s));
+  }
+  return ret;
+}
+
+toml_datum_t toml_bool_in(const toml_table_t *arr, const char *key) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtob(toml_raw_in(arr, key), &ret.u.b));
+  return ret;
+}
+
+toml_datum_t toml_int_in(const toml_table_t *arr, const char *key) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtoi(toml_raw_in(arr, key), &ret.u.i));
+  return ret;
+}
+
+toml_datum_t toml_double_in(const toml_table_t *arr, const char *key) {
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtod(toml_raw_in(arr, key), &ret.u.d));
+  return ret;
+}
+
+toml_datum_t toml_timestamp_in(const toml_table_t *arr, const char *key) {
+  toml_timestamp_t ts;
+  toml_datum_t ret;
+  memset(&ret, 0, sizeof(ret));
+  ret.ok = (0 == toml_rtots(toml_raw_in(arr, key), &ts));
+  if (ret.ok) {
+    ret.ok = !!(ret.u.ts = MALLOC(sizeof(*ret.u.ts)));
+    if (ret.ok) {
+      *ret.u.ts = ts;
+      if (ret.u.ts->year)
+        ret.u.ts->year = &ret.u.ts->__buffer.year;
+      if (ret.u.ts->month)
+        ret.u.ts->month = &ret.u.ts->__buffer.month;
+      if (ret.u.ts->day)
+        ret.u.ts->day = &ret.u.ts->__buffer.day;
+      if (ret.u.ts->hour)
+        ret.u.ts->hour = &ret.u.ts->__buffer.hour;
+      if (ret.u.ts->minute)
+        ret.u.ts->minute = &ret.u.ts->__buffer.minute;
+      if (ret.u.ts->second)
+        ret.u.ts->second = &ret.u.ts->__buffer.second;
+      if (ret.u.ts->millisec)
+        ret.u.ts->millisec = &ret.u.ts->__buffer.millisec;
+      if (ret.u.ts->z)
+        ret.u.ts->z = ret.u.ts->__buffer.z;
+    }
+  }
+  return ret;
+}
+
+static int parse_millisec(const char *p, const char **endp) {
+  int ret = 0;
+  int unit = 100; /* unit in millisec */
+  for (; '0' <= *p && *p <= '9'; p++, unit /= 10) {
+    ret += (*p - '0') * unit;
+  }
+  *endp = p;
+  return ret;
+
+==> src/transformer.c <==
+#include <math.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "../include/config.h" // Include config.h before transformer.h
+#include "../include/cwt.h"
+#include "../include/fasta_parser.h"
+#include "../include/gff_parser.h"
+#include "../include/transformer.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ============================================================================
+// Workspace for matrix operations (placed early to avoid implicit decls)
+// ============================================================================
+typedef struct {
+  Matrix* features;    // window_size x feature_dim (num_scales*2)
+  Matrix* projected;   // window_size x d_model
+  Matrix* encoder_out; // window_size x d_model
+  Matrix* logits;      // window_size x num_labels
+  double**
+      cwt_planes;  // raw CWT planes (feature_dim arrays of length window_size)
+  int feature_dim; // feature_dim = num_scales * 2
+} TransformerWorkspace;
+
+// Forward declaration for free function (used in create on allocation failure)
+static void transformer_workspace_free(TransformerWorkspace* ws);
+
+static TransformerWorkspace*
+transformer_workspace_create(const TransformerConfig* config) {
+  TransformerWorkspace* ws =
+      (TransformerWorkspace*)malloc(sizeof(TransformerWorkspace));
+  if (!ws)
+    return NULL;
+  int window_size = config->window_size;
+  int d_model = config->d_model;
+  int feature_dim = config->num_cwt_scales * 2;
+  ws->feature_dim = feature_dim;
+  ws->features = matrix_create(window_size, feature_dim);
+  ws->projected = matrix_create(window_size, d_model);
+  ws->encoder_out = matrix_create(window_size, d_model);
+  ws->logits = matrix_create(window_size, config->num_labels);
+  ws->cwt_planes = (double**)calloc(feature_dim, sizeof(double*));
+  if (ws->cwt_planes) {
+    for (int i = 0; i < feature_dim; i++) {
+      ws->cwt_planes[i] = (double*)calloc(window_size, sizeof(double));
+      if (!ws->cwt_planes[i]) {
+        for (int j = 0; j < i; j++)
+          free(ws->cwt_planes[j]);
+        free(ws->cwt_planes);
+        ws->cwt_planes = NULL;
+        break;
+      }
+    }
+  }
+  if (!ws->features || !ws->projected || !ws->encoder_out || !ws->logits ||
+      !ws->cwt_planes) {
+    transformer_workspace_free(ws);
+    return NULL;
+  }
+  return ws;
+}
+
+static void transformer_workspace_free(TransformerWorkspace* ws) {
+  if (!ws)
+    return;
+  matrix_free(ws->features);
+  matrix_free(ws->projected);
+  matrix_free(ws->encoder_out);
+  matrix_free(ws->logits);
+  if (ws->cwt_planes) {
+    for (int i = 0; i < ws->feature_dim; i++)
+      free(ws->cwt_planes[i]);
+    free(ws->cwt_planes);
+  }
+  free(ws);
+}
+
+// Safe fread wrapper
+static bool safe_fread(void* ptr, size_t size, size_t nmemb, FILE* fp,
+                       const char* what) {
+  size_t r = fread(ptr, size, nmemb, fp);
+  if (r != nmemb) {
+    fprintf(stderr,
+            "Error: Failed reading %s (expected %zu elements, got %zu)\n", what,
+            nmemb, r);
+    return false;
+  }
+  return true;
+}
+
+// Forward declaration of window processor
+static double process_sequence_window(TransformerModel* model,
+                                      TransformerWorkspace* ws,
+                                      const char* window_seq, int window_len,
+                                      const int* window_labels,
+                                      bool is_training);
+
+// ============================================================================
+// Matrix operations
+// ============================================================================
+
+Matrix* matrix_create(int rows, int cols) {
+  Matrix* m = (Matrix*)malloc(sizeof(Matrix));
+  if (!m)
+    return NULL;
+
+  m->rows = rows;
+  m->cols = cols;
+  m->data = (double*)calloc(rows * cols, sizeof(double));
+  if (!m->data) {
+    free(m);
+    return NULL;
+  }
+
+  return m;
+}
+
+void matrix_free(Matrix* m) {
+  if (m) {
+    free(m->data);
+    free(m);
+  }
+}
+
+void matrix_zero(Matrix* m) {
+  memset(m->data, 0, m->rows * m->cols * sizeof(double));
+}
+
+void matrix_random_init(Matrix* m, double scale) {
+  // Xavier/Glorot initialization
+  for (int i = 0; i < m->rows * m->cols; i++) {
+    m->data[i] = ((double)rand() / RAND_MAX - 0.5) * 2.0 * scale;
+  }
+}
+
+void matrix_copy(Matrix* dst, const Matrix* src) {
+  if (dst->rows != src->rows || dst->cols != src->cols) {
+    fprintf(stderr, "Error: Matrix dimensions mismatch in copy\n");
+    return;
+  }
+  memcpy(dst->data, src->data, src->rows * src->cols * sizeof(double));
+}
+
+void matrix_add(Matrix* result, const Matrix* a, const Matrix* b) {
+  if (a->rows != b->rows || a->cols != b->cols || result->rows != a->rows ||
+      result->cols != a->cols) {
+    fprintf(stderr, "Error: Matrix dimensions mismatch in add\n");
+    return;
+  }
+
+  for (int i = 0; i < a->rows * a->cols; i++) {
+    result->data[i] = a->data[i] + b->data[i];
+  }
+}
+
+void matrix_transpose(Matrix* result, const Matrix* input) {
+  if (result->rows != input->cols || result->cols != input->rows) {
+    fprintf(stderr, "Error: Matrix dimensions mismatch in transpose\n");
+    return;
+  }
+
+  for (int i = 0; i < input->rows; i++) {
+    for (int j = 0; j < input->cols; j++) {
+      result->data[j * result->cols + i] = input->data[i * input->cols + j];
+    }
+  }
+}
+
+// Thread data for parallel matrix multiplication
+typedef struct {
+  const Matrix* a;
+  const Matrix* b;
+  Matrix* result;
+  int start_row;
+  int end_row;
+} MatMulThreadData;
+
+static void* matrix_multiply_thread(void* arg) {
+  MatMulThreadData* data = (MatMulThreadData*)arg;
+
+  for (int i = data->start_row; i < data->end_row; i++) {
+    for (int j = 0; j < data->b->cols; j++) {
+      double sum = 0.0;
+      for (int k = 0; k < data->a->cols; k++) {
+        sum += data->a->data[i * data->a->cols + k] *
+               data->b->data[k * data->b->cols + j];
+      }
+      data->result->data[i * data->result->cols + j] = sum;
+    }
+  }
+
+  return NULL;
+}
+
+void matrix_multiply_parallel(Matrix* result, const Matrix* a, const Matrix* b,
+                              int num_threads) {
+  if (a->cols != b->rows || result->rows != a->rows ||
+      result->cols != b->cols) {
+    fprintf(stderr, "Error: Matrix dimensions mismatch in multiply\n");
+    return;
+  }
+
+  if (num_threads <= 1 || a->rows < num_threads) {
+    // Single-threaded multiplication for small matrices
+    for (int i = 0; i < a->rows; i++) {
+      for (int j = 0; j < b->cols; j++) {
+        double sum = 0.0;
+        for (int k = 0; k < a->cols; k++) {
+          sum += a->data[i * a->cols + k] * b->data[k * b->cols + j];
+        }
+        result->data[i * result->cols + j] = sum;
+      }
+    }
+    return;
+  }
+
+  pthread_t* threads = (pthread_t*)malloc(num_threads * sizeof(pthread_t));
+  MatMulThreadData* thread_data =
+      (MatMulThreadData*)malloc(num_threads * sizeof(MatMulThreadData));
+
+  int rows_per_thread = a->rows / num_threads;
+  int remaining_rows = a->rows % num_threads;
+
+  int current_row = 0;
+  for (int t = 0; t < num_threads; t++) {
+    thread_data[t].a = a;
+    thread_data[t].b = b;
+    thread_data[t].result = result;
+    thread_data[t].start_row = current_row;
+    thread_data[t].end_row =
+        current_row + rows_per_thread + (t < remaining_rows ? 1 : 0);
+    current_row = thread_data[t].end_row;
+
+    pthread_create(&threads[t], NULL, matrix_multiply_thread, &thread_data[t]);
+  }
+
+  for (int t = 0; t < num_threads; t++) {
+    pthread_join(threads[t], NULL);
+  }
+
+  free(threads);
+  free(thread_data);
+}
+
+// ============================================================================
+// Positional Encoding
+// ============================================================================
+
+void compute_positional_encoding(Matrix* pos_enc, int max_length, int d_model) {
+  for (int pos = 0; pos < max_length; pos++) {
+    for (int i = 0; i < d_model; i++) {
+      double angle = pos / pow(10000.0, (2.0 * (i / 2)) / d_model);
+      if (i % 2 == 0) {
+        pos_enc->data[pos * d_model + i] = sin(angle);
+      } else {
+        pos_enc->data[pos * d_model + i] = cos(angle);
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Layer Normalization
+// ============================================================================
+
+LayerNorm* layer_norm_create(int d_model) {
+  LayerNorm* ln = (LayerNorm*)malloc(sizeof(LayerNorm));
+  if (!ln)
+    return NULL;
+
+  ln->d_model = d_model;
+  ln->gamma = (double*)malloc(d_model * sizeof(double));
+  ln->beta = (double*)malloc(d_model * sizeof(double));
+
+  if (!ln->gamma || !ln->beta) {
+    layer_norm_free(ln);
+    return NULL;
+  }
+
+  // Initialize gamma to 1, beta to 0
+  for (int i = 0; i < d_model; i++) {
+    ln->gamma[i] = 1.0;
+    ln->beta[i] = 0.0;
+  }
+
+  return ln;
+}
+
+void layer_norm_free(LayerNorm* ln) {
+  if (ln) {
+    free(ln->gamma);
+    free(ln->beta);
+    free(ln);
+  }
+}
+
+void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input) {
+  const double eps = 1e-6;
+
+  for (int i = 0; i < input->rows; i++) {
+    // Calculate mean
+    double mean = 0.0;
+    for (int j = 0; j < ln->d_model; j++) {
+      mean += input->data[i * ln->d_model + j];
+    }
+    mean /= ln->d_model;
+
+    // Calculate variance
+    double variance = 0.0;
+    for (int j = 0; j < ln->d_model; j++) {
+      double diff = input->data[i * ln->d_model + j] - mean;
+      variance += diff * diff;
+    }
+    variance /= ln->d_model;
+
+    // Normalize and apply affine transformation
+    double std = sqrt(variance + eps);
+    for (int j = 0; j < ln->d_model; j++) {
+      double normalized = (input->data[i * ln->d_model + j] - mean) / std;
+      output->data[i * ln->d_model + j] =
+          ln->gamma[j] * normalized + ln->beta[j];
+    }
+  }
+}
+
+// ============================================================================
+// Scaled Dot-Product Attention
+// ============================================================================
+
+typedef struct {
+  const Matrix* Q;
+  const Matrix* K;
+  const Matrix* V;
+  Matrix* scores;
+  Matrix* output;
+  const Matrix* mask;
+  int start_row;
+  int end_row;
+  double scale;
+} AttentionThreadData;
+
+static void* attention_compute_thread(void* arg) {
+  AttentionThreadData* data = (AttentionThreadData*)arg;
+
+  // Compute attention scores: Q * K^T
+  for (int i = data->start_row; i < data->end_row; i++) {
+    for (int j = 0; j < data->K->rows; j++) {
+      double sum = 0.0;
+      for (int k = 0; k < data->Q->cols; k++) {
+        sum += data->Q->data[i * data->Q->cols + k] *
+               data->K->data[j * data->K->cols + k];
+      }
+      data->scores->data[i * data->scores->cols + j] = sum * data->scale;
+    }
+  }
+
+  return NULL;
+}
+
+void scaled_dot_product_attention(Matrix* output, const Matrix* Q,
+                                  const Matrix* K, const Matrix* V,
+                                  const Matrix* mask, int num_threads) {
+  int seq_len = Q->rows;
+  int d_k = Q->cols;
+  double scale = 1.0 / sqrt((double)d_k);
+
+  // Compute attention scores
+  Matrix* scores = matrix_create(seq_len, K->rows);
+
+  if (num_threads <= 1 || seq_len < num_threads) {
+    // Single-threaded
+    for (int i = 0; i < seq_len; i++) {
+      for (int j = 0; j < K->rows; j++) {
+        double sum = 0.0;
+        for (int k = 0; k < d_k; k++) {
+          sum += Q->data[i * d_k + k] * K->data[j * d_k + k];
+        }
+        scores->data[i * K->rows + j] = sum * scale;
+      }
+    }
+  } else {
+    // Parallel computation
+    pthread_t* threads = (pthread_t*)malloc(num_threads * sizeof(pthread_t));
+    AttentionThreadData* thread_data =
+        (AttentionThreadData*)malloc(num_threads * sizeof(AttentionThreadData));
+
+    int rows_per_thread = seq_len / num_threads;
+    int remaining = seq_len % num_threads;
+    int current = 0;
+
+    for (int t = 0; t < num_threads; t++) {
+      thread_data[t].Q = Q;
+      thread_data[t].K = K;
+      thread_data[t].V = V;
+      thread_data[t].scores = scores;
+      thread_data[t].output = output;
+      thread_data[t].mask = mask;
+      thread_data[t].scale = scale;
+      thread_data[t].start_row = current;
+      thread_data[t].end_row =
+          current + rows_per_thread + (t < remaining ? 1 : 0);
+      current = thread_data[t].end_row;
+
+      pthread_create(&threads[t], NULL, attention_compute_thread,
+                     &thread_data[t]);
+    }
+
+    for (int t = 0; t < num_threads; t++) {
+      pthread_join(threads[t], NULL);
+    }
+
+    free(threads);
+    free(thread_data);
+  }
+
+  // Apply mask if provided
+  if (mask) {
+    for (int i = 0; i < scores->rows * scores->cols; i++) {
+      if (mask->data[i] == 0.0) {
+        scores->data[i] = -1e9; // Large negative value
+      }
+    }
+  }
+
+  // Apply softmax
+  for (int i = 0; i < seq_len; i++) {
+    double max_score = -1e9;
+    for (int j = 0; j < K->rows; j++) {
+      if (scores->data[i * K->rows + j] > max_score) {
+        max_score = scores->data[i * K->rows + j];
+      }
+    }
+
+    double sum_exp = 0.0;
+    for (int j = 0; j < K->rows; j++) {
+      scores->data[i * K->rows + j] =
+          exp(scores->data[i * K->rows + j] - max_score);
+      sum_exp += scores->data[i * K->rows + j];
+    }
+
+    for (int j = 0; j < K->rows; j++) {
+      scores->data[i * K->rows + j] /= sum_exp;
+    }
+  }
+
+  // Multiply by V: scores * V
+  matrix_multiply_parallel(output, scores, V, num_threads);
+
+  matrix_free(scores);
+}
+
+// ============================================================================
+// Multi-Head Attention
+// ============================================================================
+
+MultiHeadAttention* multihead_attention_create(int d_model, int num_heads) {
+  if (d_model % num_heads != 0) {
+    fprintf(stderr, "Error: d_model must be divisible by num_heads\n");
+    return NULL;
+  }
+
+  MultiHeadAttention* mha =
+      (MultiHeadAttention*)malloc(sizeof(MultiHeadAttention));
+  if (!mha)
+    return NULL;
+
+  mha->d_model = d_model;
+  mha->num_heads = num_heads;
+  mha->d_k = d_model / num_heads;
+
+  double scale = sqrt(2.0 / d_model);
+
+  mha->W_q = matrix_create(d_model, d_model);
+  mha->W_k = matrix_create(d_model, d_model);
+  mha->W_v = matrix_create(d_model, d_model);
+  mha->W_o = matrix_create(d_model, d_model);
+
+  if (!mha->W_q || !mha->W_k || !mha->W_v || !mha->W_o) {
+    multihead_attention_free(mha);
+    return NULL;
+  }
+
+  matrix_random_init(mha->W_q, scale);
+  matrix_random_init(mha->W_k, scale);
+  matrix_random_init(mha->W_v, scale);
+  matrix_random_init(mha->W_o, scale);
+
+  return mha;
+}
+
+void multihead_attention_free(MultiHeadAttention* mha) {
+  if (mha) {
+    matrix_free(mha->W_q);
+    matrix_free(mha->W_k);
+    matrix_free(mha->W_v);
+    matrix_free(mha->W_o);
+    free(mha);
+  }
+}
+
+// Thread data for multi-head attention
+typedef struct {
+  MultiHeadAttention* mha;
+  Matrix* output;
+  const Matrix* query;
+  const Matrix* key;
+  const Matrix* value;
+  const Matrix* mask;
+  int head_id;
+  int num_threads;
+} MHAThreadData;
+
+static void* multihead_attention_head_thread(void* arg) {
+  MHAThreadData* data = (MHAThreadData*)arg;
+  int seq_len = data->query->rows;
+  int d_k = data->mha->d_k;
+
+  // Extract Q, K, V for this head
+  Matrix* Q_head = matrix_create(seq_len, d_k);
+  Matrix* K_head = matrix_create(seq_len, d_k);
+  Matrix* V_head = matrix_create(seq_len, d_k);
+  Matrix* attn_output = matrix_create(seq_len, d_k);
+
+  // Project and extract head-specific Q, K, V
+  // This is a simplified version - full implementation would do proper
+  // projection
+  int head_offset = data->head_id * d_k;
+  for (int i = 0; i < seq_len; i++) {
+    for (int j = 0; j < d_k; j++) {
+      Q_head->data[i * d_k + j] =
+          data->query->data[i * data->mha->d_model + head_offset + j];
+      K_head->data[i * d_k + j] =
+          data->key->data[i * data->mha->d_model + head_offset + j];
+      V_head->data[i * d_k + j] =
+          data->value->data[i * data->mha->d_model + head_offset + j];
+    }
+  }
+
+  // Compute attention for this head
+  scaled_dot_product_attention(attn_output, Q_head, K_head, V_head, data->mask,
+                               1);
+
+  // Copy output to the correct position
+  for (int i = 0; i < seq_len; i++) {
+    for (int j = 0; j < d_k; j++) {
+      data->output->data[i * data->mha->d_model + head_offset + j] =
+          attn_output->data[i * d_k + j];
+    }
+  }
+
+  matrix_free(Q_head);
+  matrix_free(K_head);
+  matrix_free(V_head);
+  matrix_free(attn_output);
+
+  return NULL;
+}
+
+void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
+                                 const Matrix* query, const Matrix* key,
+                                 const Matrix* value, const Matrix* mask,
+                                 int num_threads) {
+  int seq_len = query->rows;
+
+  // Project inputs
+  Matrix* Q = matrix_create(seq_len, mha->d_model);
+  Matrix* K = matrix_create(seq_len, mha->d_model);
+  Matrix* V = matrix_create(seq_len, mha->d_model);
+
+  matrix_multiply_parallel(Q, query, mha->W_q, num_threads);
+  matrix_multiply_parallel(K, key, mha->W_k, num_threads);
+  matrix_multiply_parallel(V, value, mha->W_v, num_threads);
+
+  // Compute attention for each head in parallel
+  Matrix* concat_output = matrix_create(seq_len, mha->d_model);
+  matrix_zero(concat_output);
+
+  if (num_threads >= mha->num_heads) {
+    // Parallelize across heads
+    pthread_t* threads = (pthread_t*)malloc(mha->num_heads * sizeof(pthread_t));
+    MHAThreadData* thread_data =
+        (MHAThreadData*)malloc(mha->num_heads * sizeof(MHAThreadData));
+
+    for (int h = 0; h < mha->num_heads; h++) {
+      thread_data[h].mha = mha;
+      thread_data[h].output = concat_output;
+      thread_data[h].query = Q;
+      thread_data[h].key = K;
+      thread_data[h].value = V;
+      thread_data[h].mask = mask;
+      thread_data[h].head_id = h;
+      thread_data[h].num_threads = 1;
+
+      pthread_create(&threads[h], NULL, multihead_attention_head_thread,
+                     &thread_data[h]);
+    }
+
+    for (int h = 0; h < mha->num_heads; h++) {
+      pthread_join(threads[h], NULL);
+    }
+
+    free(threads);
+    free(thread_data);
+  } else {
+    // Sequential computation of heads
+    for (int h = 0; h < mha->num_heads; h++) {
+      MHAThreadData data;
+      data.mha = mha;
+      data.output = concat_output;
+      data.query = Q;
+      data.key = K;
+      data.value = V;
+      data.mask = mask;
+      data.head_id = h;
+      data.num_threads = 1;
+
+      multihead_attention_head_thread(&data);
+    }
+  }
+
+  // Final linear projection
+  matrix_multiply_parallel(output, concat_output, mha->W_o, num_threads);
+
+  matrix_free(Q);
+  matrix_free(K);
+  matrix_free(V);
+  matrix_free(concat_output);
+}
+
+// ============================================================================
+// Feed-Forward Network
+// ============================================================================
+
+FeedForward* feedforward_create(int d_model, int d_ff) {
+  FeedForward* ff = (FeedForward*)malloc(sizeof(FeedForward));
+  if (!ff)
+    return NULL;
+
+  ff->d_model = d_model;
+  ff->d_ff = d_ff;
+
+  double scale = sqrt(2.0 / d_model);
+
+  ff->W1 = matrix_create(d_model, d_ff);
+  ff->b1 = matrix_create(1, d_ff);
+  ff->W2 = matrix_create(d_ff, d_model);
+  ff->b2 = matrix_create(1, d_model);
+
+  if (!ff->W1 || !ff->b1 || !ff->W2 || !ff->b2) {
+    feedforward_free(ff);
+    return NULL;
+  }
+
+  matrix_random_init(ff->W1, scale);
+  matrix_zero(ff->b1);
+  matrix_random_init(ff->W2, scale);
+  matrix_zero(ff->b2);
+
+  return ff;
+}
+
+void feedforward_free(FeedForward* ff) {
+  if (ff) {
+    matrix_free(ff->W1);
+    matrix_free(ff->b1);
+    matrix_free(ff->W2);
+    matrix_free(ff->b2);
+    free(ff);
+  }
+}
+
+// ReLU activation
+static void relu(Matrix* m) {
+  for (int i = 0; i < m->rows * m->cols; i++) {
+    if (m->data[i] < 0.0) {
+      m->data[i] = 0.0;
+    }
+  }
+}
+
+void feedforward_forward(FeedForward* ff, Matrix* output, const Matrix* input,
+                         int num_threads) {
+  int seq_len = input->rows;
+
+  // First layer: input * W1 + b1
+  Matrix* hidden = matrix_create(seq_len, ff->d_ff);
+  matrix_multiply_parallel(hidden, input, ff->W1, num_threads);
+
+  // Add bias
+  for (int i = 0; i < seq_len; i++) {
+    for (int j = 0; j < ff->d_ff; j++) {
+      hidden->data[i * ff->d_ff + j] += ff->b1->data[j];
+    }
+  }
+
+  // ReLU activation
+  relu(hidden);
+
+  // Second layer: hidden * W2 + b2
+  matrix_multiply_parallel(output, hidden, ff->W2, num_threads);
+
+  // Add bias
+  for (int i = 0; i < seq_len; i++) {
+    for (int j = 0; j < ff->d_model; j++) {
+      output->data[i * ff->d_model + j] += ff->b2->data[j];
+    }
+  }
+
+  matrix_free(hidden);
+}
+
+// ============================================================================
+// Encoder Layer
+// ============================================================================
+EncoderLayer* encoder_layer_create(int d_model, int num_heads, int d_ff,
+                                   double dropout_rate) {
+  EncoderLayer* layer = (EncoderLayer*)malloc(sizeof(EncoderLayer));
+  if (!layer)
+    return NULL;
+  layer->self_attn = multihead_attention_create(d_model, num_heads);
+  layer->ff = feedforward_create(d_model, d_ff);
+  layer->norm1 = layer_norm_create(d_model);
+  layer->norm2 = layer_norm_create(d_model);
+  layer->dropout_rate = dropout_rate;
+  if (!layer->self_attn || !layer->ff || !layer->norm1 || !layer->norm2) {
+    encoder_layer_free(layer);
+    return NULL;
+  }
+  return layer;
+}
+
+void encoder_layer_free(EncoderLayer* layer) {
+  if (!layer)
+    return;
+  multihead_attention_free(layer->self_attn);
+  feedforward_free(layer->ff);
+  layer_norm_free(layer->norm1);
+  layer_norm_free(layer->norm2);
+  free(layer);
+}
+
+void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
+                           const Matrix* input, const Matrix* mask,
+                           int num_threads) {
+  int seq_len = input->rows;
+  int d_model = input->cols;
+
+  // Self-attention
+  Matrix* attn_out = matrix_create(seq_len, d_model);
+  multihead_attention_forward(layer->self_attn, attn_out, input, input, input,
+                              mask, num_threads);
+
+  // Residual + Norm1
+  Matrix* resid1 = matrix_create(seq_len, d_model);
+  matrix_copy(resid1, input);
+  matrix_add(resid1, resid1, attn_out);
+  Matrix* normed1 = matrix_create(seq_len, d_model);
+  layer_norm_forward(layer->norm1, normed1, resid1);
+
+  // Feed-forward
+  Matrix* ff_out = matrix_create(seq_len, d_model);
+  feedforward_forward(layer->ff, ff_out, normed1, num_threads);
+
+  // Residual + Norm2
+  Matrix* resid2 = matrix_create(seq_len, d_model);
+  matrix_copy(resid2, normed1);
+  matrix_add(resid2, resid2, ff_out);
+  layer_norm_forward(layer->norm2, output, resid2);
+
+  matrix_free(attn_out);
+  matrix_free(resid1);
+  matrix_free(normed1);
+  matrix_free(ff_out);
+  matrix_free(resid2);
+}
+
+// ============================================================================
+// Full Transformer Model
+// ============================================================================
+
+TransformerModel* transformer_create(TransformerConfig* config) {
+  TransformerModel* model = (TransformerModel*)malloc(sizeof(TransformerModel));
+  if (!model)
+    return NULL;
+
+  model->config = config;
+  model->num_threads = config->num_threads;
+
+  int cwt_dim = config->num_cwt_scales * 2;
+  model->cwt_projection = matrix_create(cwt_dim, config->d_model);
+  matrix_random_init(model->cwt_projection, sqrt(2.0 / cwt_dim));
+
+  model->pos_encoding = matrix_create(config->window_size, config->d_model);
+  compute_positional_encoding(model->pos_encoding, config->window_size,
+                              config->d_model);
+
+  model->encoder_layers = (EncoderLayer**)malloc(config->num_encoder_layers *
+                                                 sizeof(EncoderLayer*));
+  for (int i = 0; i < config->num_encoder_layers; i++) {
+    model->encoder_layers[i] = encoder_layer_create(
+        config->d_model, config->num_heads, config->d_ff, config->dropout_rate);
+  }
+
+  model->output_projection = matrix_create(config->d_model, config->num_labels);
+  matrix_random_init(model->output_projection, sqrt(2.0 / config->d_model));
+
+  // Simplified parameter count for optimizer
+  int param_count = config->d_model * config->num_labels;
+  model->optimizer = adam_optimizer_create(param_count);
+
+  return model;
+}
+
+void transformer_free(TransformerModel* model) {
+  if (!model)
+    return;
+
+  matrix_free(model->cwt_projection);
+  matrix_free(model->pos_encoding);
+
+  if (model->encoder_layers) {
+    for (int i = 0; i < model->config->num_encoder_layers; i++) {
+      encoder_layer_free(model->encoder_layers[i]);
+    }
+    free(model->encoder_layers);
+  }
+
+  matrix_free(model->output_projection);
+  adam_optimizer_free(model->optimizer);
+
+  free(model);
+}
+
+void transformer_forward(TransformerModel* model, Matrix* output,
+                         const Matrix* input_features) {
+  int seq_len = input_features->rows;
+  int d_model = model->config->d_model;
+  int num_threads = model->num_threads;
+
+  // Project CWT features to d_model
+  Matrix* projected = matrix_create(seq_len, d_model);
+  matrix_multiply_parallel(projected, input_features, model->cwt_projection,
+                           num_threads);
+
+  // Add positional encoding
+  for (int i = 0; i < seq_len; i++) {
+    int pos = i % model->config->window_size;
+    for (int j = 0; j < d_model; j++) {
+      projected->data[i * d_model + j] +=
+          model->pos_encoding->data[pos * d_model + j];
+    }
+  }
+
+  // Pass through encoder
+  Matrix* encoder_output = matrix_create(seq_len, d_model);
+  matrix_copy(encoder_output, projected);
+
+  for (int i = 0; i < model->config->num_encoder_layers; i++) {
+    Matrix* layer_output = matrix_create(seq_len, d_model);
+    encoder_layer_forward(model->encoder_layers[i], layer_output,
+                          encoder_output, NULL, num_threads);
+    matrix_copy(encoder_output, layer_output);
+    matrix_free(layer_output);
+  }
+
+  // Project to vocabulary
+  matrix_multiply_parallel(output, encoder_output, model->output_projection,
+                           num_threads);
+
+  matrix_free(projected);
+  matrix_free(encoder_output);
+}
+
+// ============================================================================
+// Feature Extraction with CWT
+// ============================================================================
+
+// This function is now defined in cwt.c, so we remove the duplicate here.
+
+// ============================================================================
+// Adam Optimizer
+// ============================================================================
+
+AdamOptimizer* adam_optimizer_create(int param_count) {
+  AdamOptimizer* opt = (AdamOptimizer*)malloc(sizeof(AdamOptimizer));
+  if (!opt)
+    return NULL;
+
+  opt->gradients = (double*)calloc(param_count, sizeof(double));
+  opt->m = (double*)calloc(param_count, sizeof(double));
+  opt->v = (double*)calloc(param_count, sizeof(double));
+
+  if (!opt->gradients || !opt->m || !opt->v) {
+    adam_optimizer_free(opt);
+    return NULL;
+  }
+  return opt;
+}
+
+void adam_optimizer_free(AdamOptimizer* opt) {
+  if (opt) {
+    free(opt->gradients);
+    free(opt->m);
+    free(opt->v);
+    free(opt);
+  }
+}
+
+void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
+                         double learning_rate, double beta1, double beta2,
+                         double epsilon, int t) {
+  for (int i = 0; i < param_count; i++) {
+    // Update biased first moment estimate
+    opt->m[i] = beta1 * opt->m[i] + (1.0 - beta1) * opt->gradients[i];
+
+    // Update biased second raw moment estimate
+    opt->v[i] = beta2 * opt->v[i] +
+                (1.0 - beta2) * opt->gradients[i] * opt->gradients[i];
+
+    // Compute bias-corrected first moment estimate
+    double m_hat = opt->m[i] / (1.0 - pow(beta1, t));
+
+    // Compute bias-corrected second raw moment estimate
+    double v_hat = opt->v[i] / (1.0 - pow(beta2, t));
+
+    // Update parameters
+    params[i] -= learning_rate * m_hat / (sqrt(v_hat) + epsilon);
+  }
+}
+
+// ============================================================================
+// Loss Functions
+// ============================================================================
+
+double cross_entropy_loss(const Matrix* predictions, const int* targets,
+                          int batch_size, int num_labels) {
+  double total_loss = 0.0;
+
+  for (int b = 0; b < batch_size; b++) {
+    int target = targets[b];
+    if (target < 0 || target >= num_labels)
+      continue;
+
+    // Get prediction for target class
+    double pred = predictions->data[b * num_labels + target];
+
+    // Apply log-softmax for numerical stability
+    double max_pred = -1e9;
+    for (int v = 0; v < num_labels; v++) {
+      double val = predictions->data[b * num_labels + v];
+      if (val > max_pred)
+        max_pred = val;
+    }
+
+    double sum_exp = 0.0;
+    for (int v = 0; v < num_labels; v++) {
+      sum_exp += exp(predictions->data[b * num_labels + v] - max_pred);
+    }
+
+    double log_softmax = pred - max_pred - log(sum_exp);
+    total_loss -= log_softmax;
+  }
+
+  return total_loss / batch_size;
+}
+
+// ============================================================================
+// Training Implementation
+// ============================================================================
+
+bool transformer_train(TransformerModel* model, const char* train_fasta,
+                       const char* train_gff) {
+  fprintf(stderr, "=== Transformer Training with Token Classification ===\n");
+  fprintf(stderr, "Training data: %s, %s\n", train_fasta, train_gff);
+  fprintf(stderr, "Model: d_model=%d, heads=%d, layers=%d\n",
+          model->config->d_model, model->config->num_heads,
+          model->config->num_encoder_layers);
+  fprintf(stderr, "Labels: %d classes (intergenic=0, intron=1, exon=2)\n",
+          model->config->num_labels);
+  fprintf(stderr, "CWT: %d scales\n", model->config->num_cwt_scales);
+  fprintf(stderr, "Learning rate: %.6f, Epochs: %d\n",
+          model->config->learning_rate, model->config->num_epochs);
+  fprintf(stderr, "Sliding window: size=%d, overlap=%d\n",
+          model->config->window_size, model->config->window_overlap);
+
+  FastaData* fasta = parse_fasta(train_fasta);
+  if (!fasta) {
+    fprintf(stderr, "Error: Failed to parse FASTA file\n");
+    return false;
+  }
+  fprintf(stderr, "Loaded %d sequences from FASTA\n", fasta->count);
+
+  GFFData* gff = parse_gff(train_gff);
+  if (!gff) {
+    fprintf(stderr, "Error: Failed to parse GFF file\n");
+    free_fasta_data(fasta);
+    return false;
+  }
+
+  TransformerWorkspace* ws = transformer_workspace_create(model->config);
+  if (!ws) {
+    fprintf(stderr, "Error: Failed to create transformer workspace\n");
+    free_gff_data(gff);
+    free_fasta_data(fasta);
+    return false;
+  }
+
+  // Training loop
+  for (int epoch = 0; epoch < model->config->num_epochs; epoch++) {
+    fprintf(stderr, "\n=== Epoch %d/%d ===\n", epoch + 1,
+            model->config->num_epochs);
+    double epoch_loss = 0.0;
+    int num_windows = 0;
+    // (Label token counting removed; can be reintroduced if needed)
+
+    // Process each sequence with sliding window
+    for (int seq_idx = 0; seq_idx < fasta->count; seq_idx++) {
+      const char* seq_id = fasta->records[seq_idx].id;
+      const char* sequence = fasta->records[seq_idx].sequence;
+      int seq_len = strlen(sequence);
+
+      if (seq_len < 10)
+        continue;
+
+      fprintf(stderr, "Seq %d/%d: %s (len=%d)...\r", seq_idx + 1, fasta->count,
+              seq_id, seq_len);
+
+      int window_size = model->config->window_size;
+      int step = (model->config->window_overlap > 0 &&
+                  model->config->window_overlap < window_size)
+                     ? (window_size - model->config->window_overlap)
+                     : window_size;
+
+      // Process forward strand
+      int* labels = (int*)malloc(seq_len * sizeof(int));
+      if (create_labels_from_gff(gff, seq_id, seq_len, '+', labels)) {
+        for (int window_start = 0; window_start < seq_len;
+             window_start += step) {
+          int window_end = window_start + window_size;
+          if (window_end > seq_len)
+            window_end = seq_len;
+          int window_len = window_end - window_start;
+          if (window_len < 10)
+            continue;
+
+          char* window_seq = (char*)malloc((window_len + 1) * sizeof(char));
+          strncpy(window_seq, sequence + window_start, window_len);
+          window_seq[window_len] = '\0';
+
+          double window_loss = process_sequence_window(
+              model, ws, window_seq, window_len, &labels[window_start], true);
+          epoch_loss += window_loss;
+          num_windows++;
+
+          // Counting labels would need to be adapted if needed, as
+          // process_sequence_window doesn't return counts
+
+          free(window_seq);
+          if (window_end >= seq_len)
+            break;
+        }
+      }
+      free(labels);
+
+      // Process reverse complement strand
+      char* rc_seq = reverse_complement(sequence);
+      if (rc_seq) {
+        int* rc_labels = (int*)malloc(seq_len * sizeof(int));
+        if (create_labels_from_gff(gff, seq_id, seq_len, '-', rc_labels)) {
+          // Reverse the labels to match reverse complement sequence
+          for (int i = 0; i < seq_len / 2; i++) {
+            int tmp = rc_labels[i];
+            rc_labels[i] = rc_labels[seq_len - 1 - i];
+            rc_labels[seq_len - 1 - i] = tmp;
+          }
+
+          for (int window_start = 0; window_start < seq_len;
+               window_start += step) {
+            int window_end = window_start + window_size;
+            if (window_end > seq_len)
+              window_end = seq_len;
+            int window_len = window_end - window_start;
+            if (window_len < 10)
+              continue;
+
+            char* window_seq = (char*)malloc((window_len + 1) * sizeof(char));
+            strncpy(window_seq, rc_seq + window_start, window_len);
+            window_seq[window_len] = '\0';
+
+            double window_loss =
+                process_sequence_window(model, ws, window_seq, window_len,
+                                        &rc_labels[window_start], true);
+            epoch_loss += window_loss;
+            num_windows++;
+
+            free(window_seq);
+            if (window_end >= seq_len)
+              break;
+          }
+        }
+        free(rc_labels);
+        free(rc_seq);
+      }
+    }
+    fprintf(stderr, "\n"); // Newline after progress indicator
+
+    if (num_windows > 0) {
+      fprintf(stderr, "Epoch %d Summary: Avg Loss = %.4f\n", epoch + 1,
+              epoch_loss / num_windows);
+    } else {
+      fprintf(stderr, "Epoch %d Summary: No windows processed.\n", epoch + 1);
+    }
+  }
+
+  transformer_workspace_free(ws);
+  free_gff_data(gff);
+  free_fasta_data(fasta);
+
+  fprintf(stderr, "Training finished.\n");
+  return true;
+}
+
+// ============================================================================
+// Prediction Implementation
+// ============================================================================
+
+void transformer_predict(TransformerModel* model, const char* input_file,
+                         const char* output_gff_file,
+                         const char* output_bedgraph_file) {
+  fprintf(stderr, "=== Transformer Prediction ===\n");
+  fprintf(stderr, "Input FASTA: %s\n", input_file);
+  fprintf(stderr, "Output GFF: %s\n", output_gff_file);
+  if (output_bedgraph_file) {
+    fprintf(stderr, "Output BedGraph: %s\n", output_bedgraph_file);
+  }
+
+  FastaData* fasta = parse_fasta(input_file);
+  if (!fasta) {
+    fprintf(stderr, "Error: Failed to parse input FASTA file\n");
+    return;
+  }
+
+  FILE* out_gff = fopen(output_gff_file, "w");
+  if (!out_gff) {
+    fprintf(stderr, "Error: Cannot open output GFF file for writing\n");
+    free_fasta_data(fasta);
+    return;
+  }
+  fprintf(out_gff, "##gff-version 3\n");
+
+  FILE* out_bed = NULL;
+  if (output_bedgraph_file) {
+    out_bed = fopen(output_bedgraph_file, "w");
+    if (!out_bed) {
+      fprintf(stderr,
+              "Warning: Cannot open BedGraph file for writing. Skipping.\n");
+    }
+  }
+
+  TransformerWorkspace* ws = transformer_workspace_create(model->config);
+  if (!ws) {
+    fprintf(stderr, "Error: Failed to create transformer workspace\n");
+    fclose(out_gff);
+    if (out_bed)
+      fclose(out_bed);
+    free_fasta_data(fasta);
+    return;
+  }
+
+  for (int i = 0; i < fasta->count; i++) {
+    const char* seq_id = fasta->records[i].id;
+    const char* sequence = fasta->records[i].sequence;
+    int seq_len = strlen(sequence);
+
+    fprintf(stderr, "Predicting on sequence %s (length %d)\n", seq_id, seq_len);
+
+    int window_size = model->config->window_size;
+    int step = window_size - model->config->window_overlap;
+
+    // Allocate arrays to store aggregated predictions and counts
+    double* full_preds =
+        (double*)calloc(seq_len * model->config->num_labels, sizeof(double));
+    int* counts = (int*)calloc(seq_len, sizeof(int));
+
+    // Sliding window prediction
+    for (int start = 0; start < seq_len; start += step) {
+      int end = start + window_size;
+      if (end > seq_len)
+        end = seq_len;
+      int len = end - start;
+      if (len < 10)
+        continue;
+
+      char* window_seq = (char*)malloc((len + 1) * sizeof(char));
+      strncpy(window_seq, sequence + start, len);
+      window_seq[len] = '\0';
+
+      // process_sequence_window fills ws->logits
+      process_sequence_window(model, ws, window_seq, len, NULL, false);
+
+      // Aggregate predictions from the window
+      for (int j = 0; j < len; j++) {
+        for (int k = 0; k < model->config->num_labels; k++) {
+          full_preds[(start + j) * model->config->num_labels + k] +=
+              ws->logits->data[j * model->config->num_labels + k];
+        }
+        counts[start + j]++;
+      }
+      free(window_seq);
+    }
+
+    // Average the predictions in overlapping regions
+    for (int j = 0; j < seq_len; j++) {
+      if (counts[j] > 0) {
+        for (int k = 0; k < model->config->num_labels; k++) {
+          full_preds[j * model->config->num_labels + k] /= counts[j];
+        }
+      }
+    }
+
+    // Write BedGraph output
+    if (out_bed) {
+      for (int j = 0; j < seq_len; j++) {
+        double exon_prob = full_preds[j * model->config->num_labels +
+                                      2]; // Assuming label 2 is exon
+        fprintf(out_bed, "%s\t%d\t%d\t%.4f\n", seq_id, j, j + 1, exon_prob);
+      }
+    }
+
+    // Convert probabilities to final labels and write GFF
+    // Simple argmax for now
+    int current_label = -1;
+    int current_start = 0;
+    for (int j = 0; j < seq_len; j++) {
+      int max_label = 0;
+      double max_pred = -1e9;
+      for (int k = 0; k < model->config->num_labels; k++) {
+        if (full_preds[j * model->config->num_labels + k] > max_pred) {
+          max_pred = full_preds[j * model->config->num_labels + k];
+          max_label = k;
+        }
+      }
+
+      if (j == 0) {
+        current_label = max_label;
+        current_start = 1;
+      } else if (max_label != current_label) {
+        if (current_label > 0) { // Don't report intergenic regions
+          const char* feature_type = (current_label == 2) ? "exon" : "intron";
+          fprintf(out_gff,
+                  "%s\tSunfish\t%s\t%d\t%d\t.\t+\t.\tID=sunfish_pred_%d\n",
+                  seq_id, feature_type, current_start, j, i);
+        }
+        current_label = max_label;
+        current_start = j + 1;
+      }
+    }
+    // Write the last feature
+    if (current_label > 0 && current_start <= seq_len) {
+      const char* feature_type = (current_label == 2) ? "exon" : "intron";
+      fprintf(out_gff, "%s\tSunfish\t%s\t%d\t%d\t.\t+\t.\tID=sunfish_pred_%d\n",
+              seq_id, feature_type, current_start, seq_len, i);
+    }
+
+    free(full_preds);
+    free(counts);
+  }
+
+  transformer_workspace_free(ws);
+  fclose(out_gff);
+  if (out_bed)
+    fclose(out_bed);
+  free_fasta_data(fasta);
+
+  fprintf(stderr, "Prediction finished.\n");
+}
+
+// ============================================================================
+// Model Save/Load
+// ============================================================================
+
+bool transformer_save(const TransformerModel* model, const char* filename) {
+  if (!model || !filename) {
+    fprintf(stderr, "Error: Invalid model or filename for save\n");
+    return false;
+  }
+
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) {
+    fprintf(stderr, "Error: Cannot open file '%s' for writing\n", filename);
+    return false;
+  }
+
+  fprintf(stderr, "Saving model to %s...\n", filename);
+
+  // Write magic number and version
+  const char magic[] = "SUNFISH1";
+  fwrite(magic, 1, 8, fp);
+
+  // Write configuration (d_model first to match loader expectations)
+  int d_model = model->config->d_model;
+  fwrite(&d_model, sizeof(int), 1, fp);
+  fwrite(&model->config->num_encoder_layers, sizeof(int), 1, fp);
+  int zero = 0; // num_decoder_layers
+  fwrite(&zero, sizeof(int), 1, fp);
+  fwrite(&model->config->num_heads, sizeof(int), 1, fp);
+  fwrite(&model->config->d_ff, sizeof(int), 1, fp);
+  fwrite(&model->config->num_labels, sizeof(int), 1, fp);
+  fwrite(&model->config->num_cwt_scales, sizeof(int), 1, fp);
+  fwrite(model->config->cwt_scales, sizeof(double),
+         model->config->num_cwt_scales, fp);
+
+// Helper function to write a matrix
+#define WRITE_MATRIX(mat)                                                      \
+  do {                                                                         \
+    fwrite(&(mat)->rows, sizeof(int), 1, fp);                                  \
+    fwrite(&(mat)->cols, sizeof(int), 1, fp);                                  \
+    fwrite((mat)->data, sizeof(double), (mat)->rows * (mat)->cols, fp);        \
+  } while (0)
+
+  // Write CWT projection and positional encoding (skip embeddings as they are
+  // NULL)
+  WRITE_MATRIX(model->cwt_projection);
+  WRITE_MATRIX(model->pos_encoding);
+
+  // Write encoder layers
+  for (int i = 0; i < model->config->num_encoder_layers; i++) {
+    EncoderLayer* layer = model->encoder_layers[i];
+
+    // Multi-head attention weights
+    WRITE_MATRIX(layer->self_attn->W_q);
+    WRITE_MATRIX(layer->self_attn->W_k);
+    WRITE_MATRIX(layer->self_attn->W_v);
+    WRITE_MATRIX(layer->self_attn->W_o);
+
+    // Feed-forward weights
+    WRITE_MATRIX(layer->ff->W1);
+    WRITE_MATRIX(layer->ff->b1);
+    WRITE_MATRIX(layer->ff->W2);
+    WRITE_MATRIX(layer->ff->b2);
+
+    // Layer norm parameters
+    fwrite(layer->norm1->gamma, sizeof(double), layer->norm1->d_model, fp);
+    fwrite(layer->norm1->beta, sizeof(double), layer->norm1->d_model, fp);
+    fwrite(layer->norm2->gamma, sizeof(double), layer->norm2->d_model, fp);
+    fwrite(layer->norm2->beta, sizeof(double), layer->norm2->d_model, fp);
+  }
+
+  // No decoder layers / final layer norm in simplified model
+  WRITE_MATRIX(model->output_projection);
+
+#undef WRITE_MATRIX
+
+  fclose(fp);
+  fprintf(stderr, "Model saved successfully\n");
+  return true;
+}
+
+bool transformer_load(TransformerModel* model, const char* filename) {
+  if (!model || !filename) {
+    fprintf(stderr, "Error: Invalid model or filename for load\n");
+    return false;
+  }
+
+  FILE* fp = fopen(filename, "rb");
+  if (!fp) {
+    fprintf(stderr, "Error: Cannot open file '%s' for reading\n", filename);
+    return false;
+  }
+
+  fprintf(stderr, "Loading model from %s...\n", filename);
+
+  // Read and verify magic number
+  char magic[8];
+  if (fread(magic, 1, 8, fp) != 8 || memcmp(magic, "SUNFISH1", 8) != 0) {
+    fprintf(stderr, "Error: Invalid model file format\n");
+    fclose(fp);
+    return false;
+  }
+
+  // Read configuration
+  int d_model, num_encoder_layers, num_decoder_layers, num_heads, d_ff,
+      num_labels, num_cwt_scales;
+  if (!safe_fread(&d_model, sizeof(int), 1, fp, "d_model") ||
+      !safe_fread(&num_encoder_layers, sizeof(int), 1, fp,
+                  "num_encoder_layers") ||
+      !safe_fread(&num_decoder_layers, sizeof(int), 1, fp,
+                  "num_decoder_layers") ||
+      !safe_fread(&num_heads, sizeof(int), 1, fp, "num_heads") ||
+      !safe_fread(&d_ff, sizeof(int), 1, fp, "d_ff") ||
+      !safe_fread(&num_labels, sizeof(int), 1, fp, "num_labels") ||
+      !safe_fread(&num_cwt_scales, sizeof(int), 1, fp, "num_cwt_scales")) {
+    fclose(fp);
+    return false;
+  }
+
+  // Verify configuration matches (decoder removed)
+  if (d_model != model->config->d_model ||
+      num_encoder_layers != model->config->num_encoder_layers ||
+      num_decoder_layers != 0 || num_heads != model->config->num_heads ||
+      d_ff != model->config->d_ff || num_labels != model->config->num_labels ||
+      num_cwt_scales != model->config->num_cwt_scales) {
+    fprintf(stderr, "Error: Model configuration mismatch\n");
+    fprintf(stderr,
+            "  Expected: d_model=%d, enc=%d, dec=0, heads=%d, d_ff=%d, "
+            "labels=%d, cwt=%d\n",
+            model->config->d_model, model->config->num_encoder_layers,
+            model->config->num_heads, model->config->d_ff,
+            model->config->num_labels, model->config->num_cwt_scales);
+    fprintf(stderr,
+            "  Got: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, labels=%d, "
+            "cwt=%d\n",
+            d_model, num_encoder_layers, num_decoder_layers, num_heads, d_ff,
+            num_labels, num_cwt_scales);
+    fclose(fp);
+    return false;
+  }
+
+  // Read CWT scales
+  double* cwt_scales = (double*)malloc(num_cwt_scales * sizeof(double));
+  if (!safe_fread(cwt_scales, sizeof(double), num_cwt_scales, fp,
+                  "cwt_scales")) {
+    free(cwt_scales);
+    fclose(fp);
+    return false;
+  }
+  free(cwt_scales); // Just verify, already have scales in config
+
+// Helper function to read a matrix
+#define READ_MATRIX(mat)                                                       \
+  do {                                                                         \
+    int rows, cols;                                                            \
+    if (!safe_fread(&rows, sizeof(int), 1, fp, "matrix_rows") ||               \
+        !safe_fread(&cols, sizeof(int), 1, fp, "matrix_cols")) {               \
+      fclose(fp);                                                              \
+      return false;                                                            \
+    }                                                                          \
+    if (rows != (mat)->rows || cols != (mat)->cols) {                          \
+      fprintf(stderr,                                                          \
+              "Error: Matrix size mismatch (%d,%d)! expected (%d,%d)\n", rows, \
+              cols, (mat)->rows, (mat)->cols);                                 \
+      fclose(fp);                                                              \
+      return false;                                                            \
+    }                                                                          \
+    if (!safe_fread((mat)->data, sizeof(double), rows * cols, fp,              \
+                    "matrix_data")) {                                          \
+      fclose(fp);                                                              \
+      return false;                                                            \
+    }                                                                          \
+  } while (0)
+
+  // Read CWT projection and positional encoding (skip embeddings)
+  READ_MATRIX(model->cwt_projection);
+  READ_MATRIX(model->pos_encoding);
+
+  // Read encoder layers
+  for (int i = 0; i < model->config->num_encoder_layers; i++) {
+    EncoderLayer* layer = model->encoder_layers[i];
+
+    // Multi-head attention weights
+    READ_MATRIX(layer->self_attn->W_q);
+    READ_MATRIX(layer->self_attn->W_k);
+    READ_MATRIX(layer->self_attn->W_v);
+    READ_MATRIX(layer->self_attn->W_o);
+
+    // Feed-forward weights
+    READ_MATRIX(layer->ff->W1);
+    READ_MATRIX(layer->ff->b1);
+    READ_MATRIX(layer->ff->W2);
+    READ_MATRIX(layer->ff->b2);
+
+    // Layer norm parameters (use safe_fread)
+    if (!safe_fread(layer->norm1->gamma, sizeof(double), layer->norm1->d_model,
+                    fp, "norm1_gamma") ||
+        !safe_fread(layer->norm1->beta, sizeof(double), layer->norm1->d_model,
+                    fp, "norm1_beta") ||
+        !safe_fread(layer->norm2->gamma, sizeof(double), layer->norm2->d_model,
+                    fp, "norm2_gamma") ||
+        !safe_fread(layer->norm2->beta, sizeof(double), layer->norm2->d_model,
+                    fp, "norm2_beta")) {
+      fclose(fp);
+      return false;
+    }
+  }
+
+  // No decoder layers / final norm in simplified model
+  READ_MATRIX(model->output_projection);
+
+  fclose(fp);
+  fprintf(stderr, "Model loaded successfully\n");
+  return true;
+}
+
+// ============================================================================
+// Window processing (feature extraction + forward + optional training)
+// ============================================================================
+static double process_sequence_window(TransformerModel* model,
+                                      TransformerWorkspace* ws,
+                                      const char* window_seq, int window_len,
+                                      const int* window_labels,
+                                      bool is_training) {
+  if (window_len <= 0)
+    return 0.0;
+
+  // 1. CWT feature extraction into raw planes
+  if (!compute_cwt_features(window_seq, window_len, model->config->cwt_scales,
+                            model->config->num_cwt_scales, ws->cwt_planes)) {
+    fprintf(stderr,
+            "Warning: CWT feature extraction failed for window_len=%d\n",
+            window_len);
+    return 0.0;
+  }
+
+  // Pack planes into features matrix (rows=time, cols=feature_dim)
+  Matrix* features = ws->features;
+  features->rows = window_len;
+  int feature_dim = ws->feature_dim; // num_scales * 2
+  int num_scales = model->config->num_cwt_scales;
+  for (int t = 0; t < window_len; t++) {
+    for (int s = 0; s < num_scales; s++) {
+      features->data[t * feature_dim + (2 * s)] = ws->cwt_planes[2 * s][t];
+      features->data[t * feature_dim + (2 * s + 1)] =
+          ws->cwt_planes[2 * s + 1][t];
+    }
+  }
+
+  // 2. Linear projection to d_model
+  Matrix* projected = ws->projected;
+  projected->rows = window_len;
+  matrix_multiply_parallel(projected, features, model->cwt_projection,
+                           model->num_threads);
+
+  // 3. Add positional encoding
+  for (int t = 0; t < window_len; t++) {
+    int pos = t % model->config->window_size;
+    for (int d = 0; d < model->config->d_model; d++) {
+      projected->data[t * model->config->d_model + d] +=
+          model->pos_encoding->data[pos * model->config->d_model + d];
+    }
+  }
+
+  // 4. Encoder stack forward
+  Matrix* encoder_out = ws->encoder_out;
+  encoder_out->rows = window_len;
+  matrix_copy(encoder_out, projected);
+  for (int i = 0; i < model->config->num_encoder_layers; i++) {
+    Matrix* layer_out = matrix_create(window_len, model->config->d_model);
+    if (!layer_out) {
+      fprintf(stderr, "Error: Allocation failure in process_sequence_window\n");
+      return 0.0;
+    }
+    encoder_layer_forward(model->encoder_layers[i], layer_out, encoder_out,
+                          NULL, model->num_threads);
+    matrix_copy(encoder_out, layer_out);
+    matrix_free(layer_out);
+  }
+
+  // 5. Output projection to logits
+  Matrix* logits = ws->logits;
+  logits->rows = window_len;
+  matrix_multiply_parallel(logits, encoder_out, model->output_projection,
+                           model->num_threads);
+
+  int num_labels = model->config->num_labels;
+  double loss = 0.0;
+
+  if (is_training && window_labels) {
+    // Cross entropy loss + gradient
+    loss = cross_entropy_loss(logits, window_labels, window_len, num_labels);
+
+    // Compute stable softmax & gradient (reuse temporary buffer)
+    double* grad_logits =
+        (double*)calloc(window_len * num_labels, sizeof(double));
+    if (!grad_logits)
+      return loss; // best-effort
+    for (int t = 0; t < window_len; t++) {
+      double max_v = -1e9;
+      for (int c = 0; c < num_labels; c++) {
+        double v = logits->data[t * num_labels + c];
+        if (v > max_v)
+          max_v = v;
+      }
+      double sum_exp = 0.0;
+      for (int c = 0; c < num_labels; c++) {
+        double e = exp(logits->data[t * num_labels + c] - max_v);
+        grad_logits[t * num_labels + c] = e; // store exp temporarily
+        sum_exp += e;
+      }
+      int tgt = window_labels[t];
+      for (int c = 0; c < num_labels; c++) {
+        double soft = grad_logits[t * num_labels + c] / sum_exp; // softmax
+        double grad =
+            soft - ((tgt >= 0 && tgt < num_labels && tgt == c) ? 1.0 : 0.0);
+        grad_logits[t * num_labels + c] = grad / window_len; // mean reduction
+      }
+    }
+    // dW = H^T * grad_logits (H: window_len x d_model)
+    int d_model = model->config->d_model;
+    for (int i = 0; i < d_model; i++) {
+      for (int c = 0; c < num_labels; c++) {
+        double acc = 0.0;
+        for (int t = 0; t < window_len; t++) {
+          acc += encoder_out->data[t * d_model + i] *
+                 grad_logits[t * num_labels + c];
+        }
+        model->optimizer->gradients[i * num_labels + c] = acc;
+      }
+    }
+    adam_optimizer_step(model->optimizer, model->output_projection->data,
+                        d_model * num_labels, model->config->learning_rate, 0.9,
+                        0.999, 1e-8, 1); // t=1 (no bias correction state yet)
+    free(grad_logits);
+  } else {
+    // Inference: convert logits to probabilities (softmax in-place)
+    for (int t = 0; t < window_len; t++) {
+      double max_v = -1e9;
+      for (int c = 0; c < num_labels; c++) {
+        double v = logits->data[t * num_labels + c];
+        if (v > max_v)
+          max_v = v;
+      }
+      double sum_exp = 0.0;
+      for (int c = 0; c < num_labels; c++) {
+        double e = exp(logits->data[t * num_labels + c] - max_v);
+        logits->data[t * num_labels + c] = e;
+        sum_exp += e;
+      }
+      for (int c = 0; c < num_labels; c++) {
+        logits->data[t * num_labels + c] /= sum_exp;
+      }
+    }
+  }
+
+  return loss;
+
+==> include/config.h <==
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <stdbool.h>
+
+// Transformer model configuration
+typedef struct {
+  // Model architecture
+  int d_model;            // Model dimension (e.g., 512)
+  int num_encoder_layers; // Number of encoder layers
+  int num_heads;          // Number of attention heads
+  int d_ff;               // Feed-forward dimension
+
+  // Training parameters
+  double dropout_rate;  // Dropout rate
+  double learning_rate; // Learning rate
+  // (Removed deprecated max_seq_length; sliding window fields below replace it)
+  int batch_size; // Batch size for training
+  int num_epochs; // Number of training epochs
+
+  // Parallelization
+  int num_threads; // Number of threads for parallel computation
+
+  // Classification
+  int num_labels; // Number of output labels (3 for exon/intron/intergenic)
+
+  // CWT Feature Extraction
+  int num_cwt_scales; // Number of wavelet scales
+  double* cwt_scales; // Array of scale values (dynamically allocated)
+
+  // Sliding window configuration
+  int window_size;    // Window size for sliding window approach
+  int window_overlap; // Overlap between consecutive windows
+
+  // File paths
+  char* train_fasta;     // Training FASTA file path
+  char* train_gff;       // Training GFF file path
+  char* predict_fasta;   // Prediction FASTA file path
+  char* output_gff;      // Output GFF file path
+  char* output_bedgraph; // Output bedgraph file path
+  char* model_path;      // Model save/load path
+
+} TransformerConfig;
+
+/**
+ * Load configuration from TOML file
+ * @param filename Path to TOML configuration file
+ * @param config Output configuration structure
+ * @return true on success, false on error
+ */
+bool config_load(const char* filename, TransformerConfig* config);
+
+/**
+ * Initialize configuration with default values
+ * @param config Configuration structure to initialize
+ */
+void config_init_defaults(TransformerConfig* config);
+
+/**
+ * Free any allocated resources in configuration
+ * @param config Configuration structure
+ */
+void config_free(TransformerConfig* config);
+
+
+==> include/cwt.h <==
+#ifndef CWT_H
+#define CWT_H
+
+#include <complex.h>
+#include <stdbool.h>
+
+#include "fft.h"
+
+/**
+ * Convert DNA base to complex number on the complex plane.
+ * A -> (1+1i), T -> (1-1i), G -> (-1+1i), C -> (-1-1i)
+ * @param base DNA base character
+ * @return Complex number representation
+ */
+cplx dna_to_complex(char base);
+
+/**
+ * Convert DNA sequence to numerical signal (complex array).
+ * @param sequence DNA sequence string
+ * @param length Length of sequence
+ * @param output Output array (must be pre-allocated)
+ */
+void dna_to_signal(const char* sequence, int length, cplx* output);
+
+/**
+ * Generate Morlet wavelet for a given scale parameter.
+ * Formula: ψ(t) = (1/√(s·π^(1/4))) * exp(-1/2 * (t/s)^2) * exp(-j*2π*t/s)
+ * @param scale Scale parameter s
+ * @param length Length of the wavelet (should be centered at length/2)
+ * @param output Output array (must be pre-allocated)
+ */
+void generate_morlet_wavelet(double scale, int length, cplx* output);
+
+/**
+ * Perform convolution using FFT.
+ * @param signal Input signal
+ * @param signal_len Length of signal
+ * @param wavelet Wavelet kernel
+ * @param wavelet_len Length of wavelet
+ * @param output Output array (must be pre-allocated, size signal_len)
+ * @return true on success, false on error
+ */
+bool convolve_with_wavelet(const cplx* signal, int signal_len,
+                           const cplx* wavelet, int wavelet_len,
+                           cplx* output);
+
+/**
+ * Compute CWT features for a DNA sequence at multiple scales.
+ * @param sequence DNA sequence
+ * @param seq_len Length of sequence
+ * @param scales Array of scale parameters
+ * @param num_scales Number of scales
+ * @param features Output 2D array: features[scale_idx * 2 + 0] = real part,
+ *                 features[scale_idx * 2 + 1] = imaginary part
+ *                 (must be pre-allocated: num_scales * 2 rows, seq_len cols each)
+ * @return true on success, false on error
+ */
+bool compute_cwt_features(const char* sequence, int seq_len,
+                          const double* scales, int num_scales,
+                          double** features);
+
+
+==> include/fasta_parser.h <==
+#ifndef FASTA_PARSER_H
+#define FASTA_PARSER_H
+
+// Data Structures
+typedef struct {
+  char* id;
+  char* sequence;
+} FastaRecord;
+
+typedef struct {
+  FastaRecord* records;
+  int count;
+} FastaData;
+
+void free_fasta_data(FastaData* data);
+FastaData* parse_fasta(const char* path);
+
+/**
+ * Get complement of a DNA base
+ * @param base DNA base character (A, T, G, C)
+ * @return Complement base
+ */
+char complement_base(char base);
+
+/**
+ * Create reverse complement of a DNA sequence
+ * @param sequence Input DNA sequence
+ * @return Newly allocated reverse complement sequence (caller must free)
+ */
+char* reverse_complement(const char* sequence);
+
+
+==> include/fft.h <==
+#ifndef FFT_H
+#define FFT_H
+
+#include <complex.h>
+#include <stdbool.h>
+
+// Complex number type (using C99 complex)
+typedef double complex cplx;
+
+/**
+ * Compute the next power of 2 greater than or equal to n.
+ * @param n Input value
+ * @return Next power of 2
+ */
+int next_power_of_2(int n);
+
+/**
+ * Cooley-Tukey FFT algorithm (radix-2 decimation-in-time).
+ * @param x Input/output array (in-place)
+ * @param n Length of array (must be power of 2)
+ * @param inverse If true, compute inverse FFT
+ */
+void fft(cplx* x, int n, bool inverse);
+
+/**
+ * Inverse FFT wrapper for convenience.
+ * @param x Input/output array (in-place)
+ * @param n Length of array (must be power of 2)
+ */
+void ifft(cplx* x, int n);
+
+
+==> include/gff_parser.h <==
+#ifndef GFF_PARSER_H
+#define GFF_PARSER_H
+
+#include <stdbool.h>
+
+// Label types for token classification
+typedef enum {
+  LABEL_INTERGENIC = 0,  // Non-coding regions
+  LABEL_INTRON = 1,       // Intron regions
+  LABEL_EXON = 2          // Exon/CDS regions (protein-coding)
+} SequenceLabel;
+
+// GFF feature record
+typedef struct {
+  char* seqid;      // Sequence ID
+  char* source;     // Source (e.g., "RefSeq")
+  char* feature;    // Feature type (e.g., "CDS", "exon", "gene")
+  int start;        // 1-based start position
+  int end;          // 1-based end position (inclusive)
+  char strand;      // '+' or '-'
+  char* attributes; // Additional attributes
+} GFFRecord;
+
+// Collection of GFF records
+typedef struct {
+  GFFRecord* records;
+  int count;
+  int capacity;
+} GFFData;
+
+/**
+ * Parse GFF3 file and return all records
+ * @param filename Path to GFF file
+ * @return Parsed GFF data, or NULL on error
+ */
+GFFData* parse_gff(const char* filename);
+
+/**
+ * Free GFF data structure
+ * @param gff_data GFF data to free
+ */
+void free_gff_data(GFFData* gff_data);
+
+/**
+ * Create label array for a sequence using GFF annotations
+ * Labels: 0=intergenic, 1=intron, 2=exon(CDS)
+ * @param gff_data Parsed GFF annotations
+ * @param seqid Sequence identifier
+ * @param seq_len Length of sequence
+ * @param strand Strand ('+' or '-')
+ * @param labels Output array (must be pre-allocated, size seq_len)
+ * @return true on success, false on error
+ */
+bool create_labels_from_gff(const GFFData* gff_data, const char* seqid, 
+                            int seq_len, char strand, int* labels);
+
+
+==> include/thread_pool.h <==
+#ifndef THREAD_POOL_H
+#define THREAD_POOL_H
+
+#include <pthread.h>
+#include <stdbool.h>
+
+// Task function signature
+typedef void (*task_func_t)(void* arg);
+
+// Task structure
+typedef struct task_t {
+  task_func_t function;
+  void* argument;
+  struct task_t* next;
+} task_t;
+
+// Thread pool structure
+typedef struct {
+  pthread_t* threads;
+  int thread_count;
+  
+  task_t* task_queue_head;
+  task_t* task_queue_tail;
+  
+  pthread_mutex_t queue_mutex;
+  pthread_cond_t queue_cond;
+  pthread_cond_t done_cond;
+  
+  int active_tasks;
+  bool shutdown;
+} thread_pool_t;
+
+/**
+ * Create a thread pool with specified number of worker threads.
+ * @param num_threads Number of worker threads to create
+ * @return Pointer to thread pool, or NULL on error
+ */
+thread_pool_t* thread_pool_create(int num_threads);
+
+/**
+ * Add a task to the thread pool's queue.
+ * @param pool Thread pool
+ * @param function Function to execute
+ * @param arg Argument to pass to function
+ * @return true on success, false on error
+ */
+bool thread_pool_add_task(thread_pool_t* pool, task_func_t function, void* arg);
+
+/**
+ * Wait for all tasks to complete.
+ * @param pool Thread pool
+ */
+void thread_pool_wait(thread_pool_t* pool);
+
+/**
+ * Destroy the thread pool and free all resources.
+ * @param pool Thread pool to destroy
+ */
+void thread_pool_destroy(thread_pool_t* pool);
+
+
+==> include/toml.h <==
+/*
+  MIT License
+
+  Copyright (c) CK Tan
+  https://github.com/cktan/tomlc99
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*/
+#ifndef TOML_H
+#define TOML_H
+
+#ifdef _MSC_VER
+#pragma warning(disable : 4996)
+#endif
+
+#include <stdint.h>
+#include <stdio.h>
+
+#ifdef __cplusplus
+#define TOML_EXTERN extern "C"
+#else
+#define TOML_EXTERN extern
+#endif
+
+typedef struct toml_timestamp_t toml_timestamp_t;
+typedef struct toml_table_t toml_table_t;
+typedef struct toml_array_t toml_array_t;
+typedef struct toml_datum_t toml_datum_t;
+
+/* Parse a file. Return a table on success, or 0 otherwise.
+ * Caller must toml_free(the-return-value) after use.
+ */
+TOML_EXTERN toml_table_t *toml_parse_file(FILE *fp, char *errbuf, int errbufsz);
+
+/* Parse a string containing the full config.
+ * Return a table on success, or 0 otherwise.
+ * Caller must toml_free(the-return-value) after use.
+ */
+TOML_EXTERN toml_table_t *toml_parse(char *conf, /* NUL terminated, please. */
+                                     char *errbuf, int errbufsz);
+
+/* Free the table returned by toml_parse() or toml_parse_file(). Once
+ * this function is called, any handles accessed through this tab
+ * directly or indirectly are no longer valid.
+ */
+TOML_EXTERN void toml_free(toml_table_t *tab);
+
+/* Timestamp types. The year, month, day, hour, minute, second, z
+ * fields may be NULL if they are not relevant. e.g. In a DATE
+ * type, the hour, minute, second and z fields will be NULLs.
+ */
+struct toml_timestamp_t {
+  struct { /* internal. do not use. */
+    int year, month, day;
+    int hour, minute, second, millisec;
+    char z[10];
+  } __buffer;
+  int *year, *month, *day;
+  int *hour, *minute, *second, *millisec;
+  char *z;
+};
+
+/*-----------------------------------------------------------------
+ *  Enhanced access methods
+ */
+struct toml_datum_t {
+  int ok;
+  union {
+    toml_timestamp_t *ts; /* ts must be freed after use */
+    char *s;              /* string value. s must be freed after use */
+    int b;                /* bool value */
+    int64_t i;            /* int value */
+    double d;             /* double value */
+  } u;
+};
+
+/* on arrays: */
+/* ... retrieve size of array. */
+TOML_EXTERN int toml_array_nelem(const toml_array_t *arr);
+/* ... retrieve values using index. */
+TOML_EXTERN toml_datum_t toml_string_at(const toml_array_t *arr, int idx);
+TOML_EXTERN toml_datum_t toml_bool_at(const toml_array_t *arr, int idx);
+TOML_EXTERN toml_datum_t toml_int_at(const toml_array_t *arr, int idx);
+TOML_EXTERN toml_datum_t toml_double_at(const toml_array_t *arr, int idx);
+TOML_EXTERN toml_datum_t toml_timestamp_at(const toml_array_t *arr, int idx);
+/* ... retrieve array or table using index. */
+TOML_EXTERN toml_array_t *toml_array_at(const toml_array_t *arr, int idx);
+TOML_EXTERN toml_table_t *toml_table_at(const toml_array_t *arr, int idx);
+
+/* on tables: */
+/* ... retrieve the key in table at keyidx. Return 0 if out of range. */
+TOML_EXTERN const char *toml_key_in(const toml_table_t *tab, int keyidx);
+/* ... returns 1 if key exists in tab, 0 otherwise */
+TOML_EXTERN int toml_key_exists(const toml_table_t *tab, const char *key);
+/* ... retrieve values using key. */
+TOML_EXTERN toml_datum_t toml_string_in(const toml_table_t *arr,
+                                        const char *key);
+TOML_EXTERN toml_datum_t toml_bool_in(const toml_table_t *arr, const char *key);
+TOML_EXTERN toml_datum_t toml_int_in(const toml_table_t *arr, const char *key);
+TOML_EXTERN toml_datum_t toml_double_in(const toml_table_t *arr,
+                                        const char *key);
+TOML_EXTERN toml_datum_t toml_timestamp_in(const toml_table_t *arr,
+                                           const char *key);
+/* .. retrieve array or table using key. */
+TOML_EXTERN toml_array_t *toml_array_in(const toml_table_t *tab,
+                                        const char *key);
+TOML_EXTERN toml_table_t *toml_table_in(const toml_table_t *tab,
+                                        const char *key);
+
+/*-----------------------------------------------------------------
+ * lesser used
+ */
+/* Return the array kind: 't'able, 'a'rray, 'v'alue, 'm'ixed */
+TOML_EXTERN char toml_array_kind(const toml_array_t *arr);
+
+/* For array kind 'v'alue, return the type of values
+   i:int, d:double, b:bool, s:string, t:time, D:date, T:timestamp, 'm'ixed
+   0 if unknown
+*/
+TOML_EXTERN char toml_array_type(const toml_array_t *arr);
+
+/* Return the key of an array */
+TOML_EXTERN const char *toml_array_key(const toml_array_t *arr);
+
+/* Return the number of key-values in a table */
+TOML_EXTERN int toml_table_nkval(const toml_table_t *tab);
+
+/* Return the number of arrays in a table */
+TOML_EXTERN int toml_table_narr(const toml_table_t *tab);
+
+/* Return the number of sub-tables in a table */
+TOML_EXTERN int toml_table_ntab(const toml_table_t *tab);
+
+/* Return the key of a table*/
+TOML_EXTERN const char *toml_table_key(const toml_table_t *tab);
+
+/*--------------------------------------------------------------
+ * misc
+ */
+TOML_EXTERN int toml_utf8_to_ucs(const char *orig, int len, int64_t *ret);
+TOML_EXTERN int toml_ucs_to_utf8(int64_t code, char buf[6]);
+TOML_EXTERN void toml_set_memutil(void *(*xxmalloc)(size_t),
+                                  void (*xxfree)(void *));
+
+/*--------------------------------------------------------------
+ *  deprecated
+ */
+/* A raw value, must be processed by toml_rto* before using. */
+typedef const char *toml_raw_t;
+TOML_EXTERN toml_raw_t toml_raw_in(const toml_table_t *tab, const char *key);
+TOML_EXTERN toml_raw_t toml_raw_at(const toml_array_t *arr, int idx);
+TOML_EXTERN int toml_rtos(toml_raw_t s, char **ret);
+TOML_EXTERN int toml_rtob(toml_raw_t s, int *ret);
+TOML_EXTERN int toml_rtoi(toml_raw_t s, int64_t *ret);
+TOML_EXTERN int toml_rtod(toml_raw_t s, double *ret);
+TOML_EXTERN int toml_rtod_ex(toml_raw_t s, double *ret, char *buf, int buflen);
+TOML_EXTERN int toml_rtots(toml_raw_t s, toml_timestamp_t *ret);
+
+
+==> include/transformer.h <==
+#ifndef TRANSFORMER_H
+#define TRANSFORMER_H
+
+#include "config.h" // Include config.h at the top
+#include <pthread.h>
+#include <stdbool.h>
+
+// Matrix structure for dynamic allocation
+typedef struct {
+  double* data;
+  int rows;
+  int cols;
+} Matrix;
+
+// Multi-head attention structure
+typedef struct {
+  int d_model;
+  int num_heads;
+  int d_k; // d_model / num_heads
+  Matrix* W_q;
+  Matrix* W_k;
+  Matrix* W_v;
+  Matrix* W_o;
+} MultiHeadAttention;
+
+// Position-wise feed-forward network
+typedef struct {
+  int d_model;
+  int d_ff;
+  Matrix* W1;
+  Matrix* b1;
+  Matrix* W2;
+  Matrix* b2;
+} FeedForward;
+
+// Layer normalization
+typedef struct {
+  int d_model;
+  double* gamma;
+  double* beta;
+} LayerNorm;
+
+// Encoder layer
+typedef struct {
+  MultiHeadAttention* self_attn;
+  FeedForward* ff;
+  LayerNorm* norm1;
+  LayerNorm* norm2;
+  double dropout_rate;
+} EncoderLayer;
+
+// Adam Optimizer
+typedef struct {
+  double* gradients;
+  double* m;
+  double* v;
+} AdamOptimizer;
+
+// Full Transformer model
+typedef struct {
+  TransformerConfig* config; // use typedef name (struct was anonymous)
+  Matrix* cwt_projection;
+  Matrix* pos_encoding;
+  EncoderLayer** encoder_layers;
+  Matrix* output_projection;
+  int num_threads;
+  AdamOptimizer* optimizer;
+} TransformerModel;
+
+// Function Prototypes
+
+// Matrix operations
+Matrix* matrix_create(int rows, int cols);
+void matrix_free(Matrix* m);
+void matrix_zero(Matrix* m);
+void matrix_random_init(Matrix* m, double scale);
+void matrix_copy(Matrix* dst, const Matrix* src);
+void matrix_add(Matrix* result, const Matrix* a, const Matrix* b);
+void matrix_transpose(Matrix* result, const Matrix* input);
+void matrix_multiply_parallel(Matrix* result, const Matrix* a, const Matrix* b,
+                              int num_threads);
+
+// Attention and Layer components
+void scaled_dot_product_attention(Matrix* output, const Matrix* Q,
+                                  const Matrix* K, const Matrix* V,
+                                  const Matrix* mask, int num_threads);
+MultiHeadAttention* multihead_attention_create(int d_model, int num_heads);
+void multihead_attention_free(MultiHeadAttention* mha);
+void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
+                                 const Matrix* query, const Matrix* key,
+                                 const Matrix* value, const Matrix* mask,
+                                 int num_threads);
+FeedForward* feedforward_create(int d_model, int d_ff);
+void feedforward_free(FeedForward* ff);
+void feedforward_forward(FeedForward* ff, Matrix* output, const Matrix* input,
+                         int num_threads);
+LayerNorm* layer_norm_create(int d_model);
+void layer_norm_free(LayerNorm* ln);
+void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input);
+EncoderLayer* encoder_layer_create(int d_model, int num_heads, int d_ff,
+                                   double dropout_rate);
+void encoder_layer_free(EncoderLayer* layer);
+void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
+                           const Matrix* input, const Matrix* mask,
+                           int num_threads);
+
+// Positional Encoding
+void compute_positional_encoding(Matrix* pos_enc, int max_length, int d_model);
+
+// Core Model functions
+TransformerModel* transformer_create(TransformerConfig* config);
+void transformer_free(TransformerModel* model);
+bool transformer_train(TransformerModel* model, const char* train_fasta,
+                       const char* train_gff);
+// Prediction now can also output optional bedgraph
+void transformer_predict(TransformerModel* model, const char* input_file,
+                         const char* output_gff_file,
+                         const char* output_bedgraph_file);
+bool transformer_save(const TransformerModel* model, const char* filename);
+bool transformer_load(TransformerModel* model, const char* filename);
+
+// Optimizer
+AdamOptimizer* adam_optimizer_create(int param_count);
+void adam_optimizer_free(AdamOptimizer* opt);
+void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
+                         double learning_rate, double beta1, double beta2,
+                         double epsilon, int t);
+
+// Loss function
+double cross_entropy_loss(const Matrix* predictions, const int* targets,
+                          int batch_size, int num_labels);
+
