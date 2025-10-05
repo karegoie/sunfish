@@ -23,10 +23,10 @@ d_ff = 64
 [training]
 dropout_rate = 0.1
 batch_size = 4
-num_epochs = 200
+num_epochs = 300
 
 [adam]
-learning_rate = 0.001
+learning_rate = 0.0005
 beta1 = 0.9
 beta2 = 0.999
 epsilon = 1e-08
@@ -36,7 +36,7 @@ weight_decay = 0.0
 num_threads = 2
 
 [cwt]
-scales = [3.0, 4.0, 5.0, 10.0, 100.0]
+scales = [3.0, 4.0, 5.0, 10.0, 27.0, 81.0, 100.0]
 
 [sliding_window]
 window_size = 200
