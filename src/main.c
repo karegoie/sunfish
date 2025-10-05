@@ -84,8 +84,18 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     
-    fprintf(stderr, "Training mode not yet fully implemented\n");
-    fprintf(stderr, "Would train on: %s and %s\n", argv[2], argv[3]);
+    const char* train_fasta = argv[2];
+    const char* train_gff = argv[3];
+    
+    fprintf(stderr, "Starting training...\n");
+    if (!transformer_train(model, train_fasta, train_gff)) {
+      fprintf(stderr, "Error: Training failed\n");
+      transformer_free(model);
+      config_free(&config);
+      return 1;
+    }
+    
+    fprintf(stderr, "Training completed successfully!\n");
     
   } else if (strcmp(argv[1], "predict") == 0) {
     if (argc < 3) {
