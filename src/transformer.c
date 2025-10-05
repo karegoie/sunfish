@@ -806,6 +806,9 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
 
   for (int h = 0; h < num_heads; h++) {
     int head_offset = h * d_k;
+    // Extract head-specific slices from Q, K, V
+    // Note: This could be further optimized by restructuring data layout,
+    // but would require more extensive changes to avoid this copy
     for (int i = 0; i < seq_len; i++) {
       const double* q_row = &Q->data[i * d_model + head_offset];
       const double* k_row = &K->data[i * d_model + head_offset];
@@ -813,11 +816,10 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
       double* q_dst = &q_head_data[i * d_k];
       double* k_dst = &k_head_data[i * d_k];
       double* v_dst = &v_head_data[i * d_k];
-      for (int c = 0; c < d_k; c++) {
-        q_dst[c] = q_row[c];
-        k_dst[c] = k_row[c];
-        v_dst[c] = v_row[c];
-      }
+      // Use memcpy for better performance than element-by-element copy
+      memcpy(q_dst, q_row, d_k * sizeof(double));
+      memcpy(k_dst, k_row, d_k * sizeof(double));
+      memcpy(v_dst, v_row, d_k * sizeof(double));
     }
 
     Matrix q_head = {.data = q_head_data, .rows = seq_len, .cols = d_k};
@@ -869,9 +871,8 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
     for (int i = 0; i < seq_len; i++) {
       double* out_row = &concat_output->data[i * d_model + head_offset];
       const double* head_row = &head_context->data[i * d_k];
-      for (int c = 0; c < d_k; c++) {
-        out_row[c] = head_row[c];
-      }
+      // Use memcpy for better performance
+      memcpy(out_row, head_row, d_k * sizeof(double));
     }
   }
 
