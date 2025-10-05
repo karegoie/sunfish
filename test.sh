@@ -26,7 +26,7 @@ max_seq_length = 500
 dropout_rate = 0.1
 learning_rate = 0.001
 batch_size = 4
-num_epochs = 1
+num_epochs = 10
 
 [parallel]
 num_threads = 2
