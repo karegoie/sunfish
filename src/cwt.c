@@ -1,6 +1,7 @@
 #include <complex.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,80 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+typedef struct {
+  double scale;
+  int length;
+  cplx* values;
+} WaveletCacheEntry;
+
+typedef struct {
+  WaveletCacheEntry* entries;
+  int count;
+  int capacity;
+  pthread_mutex_t mutex;
+} WaveletCache;
+
+static WaveletCache g_wavelet_cache = {.entries = NULL,
+                                       .count = 0,
+                                       .capacity = 0,
+                                       .mutex = PTHREAD_MUTEX_INITIALIZER};
+
+static void wavelet_cache_destroy(void) __attribute__((destructor));
+
+static void wavelet_cache_destroy(void) {
+  pthread_mutex_lock(&g_wavelet_cache.mutex);
+  for (int i = 0; i < g_wavelet_cache.count; i++)
+    free(g_wavelet_cache.entries[i].values);
+  free(g_wavelet_cache.entries);
+  g_wavelet_cache.entries = NULL;
+  g_wavelet_cache.count = 0;
+  g_wavelet_cache.capacity = 0;
+  pthread_mutex_unlock(&g_wavelet_cache.mutex);
+  pthread_mutex_destroy(&g_wavelet_cache.mutex);
+}
+
+static const cplx* wavelet_cache_get(double scale, int length) {
+  const double eps = 1e-9;
+  pthread_mutex_lock(&g_wavelet_cache.mutex);
+  for (int i = 0; i < g_wavelet_cache.count; i++) {
+    WaveletCacheEntry* entry = &g_wavelet_cache.entries[i];
+    if (entry->length == length && fabs(entry->scale - scale) < eps) {
+      const cplx* result = entry->values;
+      pthread_mutex_unlock(&g_wavelet_cache.mutex);
+      return result;
+    }
+  }
+
+  if (g_wavelet_cache.count == g_wavelet_cache.capacity) {
+    int new_capacity =
+        (g_wavelet_cache.capacity == 0) ? 8 : g_wavelet_cache.capacity * 2;
+    WaveletCacheEntry* new_entries = (WaveletCacheEntry*)realloc(
+        g_wavelet_cache.entries, new_capacity * sizeof(WaveletCacheEntry));
+    if (!new_entries) {
+      pthread_mutex_unlock(&g_wavelet_cache.mutex);
+      return NULL;
+    }
+    g_wavelet_cache.entries = new_entries;
+    g_wavelet_cache.capacity = new_capacity;
+  }
+
+  cplx* values = (cplx*)malloc(length * sizeof(cplx));
+  if (!values) {
+    pthread_mutex_unlock(&g_wavelet_cache.mutex);
+    return NULL;
+  }
+  generate_morlet_wavelet(scale, length, values);
+
+  WaveletCacheEntry* new_entry =
+      &g_wavelet_cache.entries[g_wavelet_cache.count++];
+  new_entry->scale = scale;
+  new_entry->length = length;
+  new_entry->values = values;
+  const cplx* result = new_entry->values;
+  pthread_mutex_unlock(&g_wavelet_cache.mutex);
+  return result;
+}
 
 cplx dna_to_complex(char base) {
   switch (toupper((unsigned char)base)) {
@@ -57,9 +132,11 @@ bool convolve_with_wavelet(const cplx* signal, int signal_len,
   cplx* signal_padded = (cplx*)calloc(padded_len, sizeof(cplx));
   cplx* wavelet_padded = (cplx*)calloc(padded_len, sizeof(cplx));
 
-  if (signal_padded == NULL || wavelet_padded == NULL) {
-    free(signal_padded);
-    free(wavelet_padded);
+  if (!signal_padded || !wavelet_padded) {
+    if (signal_padded)
+      free(signal_padded);
+    if (wavelet_padded)
+      free(wavelet_padded);
     return false;
   }
 
@@ -113,12 +190,10 @@ bool compute_cwt_features(const char* sequence, int seq_len,
   if (max_wavelet_len % 2 == 0)
     max_wavelet_len++;
 
-  cplx* wavelet = (cplx*)malloc(max_wavelet_len * sizeof(cplx));
   cplx* cwt_result = (cplx*)malloc(seq_len * sizeof(cplx));
 
-  if (!wavelet || !cwt_result) {
+  if (!cwt_result) {
     free(signal);
-    free(wavelet);
     free(cwt_result);
     return false;
   }
@@ -130,12 +205,16 @@ bool compute_cwt_features(const char* sequence, int seq_len,
     if (wavelet_len % 2 == 0)
       wavelet_len++;
 
-    generate_morlet_wavelet(scales[s], wavelet_len, wavelet);
+    const cplx* wavelet = wavelet_cache_get(scales[s], wavelet_len);
+    if (!wavelet) {
+      free(signal);
+      free(cwt_result);
+      return false;
+    }
 
     if (!convolve_with_wavelet(signal, seq_len, wavelet, wavelet_len,
                                cwt_result)) {
       free(signal);
-      free(wavelet);
       free(cwt_result);
       return false;
     }
@@ -149,7 +228,6 @@ bool compute_cwt_features(const char* sequence, int seq_len,
   }
 
   free(signal);
-  free(wavelet);
   free(cwt_result);
   return true;
 }

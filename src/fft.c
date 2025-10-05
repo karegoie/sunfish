@@ -17,8 +17,18 @@ int next_power_of_2(int n) {
   return power;
 }
 
-// Bit-reversal permutation for FFT
-static void bit_reverse_copy(cplx* dst, const cplx* src, int n) {
+static inline int reverse_bits(int value, int bits) {
+  int reversed = 0;
+  for (int i = 0; i < bits; i++) {
+    if (value & (1 << i)) {
+      reversed |= 1 << (bits - 1 - i);
+    }
+  }
+  return reversed;
+}
+
+// Bit-reversal permutation performed in-place to avoid temporary buffers.
+static void bit_reverse_inplace(cplx* x, int n) {
   int bits = 0;
   int temp = n;
   while (temp > 1) {
@@ -27,27 +37,28 @@ static void bit_reverse_copy(cplx* dst, const cplx* src, int n) {
   }
 
   for (int i = 0; i < n; i++) {
-    int rev = 0;
-    for (int j = 0; j < bits; j++) {
-      if (i & (1 << j)) {
-        rev |= 1 << (bits - 1 - j);
-      }
+    int rev = reverse_bits(i, bits);
+    if (rev > i) {
+      cplx tmp = x[i];
+      x[i] = x[rev];
+      x[rev] = tmp;
     }
-    dst[rev] = src[i];
   }
 }
 
 void fft(cplx* x, int n, bool inverse) {
-  if (n <= 1) return;
+  if (n <= 1)
+    return;
 
   // Bit-reversal permutation
-  cplx* temp = (cplx*)malloc(n * sizeof(cplx));
-  bit_reverse_copy(temp, x, n);
-  memcpy(x, temp, n * sizeof(cplx));
-  free(temp);
+  bit_reverse_inplace(x, n);
 
   // Cooley-Tukey FFT
-  for (int s = 1; s <= (int)(log2(n)); s++) {
+  int stages = 0;
+  for (int t = n; t > 1; t >>= 1)
+    stages++;
+
+  for (int s = 1; s <= stages; s++) {
     int m = 1 << s;  // 2^s
     int m2 = m >> 1; // m/2
 
@@ -75,6 +86,4 @@ void fft(cplx* x, int n, bool inverse) {
   }
 }
 
-void ifft(cplx* x, int n) {
-  fft(x, n, true);
-}
+void ifft(cplx* x, int n) { fft(x, n, true); }

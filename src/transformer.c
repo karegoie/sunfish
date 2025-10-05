@@ -269,12 +269,13 @@ void compute_positional_encoding(Matrix* pos_enc, int max_length, int d_model) {
 // Layer Normalization
 // ============================================================================
 
-LayerNorm* layer_norm_create(int d_model) {
+LayerNorm* layer_norm_create(int d_model, int num_threads) {
   LayerNorm* ln = (LayerNorm*)malloc(sizeof(LayerNorm));
   if (!ln)
     return NULL;
 
   ln->d_model = d_model;
+  ln->num_threads = (num_threads > 0) ? num_threads : 1;
   ln->gamma = (double*)malloc(d_model * sizeof(double));
   ln->beta = (double*)malloc(d_model * sizeof(double));
 
@@ -300,33 +301,104 @@ void layer_norm_free(LayerNorm* ln) {
   }
 }
 
-void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input) {
+typedef struct {
+  const LayerNorm* ln;
+  Matrix* output;
+  const Matrix* input;
+  int start_row;
+  int end_row;
+} LayerNormThreadData;
+
+static void* layer_norm_thread(void* arg) {
+  LayerNormThreadData* data = (LayerNormThreadData*)arg;
+  const LayerNorm* ln = data->ln;
+  Matrix* output = data->output;
+  const Matrix* input = data->input;
   const double eps = 1e-6;
 
-  for (int i = 0; i < input->rows; i++) {
-    // Calculate mean
+  for (int i = data->start_row; i < data->end_row; i++) {
     double mean = 0.0;
+    const double* row = &input->data[i * ln->d_model];
     for (int j = 0; j < ln->d_model; j++) {
-      mean += input->data[i * ln->d_model + j];
+      mean += row[j];
     }
     mean /= ln->d_model;
 
-    // Calculate variance
     double variance = 0.0;
     for (int j = 0; j < ln->d_model; j++) {
-      double diff = input->data[i * ln->d_model + j] - mean;
+      double diff = row[j] - mean;
       variance += diff * diff;
     }
     variance /= ln->d_model;
 
-    // Normalize and apply affine transformation
     double std = sqrt(variance + eps);
+    double* out_row = &output->data[i * ln->d_model];
     for (int j = 0; j < ln->d_model; j++) {
-      double normalized = (input->data[i * ln->d_model + j] - mean) / std;
-      output->data[i * ln->d_model + j] =
-          ln->gamma[j] * normalized + ln->beta[j];
+      double normalized = (row[j] - mean) / std;
+      out_row[j] = ln->gamma[j] * normalized + ln->beta[j];
     }
   }
+
+  return NULL;
+}
+
+void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input) {
+  int rows = input->rows;
+  if (rows == 0)
+    return;
+
+  int threads = ln->num_threads;
+  if (threads <= 1 || rows < threads) {
+    LayerNormThreadData data = {.ln = ln,
+                                .output = output,
+                                .input = input,
+                                .start_row = 0,
+                                .end_row = rows};
+    layer_norm_thread(&data);
+    return;
+  }
+
+  pthread_t* workers = (pthread_t*)malloc(threads * sizeof(pthread_t));
+  LayerNormThreadData* tdata =
+      (LayerNormThreadData*)malloc(threads * sizeof(LayerNormThreadData));
+  if (!workers || !tdata) {
+    free(workers);
+    free(tdata);
+    LayerNormThreadData data = {.ln = ln,
+                                .output = output,
+                                .input = input,
+                                .start_row = 0,
+                                .end_row = rows};
+    layer_norm_thread(&data);
+    return;
+  }
+
+  int rows_per_thread = rows / threads;
+  int remainder = rows % threads;
+  int start = 0;
+  int active_threads = 0;
+
+  for (int t = 0; t < threads; t++) {
+    int count = rows_per_thread + (t < remainder ? 1 : 0);
+    if (count == 0)
+      continue;
+    tdata[active_threads].ln = ln;
+    tdata[active_threads].output = output;
+    tdata[active_threads].input = input;
+    tdata[active_threads].start_row = start;
+    tdata[active_threads].end_row = start + count;
+    pthread_create(&workers[active_threads], NULL, layer_norm_thread,
+                   &tdata[active_threads]);
+    start += count;
+    active_threads++;
+  }
+
+  for (int t = 0; t < active_threads; t++) {
+    pthread_join(workers[t], NULL);
+  }
+
+  free(workers);
+  free(tdata);
 }
 
 // ============================================================================
@@ -513,7 +585,6 @@ typedef struct {
   const Matrix* value;
   const Matrix* mask;
   int head_id;
-  int num_threads;
 } MHAThreadData;
 
 static void* multihead_attention_head_thread(void* arg) {
@@ -521,43 +592,64 @@ static void* multihead_attention_head_thread(void* arg) {
   int seq_len = data->query->rows;
   int d_k = data->mha->d_k;
 
-  // Extract Q, K, V for this head
-  Matrix* Q_head = matrix_create(seq_len, d_k);
-  Matrix* K_head = matrix_create(seq_len, d_k);
-  Matrix* V_head = matrix_create(seq_len, d_k);
-  Matrix* attn_output = matrix_create(seq_len, d_k);
-
-  // Project and extract head-specific Q, K, V
-  // This is a simplified version - full implementation would do proper
-  // projection
   int head_offset = data->head_id * d_k;
+  double scale = 1.0 / sqrt((double)d_k);
+  double* scores = (double*)malloc(seq_len * sizeof(double));
+  double* probs = (double*)malloc(seq_len * sizeof(double));
+  if (!scores || !probs) {
+    free(scores);
+    free(probs);
+    return NULL;
+  }
+
   for (int i = 0; i < seq_len; i++) {
-    for (int j = 0; j < d_k; j++) {
-      Q_head->data[i * d_k + j] =
-          data->query->data[i * data->mha->d_model + head_offset + j];
-      K_head->data[i * d_k + j] =
-          data->key->data[i * data->mha->d_model + head_offset + j];
-      V_head->data[i * d_k + j] =
-          data->value->data[i * data->mha->d_model + head_offset + j];
+    const double* q_row =
+        &data->query->data[i * data->mha->d_model + head_offset];
+    for (int j = 0; j < seq_len; j++) {
+      const double* k_row =
+          &data->key->data[j * data->mha->d_model + head_offset];
+      double sum = 0.0;
+      for (int k = 0; k < d_k; k++) {
+        sum += q_row[k] * k_row[k];
+      }
+      scores[j] = sum * scale;
+      if (data->mask) {
+        double mask_val = data->mask->data[i * data->mask->cols + j];
+        if (mask_val == 0.0)
+          scores[j] = -1e9;
+      }
+    }
+
+    double max_score = scores[0];
+    for (int j = 1; j < seq_len; j++) {
+      if (scores[j] > max_score)
+        max_score = scores[j];
+    }
+
+    double sum_exp = 0.0;
+    for (int j = 0; j < seq_len; j++) {
+      double val = exp(scores[j] - max_score);
+      probs[j] = val;
+      sum_exp += val;
+    }
+    for (int j = 0; j < seq_len; j++) {
+      probs[j] /= sum_exp;
+    }
+
+    double* out_row = &data->output->data[i * data->mha->d_model + head_offset];
+    memset(out_row, 0, d_k * sizeof(double));
+    for (int j = 0; j < seq_len; j++) {
+      const double* v_row =
+          &data->value->data[j * data->mha->d_model + head_offset];
+      double weight = probs[j];
+      for (int k = 0; k < d_k; k++) {
+        out_row[k] += weight * v_row[k];
+      }
     }
   }
 
-  // Compute attention for this head
-  scaled_dot_product_attention(attn_output, Q_head, K_head, V_head, data->mask,
-                               1);
-
-  // Copy output to the correct position
-  for (int i = 0; i < seq_len; i++) {
-    for (int j = 0; j < d_k; j++) {
-      data->output->data[i * data->mha->d_model + head_offset + j] =
-          attn_output->data[i * d_k + j];
-    }
-  }
-
-  matrix_free(Q_head);
-  matrix_free(K_head);
-  matrix_free(V_head);
-  matrix_free(attn_output);
+  free(scores);
+  free(probs);
 
   return NULL;
 }
@@ -579,6 +671,12 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
 
   // Compute attention for each head in parallel
   Matrix* concat_output = matrix_create(seq_len, mha->d_model);
+  if (!concat_output) {
+    matrix_free(Q);
+    matrix_free(K);
+    matrix_free(V);
+    return;
+  }
   matrix_zero(concat_output);
 
   if (num_threads >= mha->num_heads) {
@@ -587,26 +685,42 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
     MHAThreadData* thread_data =
         (MHAThreadData*)malloc(mha->num_heads * sizeof(MHAThreadData));
 
-    for (int h = 0; h < mha->num_heads; h++) {
-      thread_data[h].mha = mha;
-      thread_data[h].output = concat_output;
-      thread_data[h].query = Q;
-      thread_data[h].key = K;
-      thread_data[h].value = V;
-      thread_data[h].mask = mask;
-      thread_data[h].head_id = h;
-      thread_data[h].num_threads = 1;
+    if (!threads || !thread_data) {
+      free(threads);
+      free(thread_data);
+      for (int h = 0; h < mha->num_heads; h++) {
+        MHAThreadData data;
+        data.mha = mha;
+        data.output = concat_output;
+        data.query = Q;
+        data.key = K;
+        data.value = V;
+        data.mask = mask;
+        data.head_id = h;
+        multihead_attention_head_thread(&data);
+      }
+    } else {
 
-      pthread_create(&threads[h], NULL, multihead_attention_head_thread,
-                     &thread_data[h]);
+      for (int h = 0; h < mha->num_heads; h++) {
+        thread_data[h].mha = mha;
+        thread_data[h].output = concat_output;
+        thread_data[h].query = Q;
+        thread_data[h].key = K;
+        thread_data[h].value = V;
+        thread_data[h].mask = mask;
+        thread_data[h].head_id = h;
+
+        pthread_create(&threads[h], NULL, multihead_attention_head_thread,
+                       &thread_data[h]);
+      }
+
+      for (int h = 0; h < mha->num_heads; h++) {
+        pthread_join(threads[h], NULL);
+      }
+
+      free(threads);
+      free(thread_data);
     }
-
-    for (int h = 0; h < mha->num_heads; h++) {
-      pthread_join(threads[h], NULL);
-    }
-
-    free(threads);
-    free(thread_data);
   } else {
     // Sequential computation of heads
     for (int h = 0; h < mha->num_heads; h++) {
@@ -618,7 +732,6 @@ void multihead_attention_forward(MultiHeadAttention* mha, Matrix* output,
       data.value = V;
       data.mask = mask;
       data.head_id = h;
-      data.num_threads = 1;
 
       multihead_attention_head_thread(&data);
     }
@@ -684,6 +797,25 @@ static void relu(Matrix* m) {
   }
 }
 
+static void apply_dropout(double* data, int count, double rate, bool training) {
+  if (!training || rate <= 0.0)
+    return;
+
+  const double keep_prob = 1.0 - rate;
+  if (keep_prob <= 0.0)
+    return;
+  const double scale = 1.0 / keep_prob;
+
+  for (int i = 0; i < count; i++) {
+    double r = (double)rand() / (double)RAND_MAX;
+    if (r < rate) {
+      data[i] = 0.0;
+    } else {
+      data[i] *= scale;
+    }
+  }
+}
+
 void feedforward_forward(FeedForward* ff, Matrix* output, const Matrix* input,
                          int num_threads) {
   int seq_len = input->rows;
@@ -719,14 +851,14 @@ void feedforward_forward(FeedForward* ff, Matrix* output, const Matrix* input,
 // Encoder Layer
 // ============================================================================
 EncoderLayer* encoder_layer_create(int d_model, int num_heads, int d_ff,
-                                   double dropout_rate) {
+                                   double dropout_rate, int num_threads) {
   EncoderLayer* layer = (EncoderLayer*)malloc(sizeof(EncoderLayer));
   if (!layer)
     return NULL;
   layer->self_attn = multihead_attention_create(d_model, num_heads);
   layer->ff = feedforward_create(d_model, d_ff);
-  layer->norm1 = layer_norm_create(d_model);
-  layer->norm2 = layer_norm_create(d_model);
+  layer->norm1 = layer_norm_create(d_model, num_threads);
+  layer->norm2 = layer_norm_create(d_model, num_threads);
   layer->dropout_rate = dropout_rate;
   if (!layer->self_attn || !layer->ff || !layer->norm1 || !layer->norm2) {
     encoder_layer_free(layer);
@@ -747,7 +879,7 @@ void encoder_layer_free(EncoderLayer* layer) {
 
 void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
                            const Matrix* input, const Matrix* mask,
-                           int num_threads) {
+                           int num_threads, bool training) {
   int seq_len = input->rows;
   int d_model = input->cols;
 
@@ -755,6 +887,8 @@ void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
   Matrix* attn_out = matrix_create(seq_len, d_model);
   multihead_attention_forward(layer->self_attn, attn_out, input, input, input,
                               mask, num_threads);
+  apply_dropout(attn_out->data, seq_len * d_model, layer->dropout_rate,
+                training);
 
   // Residual + Norm1
   Matrix* resid1 = matrix_create(seq_len, d_model);
@@ -766,6 +900,7 @@ void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
   // Feed-forward
   Matrix* ff_out = matrix_create(seq_len, d_model);
   feedforward_forward(layer->ff, ff_out, normed1, num_threads);
+  apply_dropout(ff_out->data, seq_len * d_model, layer->dropout_rate, training);
 
   // Residual + Norm2
   Matrix* resid2 = matrix_create(seq_len, d_model);
@@ -803,8 +938,9 @@ TransformerModel* transformer_create(TransformerConfig* config) {
   model->encoder_layers = (EncoderLayer**)malloc(config->num_encoder_layers *
                                                  sizeof(EncoderLayer*));
   for (int i = 0; i < config->num_encoder_layers; i++) {
-    model->encoder_layers[i] = encoder_layer_create(
-        config->d_model, config->num_heads, config->d_ff, config->dropout_rate);
+    model->encoder_layers[i] =
+        encoder_layer_create(config->d_model, config->num_heads, config->d_ff,
+                             config->dropout_rate, config->num_threads);
   }
 
   model->output_projection = matrix_create(config->d_model, config->num_labels);
@@ -864,7 +1000,7 @@ void transformer_forward(TransformerModel* model, Matrix* output,
   for (int i = 0; i < model->config->num_encoder_layers; i++) {
     Matrix* layer_output = matrix_create(seq_len, d_model);
     encoder_layer_forward(model->encoder_layers[i], layer_output,
-                          encoder_output, NULL, num_threads);
+                          encoder_output, NULL, num_threads, false);
     matrix_copy(encoder_output, layer_output);
     matrix_free(layer_output);
   }
@@ -914,7 +1050,9 @@ void adam_optimizer_free(AdamOptimizer* opt) {
 
 void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
                          double learning_rate, double beta1, double beta2,
-                         double epsilon, int t) {
+                         double epsilon, uint64_t t) {
+  double beta1_t = pow(beta1, (double)t);
+  double beta2_t = pow(beta2, (double)t);
   for (int i = 0; i < param_count; i++) {
     // Update biased first moment estimate
     opt->m[i] = beta1 * opt->m[i] + (1.0 - beta1) * opt->gradients[i];
@@ -924,10 +1062,10 @@ void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
                 (1.0 - beta2) * opt->gradients[i] * opt->gradients[i];
 
     // Compute bias-corrected first moment estimate
-    double m_hat = opt->m[i] / (1.0 - pow(beta1, t));
+    double m_hat = opt->m[i] / (1.0 - beta1_t);
 
     // Compute bias-corrected second raw moment estimate
-    double v_hat = opt->v[i] / (1.0 - pow(beta2, t));
+    double v_hat = opt->v[i] / (1.0 - beta2_t);
 
     // Update parameters
     params[i] -= learning_rate * m_hat / (sqrt(v_hat) + epsilon);
@@ -1556,7 +1694,7 @@ static double process_sequence_window(TransformerModel* model,
       return 0.0;
     }
     encoder_layer_forward(model->encoder_layers[i], layer_out, encoder_out,
-                          NULL, model->num_threads);
+                          NULL, model->num_threads, is_training);
     matrix_copy(encoder_out, layer_out);
     matrix_free(layer_out);
   }

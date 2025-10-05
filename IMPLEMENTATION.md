@@ -1,5 +1,17 @@
 # Implementation Summary
 
+## 2025-10 개선 사항
+
+- **구성 로더 안정화**: TOML 문자열을 중복 복사한 뒤 해제하지 않도록 수정해, 라이브러리 내부 버퍼를 이중 해제하거나 UAF를 일으키지 않게 만들었습니다.
+- **FFT 메모리 최적화**: 비트 반전 단계에서 임시 버퍼를 제거하고 제자리 치환으로 변경하여 호출당 추가 할당·복사를 없앴습니다.
+- **CWT 파이프라인 개선**: 웨이블릿을 스레드 안전한 캐시에 저장하고 재사용하며, 패딩 버퍼 할당 실패 처리 시 널 포인터를 안전하게 정리하도록 보강했습니다.
+- **FASTA 파서 정확도 향상**: 시퀀스를 이어 붙일 때 널 종료 문자가 중간에 끼어들지 않도록 복사 길이를 조정했습니다.
+- **레이어 정규화 병렬화**: 레이어 정규화 계산을 pthread 기반으로 분할하여 긴 시퀀스에서도 CPU 코어를 고르게 활용합니다.
+- **어텐션 복사 제거**: 멀티헤드 어텐션이 헤드별 Q/K/V 행렬을 새로 할당하지 않고 기존 행렬을 조각(view)으로 사용하도록 재작성했습니다.
+- **드롭아웃 활성화**: 학습 시에만 드롭아웃을 적용하고 추론 시에는 스케일 조정된 값을 사용하여 기대값을 보존합니다.
+- **Adam 단계 보정**: 학습 스텝 카운터를 `TransformerModel`에 추가해 바이어스 보정을 위한 시점 `t`를 정확하게 증가시킵니다.
+- **GFF 라벨링 정밀화**: `exon/CDS` 뿐 아니라 다양한 피처를 보존하고 Parent 속성을 파싱해 트랜스크립트별 엑손 집합을 구성, 엑손 사이 구간을 자동으로 인트론으로 라벨링합니다.
+
 ## Changes Made
 
 This update implements the following features for the Sunfish Transformer-based gene annotation tool:
@@ -89,7 +101,7 @@ for each sequence:
 - CWT scales array
 - Embeddings: src, tgt, cwt_projection, pos_encoding
 - Encoder layers: attention weights, FF weights, layer norms
-- Decoder layers: self-attention, cross-attention, FF weights, layer norms  
+- Decoder layers: self-attention, cross-attention, FF weights, layer norms
 - Final: layer norm, output projection
 ```
 

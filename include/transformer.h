@@ -4,6 +4,7 @@
 #include "config.h" // Include config.h at the top
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 // Matrix structure for dynamic allocation
 typedef struct {
@@ -38,6 +39,7 @@ typedef struct {
   int d_model;
   double* gamma;
   double* beta;
+  int num_threads;
 } LayerNorm;
 
 // Encoder layer
@@ -65,6 +67,7 @@ typedef struct {
   Matrix* output_projection;
   int num_threads;
   AdamOptimizer* optimizer;
+  uint64_t training_step;
 } TransformerModel;
 
 // Function Prototypes
@@ -94,15 +97,15 @@ FeedForward* feedforward_create(int d_model, int d_ff);
 void feedforward_free(FeedForward* ff);
 void feedforward_forward(FeedForward* ff, Matrix* output, const Matrix* input,
                          int num_threads);
-LayerNorm* layer_norm_create(int d_model);
+LayerNorm* layer_norm_create(int d_model, int num_threads);
 void layer_norm_free(LayerNorm* ln);
 void layer_norm_forward(LayerNorm* ln, Matrix* output, const Matrix* input);
 EncoderLayer* encoder_layer_create(int d_model, int num_heads, int d_ff,
-                                   double dropout_rate);
+                                   double dropout_rate, int num_threads);
 void encoder_layer_free(EncoderLayer* layer);
 void encoder_layer_forward(EncoderLayer* layer, Matrix* output,
                            const Matrix* input, const Matrix* mask,
-                           int num_threads);
+                           int num_threads, bool training);
 
 // Positional Encoding
 void compute_positional_encoding(Matrix* pos_enc, int max_length, int d_model);
@@ -124,7 +127,7 @@ AdamOptimizer* adam_optimizer_create(int param_count);
 void adam_optimizer_free(AdamOptimizer* opt);
 void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
                          double learning_rate, double beta1, double beta2,
-                         double epsilon, int t);
+                         double epsilon, uint64_t t);
 
 // Loss function
 double cross_entropy_loss(const Matrix* predictions, const int* targets,

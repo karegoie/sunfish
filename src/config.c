@@ -154,40 +154,28 @@ bool config_load(const char* filename, TransformerConfig* config) {
     toml_datum_t d;
 
     d = toml_string_in(paths, "train_fasta");
-    if (d.ok) {
+    if (d.ok)
       config->train_fasta = strdup(d.u.s);
-      free(d.u.s);
-    }
 
     d = toml_string_in(paths, "train_gff");
-    if (d.ok) {
+    if (d.ok)
       config->train_gff = strdup(d.u.s);
-      free(d.u.s);
-    }
 
     d = toml_string_in(paths, "predict_fasta");
-    if (d.ok) {
+    if (d.ok)
       config->predict_fasta = strdup(d.u.s);
-      free(d.u.s);
-    }
 
     d = toml_string_in(paths, "output_gff");
-    if (d.ok) {
+    if (d.ok)
       config->output_gff = strdup(d.u.s);
-      free(d.u.s);
-    }
 
     d = toml_string_in(paths, "output_bedgraph");
-    if (d.ok) {
+    if (d.ok)
       config->output_bedgraph = strdup(d.u.s);
-      free(d.u.s);
-    }
 
     d = toml_string_in(paths, "model_path");
-    if (d.ok) {
+    if (d.ok)
       config->model_path = strdup(d.u.s);
-      free(d.u.s);
-    }
   }
 
   toml_free(conf);

@@ -23,6 +23,120 @@ static char* trim(char* str) {
   return str;
 }
 
+typedef struct {
+  int start;
+  int end;
+} Interval;
+
+typedef struct {
+  char* id;
+  Interval* intervals;
+  int count;
+  int capacity;
+} TranscriptIntervals;
+
+static char* extract_attribute_value(const char* attributes, const char* key) {
+  if (!attributes || !*attributes)
+    return NULL;
+
+  size_t key_len = strlen(key);
+  const char* cursor = attributes;
+  while (*cursor) {
+    while (*cursor == ';' || isspace((unsigned char)*cursor))
+      cursor++;
+    if (!*cursor)
+      break;
+
+    const char* field_end = strchr(cursor, ';');
+    if (!field_end)
+      field_end = cursor + strlen(cursor);
+
+    const char* eq = strchr(cursor, '=');
+    if (eq && (size_t)(eq - cursor) == key_len &&
+        strncmp(cursor, key, key_len) == 0) {
+      const char* value_start = eq + 1;
+      while (value_start < field_end && isspace((unsigned char)*value_start))
+        value_start++;
+
+      const char* value_end = field_end;
+      while (value_end > value_start &&
+             isspace((unsigned char)*(value_end - 1)))
+        value_end--;
+
+      if (value_end > value_start && value_start[0] == '"' &&
+          value_end[-1] == '"' && value_end > value_start + 1) {
+        value_start++;
+        value_end--;
+      }
+
+      size_t len = value_end - value_start;
+      char* value = (char*)malloc(len + 1);
+      if (!value)
+        return NULL;
+      memcpy(value, value_start, len);
+      value[len] = '\0';
+      return value;
+    }
+
+    cursor = (*field_end) ? field_end + 1 : field_end;
+  }
+
+  return NULL;
+}
+
+static TranscriptIntervals* ensure_transcript(TranscriptIntervals** transcripts,
+                                              int* count, int* cap,
+                                              const char* id) {
+  for (int i = 0; i < *count; i++) {
+    if (strcmp((*transcripts)[i].id, id) == 0)
+      return &(*transcripts)[i];
+  }
+
+  if (*count == *cap) {
+    int new_cap = (*cap == 0) ? 8 : (*cap * 2);
+    TranscriptIntervals* resized = (TranscriptIntervals*)realloc(
+        *transcripts, new_cap * sizeof(TranscriptIntervals));
+    if (!resized)
+      return NULL;
+    *transcripts = resized;
+    *cap = new_cap;
+  }
+
+  TranscriptIntervals* entry = &(*transcripts)[(*count)++];
+  entry->id = strdup(id);
+  entry->intervals = NULL;
+  entry->count = 0;
+  entry->capacity = 0;
+  return entry;
+}
+
+static bool transcript_add_interval(TranscriptIntervals* tx, int start,
+                                    int end) {
+  if (!tx)
+    return false;
+  if (tx->count == tx->capacity) {
+    int new_cap = (tx->capacity == 0) ? 4 : (tx->capacity * 2);
+    Interval* resized =
+        (Interval*)realloc(tx->intervals, new_cap * sizeof(Interval));
+    if (!resized)
+      return false;
+    tx->intervals = resized;
+    tx->capacity = new_cap;
+  }
+  tx->intervals[tx->count].start = start;
+  tx->intervals[tx->count].end = end;
+  tx->count++;
+  return true;
+}
+
+static int interval_compare(const void* a, const void* b) {
+  const Interval* ia = (const Interval*)a;
+  const Interval* ib = (const Interval*)b;
+  if (ia->start == ib->start)
+    return ia->end - ib->end;
+  return ia->start - ib->start;
+}
+
 GFFData* parse_gff(const char* filename) {
   FILE* fp = fopen(filename, "r");
   if (!fp) {
@@ -76,10 +190,6 @@ GFFData* parse_gff(const char* filename) {
     if (token_count < 8)
       continue;
 
-    // Only keep CDS features
-    if (strcmp(tokens[2], "CDS") != 0)
-      continue;
-
     if (gff_data->count >= gff_data->capacity) {
       gff_data->capacity *= 2;
       GFFRecord* new_records = (GFFRecord*)realloc(
@@ -106,7 +216,7 @@ GFFData* parse_gff(const char* filename) {
   }
 
   fclose(fp);
-  fprintf(stderr, "Loaded %d CDS records from GFF\n", gff_data->count);
+  fprintf(stderr, "Loaded %d records from GFF\n", gff_data->count);
   return gff_data;
 }
 
@@ -135,31 +245,108 @@ bool create_labels_from_gff(const GFFData* gff_data, const char* seqid,
     labels[i] = LABEL_INTERGENIC;
   }
 
-  // Mark CDS regions as exons
+  TranscriptIntervals* transcripts = NULL;
+  int transcript_count = 0;
+  int transcript_capacity = 0;
+  bool success = true;
+
   for (int i = 0; i < gff_data->count; i++) {
     const GFFRecord* record = &gff_data->records[i];
-
-    // Skip if different sequence or strand
     if (strcmp(record->seqid, seqid) != 0)
       continue;
-    if (record->strand != strand)
+    if (record->strand != strand && record->strand != '.')
       continue;
 
-    // Mark positions as exon (CDS)
-    // GFF uses 1-based coordinates, convert to 0-based
+    const char* feature = record->feature;
+    bool is_exon_feature =
+        (strcmp(feature, "CDS") == 0) || (strcmp(feature, "exon") == 0);
+    bool is_gene_feature = (strcmp(feature, "gene") == 0);
+
+    if (!is_exon_feature && !is_gene_feature)
+      continue;
+
     int start_idx = record->start - 1;
     int end_idx = record->end - 1;
-
-    // Clamp to sequence bounds
     if (start_idx < 0)
       start_idx = 0;
     if (end_idx >= seq_len)
       end_idx = seq_len - 1;
+    if (end_idx < start_idx)
+      continue;
 
-    for (int pos = start_idx; pos <= end_idx; pos++) {
-      labels[pos] = LABEL_EXON;
+    if (is_exon_feature) {
+      for (int pos = start_idx; pos <= end_idx; pos++) {
+        labels[pos] = LABEL_EXON;
+      }
+
+      char* parents = extract_attribute_value(record->attributes, "Parent");
+      if (!parents)
+        parents = extract_attribute_value(record->attributes, "ID");
+
+      if (parents) {
+        char* cursor = parents;
+        while (*cursor) {
+          while (*cursor == ',' || isspace((unsigned char)*cursor))
+            cursor++;
+          if (!*cursor)
+            break;
+          char* token_start = cursor;
+          while (*cursor && *cursor != ',')
+            cursor++;
+          char saved = *cursor;
+          if (saved)
+            *cursor = '\0';
+          char* parent_id = trim(token_start);
+          if (*parent_id) {
+            TranscriptIntervals* tx =
+                ensure_transcript(&transcripts, &transcript_count,
+                                  &transcript_capacity, parent_id);
+            if (!tx || !transcript_add_interval(tx, start_idx, end_idx)) {
+              success = false;
+            }
+          }
+          if (saved) {
+            *cursor = saved;
+            cursor++;
+          }
+          if (!success)
+            break;
+        }
+        free(parents);
+      }
+      if (!success)
+        break;
+    }
+    if (!success)
+      break;
+  }
+
+  for (int t = 0; success && t < transcript_count; t++) {
+    TranscriptIntervals* tx = &transcripts[t];
+    if (tx->count <= 1)
+      continue;
+    qsort(tx->intervals, tx->count, sizeof(Interval), interval_compare);
+    for (int j = 1; j < tx->count; j++) {
+      int intron_start = tx->intervals[j - 1].end + 1;
+      int intron_end = tx->intervals[j].start - 1;
+      if (intron_start < 0)
+        intron_start = 0;
+      if (intron_end >= seq_len)
+        intron_end = seq_len - 1;
+      if (intron_start > intron_end)
+        continue;
+      for (int pos = intron_start; pos <= intron_end; pos++) {
+        if (labels[pos] == LABEL_INTERGENIC)
+          labels[pos] = LABEL_INTRON;
+      }
     }
   }
 
-  return true;
+  for (int t = 0; t < transcript_count; t++) {
+    free(transcripts[t].id);
+    free(transcripts[t].intervals);
+  }
+  free(transcripts);
+
+  return success;
 }
