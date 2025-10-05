@@ -8,7 +8,7 @@ d_model = 64
 num_encoder_layers = 4
 
 # Number of attention heads
-num_heads = 3
+num_heads = 4
 
 # Feed-forward network dimension
 d_ff = 64
