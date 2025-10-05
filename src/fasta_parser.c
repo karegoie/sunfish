@@ -103,3 +103,28 @@ FastaData* parse_fasta(const char* path) {
   fclose(fp);
   return data;
 }
+
+char complement_base(char base) {
+  switch (base) {
+    case 'A': case 'a': return 'T';
+    case 'T': case 't': return 'A';
+    case 'G': case 'g': return 'C';
+    case 'C': case 'c': return 'G';
+    default: return 'N';
+  }
+}
+
+char* reverse_complement(const char* sequence) {
+  if (!sequence) return NULL;
+  
+  size_t len = strlen(sequence);
+  char* rc = (char*)malloc(len + 1);
+  if (!rc) return NULL;
+  
+  for (size_t i = 0; i < len; i++) {
+    rc[i] = complement_base(sequence[len - 1 - i]);
+  }
+  rc[len] = '\0';
+  
+  return rc;
+}

@@ -766,12 +766,10 @@ TransformerModel* transformer_create(const TransformerConfig* config) {
   memcpy(&model->config, config, sizeof(TransformerConfig));
   model->num_threads = config->num_threads;
   
-  // Initialize embeddings
-  double emb_scale = sqrt(2.0 / config->d_model);
-  model->src_embedding = matrix_create(config->vocab_size, config->d_model);
-  model->tgt_embedding = matrix_create(config->vocab_size, config->d_model);
-  matrix_random_init(model->src_embedding, emb_scale);
-  matrix_random_init(model->tgt_embedding, emb_scale);
+  // We no longer use src_embedding and tgt_embedding
+  // The model works directly with CWT features
+  model->src_embedding = NULL;
+  model->tgt_embedding = NULL;
   
   // Initialize CWT projection
   int cwt_dim = config->num_cwt_scales * 2;
@@ -799,9 +797,9 @@ TransformerModel* transformer_create(const TransformerConfig* config) {
         config->d_model, config->num_heads, config->d_ff, config->dropout_rate);
   }
   
-  // Final layer norm and output projection
+  // Final layer norm and output projection (for token classification)
   model->final_norm = layer_norm_create(config->d_model);
-  model->output_projection = matrix_create(config->d_model, config->vocab_size);
+  model->output_projection = matrix_create(config->d_model, config->num_labels);
   matrix_random_init(model->output_projection, sqrt(2.0 / config->d_model));
   
   model->threads = NULL;
@@ -812,6 +810,7 @@ TransformerModel* transformer_create(const TransformerConfig* config) {
 void transformer_free(TransformerModel* model) {
   if (!model) return;
   
+  // src_embedding and tgt_embedding are now NULL, but check anyway
   matrix_free(model->src_embedding);
   matrix_free(model->tgt_embedding);
   matrix_free(model->cwt_projection);
@@ -1013,26 +1012,26 @@ void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
 // ============================================================================
 
 double cross_entropy_loss(const Matrix* predictions, const int* targets, 
-                         int batch_size, int vocab_size) {
+                         int batch_size, int num_labels) {
   double total_loss = 0.0;
 
   for (int b = 0; b < batch_size; b++) {
     int target = targets[b];
-    if (target < 0 || target >= vocab_size) continue;
+    if (target < 0 || target >= num_labels) continue;
 
     // Get prediction for target class
-    double pred = predictions->data[b * vocab_size + target];
+    double pred = predictions->data[b * num_labels + target];
     
     // Apply log-softmax for numerical stability
     double max_pred = -1e9;
-    for (int v = 0; v < vocab_size; v++) {
-      double val = predictions->data[b * vocab_size + v];
+    for (int v = 0; v < num_labels; v++) {
+      double val = predictions->data[b * num_labels + v];
       if (val > max_pred) max_pred = val;
     }
 
     double sum_exp = 0.0;
-    for (int v = 0; v < vocab_size; v++) {
-      sum_exp += exp(predictions->data[b * vocab_size + v] - max_pred);
+    for (int v = 0; v < num_labels; v++) {
+      sum_exp += exp(predictions->data[b * num_labels + v] - max_pred);
     }
 
     double log_softmax = pred - max_pred - log(sum_exp);
@@ -1421,7 +1420,7 @@ bool transformer_save(const TransformerModel* model, const char* filename) {
   fwrite(&model->config.num_decoder_layers, sizeof(int), 1, fp);
   fwrite(&model->config.num_heads, sizeof(int), 1, fp);
   fwrite(&model->config.d_ff, sizeof(int), 1, fp);
-  fwrite(&model->config.vocab_size, sizeof(int), 1, fp);
+  fwrite(&model->config.num_labels, sizeof(int), 1, fp);
   fwrite(&model->config.num_cwt_scales, sizeof(int), 1, fp);
   fwrite(model->config.cwt_scales, sizeof(double), model->config.num_cwt_scales, fp);
   
@@ -1432,9 +1431,7 @@ bool transformer_save(const TransformerModel* model, const char* filename) {
     fwrite((mat)->data, sizeof(double), (mat)->rows * (mat)->cols, fp); \
   } while(0)
   
-  // Write embeddings
-  WRITE_MATRIX(model->src_embedding);
-  WRITE_MATRIX(model->tgt_embedding);
+  // Write CWT projection and positional encoding (skip embeddings as they are NULL)
   WRITE_MATRIX(model->cwt_projection);
   WRITE_MATRIX(model->pos_encoding);
   
@@ -1527,13 +1524,13 @@ bool transformer_load(TransformerModel* model, const char* filename) {
   }
   
   // Read configuration
-  int d_model, num_encoder_layers, num_decoder_layers, num_heads, d_ff, vocab_size, num_cwt_scales;
+  int d_model, num_encoder_layers, num_decoder_layers, num_heads, d_ff, num_labels, num_cwt_scales;
   fread(&d_model, sizeof(int), 1, fp);
   fread(&num_encoder_layers, sizeof(int), 1, fp);
   fread(&num_decoder_layers, sizeof(int), 1, fp);
   fread(&num_heads, sizeof(int), 1, fp);
   fread(&d_ff, sizeof(int), 1, fp);
-  fread(&vocab_size, sizeof(int), 1, fp);
+  fread(&num_labels, sizeof(int), 1, fp);
   fread(&num_cwt_scales, sizeof(int), 1, fp);
   
   // Verify configuration matches
@@ -1542,16 +1539,16 @@ bool transformer_load(TransformerModel* model, const char* filename) {
       num_decoder_layers != model->config.num_decoder_layers ||
       num_heads != model->config.num_heads ||
       d_ff != model->config.d_ff ||
-      vocab_size != model->config.vocab_size ||
+      num_labels != model->config.num_labels ||
       num_cwt_scales != model->config.num_cwt_scales) {
     fprintf(stderr, "Error: Model configuration mismatch\n");
-    fprintf(stderr, "  Expected: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, vocab=%d, cwt=%d\n",
+    fprintf(stderr, "  Expected: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, labels=%d, cwt=%d\n",
             model->config.d_model, model->config.num_encoder_layers,
             model->config.num_decoder_layers, model->config.num_heads,
-            model->config.d_ff, model->config.vocab_size, model->config.num_cwt_scales);
-    fprintf(stderr, "  Got: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, vocab=%d, cwt=%d\n",
+            model->config.d_ff, model->config.num_labels, model->config.num_cwt_scales);
+    fprintf(stderr, "  Got: d_model=%d, enc=%d, dec=%d, heads=%d, d_ff=%d, labels=%d, cwt=%d\n",
             d_model, num_encoder_layers, num_decoder_layers, num_heads,
-            d_ff, vocab_size, num_cwt_scales);
+            d_ff, num_labels, num_cwt_scales);
     fclose(fp);
     return false;
   }
@@ -1574,9 +1571,7 @@ bool transformer_load(TransformerModel* model, const char* filename) {
     fread((mat)->data, sizeof(double), rows * cols, fp); \
   } while(0)
   
-  // Read embeddings
-  READ_MATRIX(model->src_embedding);
-  READ_MATRIX(model->tgt_embedding);
+  // Read CWT projection and positional encoding (skip embeddings)
   READ_MATRIX(model->cwt_projection);
   READ_MATRIX(model->pos_encoding);
   

@@ -195,7 +195,7 @@ void adam_optimizer_step(AdamOptimizer* opt, double* params, int param_count,
 
 // Loss functions
 double cross_entropy_loss(const Matrix* predictions, const int* targets, 
-                         int batch_size, int vocab_size);
+                         int batch_size, int num_labels);
 
 // Save and load model
 bool transformer_save(const TransformerModel* model, const char* filename);
