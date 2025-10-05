@@ -116,6 +116,13 @@ void scaled_dot_product_attention(Matrix* output, const Matrix* Q,
                                   const Matrix* K, const Matrix* V,
                                   const Matrix* mask, int num_threads);
 
+// Backward pass for attention (simplified gradient computation)
+void scaled_dot_product_attention_backward(const Matrix* grad_output,
+                                          const Matrix* Q, const Matrix* K,
+                                          const Matrix* V,
+                                          Matrix* grad_Q, Matrix* grad_K,
+                                          Matrix* grad_V, int num_threads);
+
 // Positional encoding
 void compute_positional_encoding(Matrix* pos_enc, int max_length, int d_model);
 
