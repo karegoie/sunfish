@@ -50,7 +50,9 @@ bool convolve_with_wavelet(const cplx* signal, int signal_len,
  * @param seq_len Length of sequence
  * @param scales Array of scale parameters
  * @param num_scales Number of scales
- * @param features Output 2D array [num_scales][seq_len] (must be pre-allocated)
+ * @param features Output 2D array: features[scale_idx * 2 + 0] = real part,
+ *                 features[scale_idx * 2 + 1] = imaginary part
+ *                 (must be pre-allocated: num_scales * 2 rows, seq_len cols each)
  * @return true on success, false on error
  */
 bool compute_cwt_features(const char* sequence, int seq_len,

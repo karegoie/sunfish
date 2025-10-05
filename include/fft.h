@@ -4,36 +4,29 @@
 #include <complex.h>
 #include <stdbool.h>
 
-// Type alias for convenience
+// Complex number type (using C99 complex)
 typedef double complex cplx;
 
 /**
- * Compute the Fast Fourier Transform (FFT) using Cooley-Tukey algorithm.
- * @param x Input/output array of complex numbers
- * @param N Length of array (must be power of 2)
- * @param inverse If true, compute inverse FFT
- */
-void fft(cplx* x, int N, bool inverse);
-
-/**
- * Compute inverse FFT with proper normalization.
- * @param x Input/output array of complex numbers
- * @param N Length of array (must be power of 2)
- */
-void ifft(cplx* x, int N);
-
-/**
- * Check if a number is a power of 2.
- * @param n Number to check
- * @return true if n is a power of 2, false otherwise
- */
-bool is_power_of_2(int n);
-
-/**
- * Find next power of 2 greater than or equal to n.
- * @param n Input number
+ * Compute the next power of 2 greater than or equal to n.
+ * @param n Input value
  * @return Next power of 2
  */
 int next_power_of_2(int n);
+
+/**
+ * Cooley-Tukey FFT algorithm (radix-2 decimation-in-time).
+ * @param x Input/output array (in-place)
+ * @param n Length of array (must be power of 2)
+ * @param inverse If true, compute inverse FFT
+ */
+void fft(cplx* x, int n, bool inverse);
+
+/**
+ * Inverse FFT wrapper for convenience.
+ * @param x Input/output array (in-place)
+ * @param n Length of array (must be power of 2)
+ */
+void ifft(cplx* x, int n);
 
 #endif // FFT_H

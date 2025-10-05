@@ -7,7 +7,8 @@
 #include <string.h>
 
 #include "../include/fasta_parser.h"
-#include "../include/sunfish.h"
+
+#define MAX_LINE_LEN 50000
 
 void free_fasta_data(FastaData* data) {
   if (!data)

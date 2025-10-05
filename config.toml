@@ -1,0 +1,42 @@
+# Transformer Model Configuration for Sunfish
+
+[model]
+# Model dimension - must be divisible by num_heads
+d_model = 512
+
+# Number of encoder and decoder layers
+num_encoder_layers = 6
+num_decoder_layers = 6
+
+# Number of attention heads
+num_heads = 8
+
+# Feed-forward network dimension
+d_ff = 2048
+
+# Vocabulary size (4 for DNA: A, C, G, T)
+vocab_size = 4
+
+# Maximum sequence length
+max_seq_length = 5000
+
+[training]
+# Dropout rate for regularization
+dropout_rate = 0.1
+
+# Learning rate
+learning_rate = 0.0001
+
+# Batch size
+batch_size = 32
+
+# Number of training epochs
+num_epochs = 10
+
+[parallel]
+# Number of threads for parallel computation
+num_threads = 4
+
+[cwt]
+# CWT scales for wavelet feature extraction
+scales = [2.0, 4.0, 8.0, 16.0, 32.0]
