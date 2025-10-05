@@ -22,7 +22,7 @@ d_ff = 64
 
 [training]
 dropout_rate = 0.1
-learning_rate = 0.01
+learning_rate = 0.001
 batch_size = 4
 num_epochs = 200
 
